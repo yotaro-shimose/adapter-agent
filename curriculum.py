@@ -401,9 +401,9 @@ async def main():
     config = CurriculumConfig()
 
     # Configuration
-    api_key = os.environ.get("GOOGLE_API_KEY")
+    api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        print("Error: GOOGLE_API_KEY environment variable not set.")
+        print("Error: GEMINI_API_KEY environment variable not set.")
         return
 
     # Paths

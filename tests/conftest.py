@@ -31,7 +31,7 @@ load_dotenv()
 def model():
     return LitellmModel(
         model="gemini/gemini-3-flash-preview",
-        api_key=os.getenv("GOOGLE_API_KEY"),
+        api_key=os.getenv("GEMINI_API_KEY"),
     )
 
 

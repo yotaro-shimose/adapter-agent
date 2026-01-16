@@ -188,7 +188,7 @@ async def main():
     config.save()
 
     # Configure Model
-    model = LitellmModel(model=config.model_name, api_key=os.environ["GOOGLE_API_KEY"])
+    model = LitellmModel(model=config.model_name, api_key=os.environ["GEMINI_API_KEY"])
 
     # Work Dir / Output Project
     project_dir = config.get_project_dir()

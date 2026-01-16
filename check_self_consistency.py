@@ -20,7 +20,7 @@ async def main():
 
     # Configure Model
     model_name = "gemini/gemini-3-flash-preview"
-    model = LitellmModel(model=model_name, api_key=os.environ["GOOGLE_API_KEY"])
+    model = LitellmModel(model=model_name, api_key=os.environ["GEMINI_API_KEY"])
 
     # Enable tracing
     add_trace_processor(AgentContentPrinter())
