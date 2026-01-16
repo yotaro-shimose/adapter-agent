@@ -1,3 +1,4 @@
+from agents import ModelSettings
 import asyncio
 import os
 import shutil
@@ -53,19 +54,21 @@ async def register_topic(
 EXPLORER_PROMPT = """You are an expert Rust Researcher.
 Your goal is to explore the provided Rust library at `repos/library` and generate a **Comprehensive Library Summary** in `library_summary.md`.
 
-The summary should cover:
+STRATEGY (Breadth-First):
+1. **Priority 1: Documentation**: Start by reading `README.md`, any files in `docs/`, and `examples/`. These provide the best high-level overview.
+2. **Priority 2: Entry Points**: Read `src/lib.rs` and top-level module files (e.g., `mod.rs` or high-level structs) to understand the architecture.
+3. **Priority 3: Key Source Code**: Read specific source files only if documentation and entry points are insufficient to describe the abstract.
+
+CRITICAL:
+- **AVOID Deep Dives**: Do NOT read hundreds of lines of implementation logic or private functions. Focus on public APIs, struct definitions, and trait declarations.
+- **Maintain High-Level Perspective**: Your goal is a summary, not a code audit. If a file looks like complex internal logic, skip it.
+- **Efficiency**: You have a limited turn budget. Do not waste turns reading large files line-by-line unless they are core to the library's identity.
+
+Your summary should cover:
 - High-level purpose of the library.
 - Main modules and their responsibilities.
 - Key structs and traits.
 - Common usage patterns (look at examples).
-
-You have access to tools to explore the file system and read files.
-Once you have created the summary, you will return it as your final output.
-CRITICAL: Your output must be ONLY a valid raw JSON object matching the schema `{"summary": "..."}`.
-Do NOT use "thought:" prefix.
-Do NOT output internal thoughts or reasoning.
-Do NOT use markdown code blocks or backticks.
-Just the raw JSON string starting with `{`.
 """
 
 DETAILED_TOPIC_GENERATOR_PROMPT_TEMPLATE = """You are a specialized Topic Extraction Agent.
@@ -89,7 +92,7 @@ INSTRUCTIONS:
    - **Title**: Human readable title.
    - **Related APIs**: List of functions/structs involved. IMPORTANT: Use the **FULL PATH** (e.g., `crate::module::struct::method` or `module::struct::method`). Do not use short names.
    - **Description**: Brief explanation of what this concept is.
-4. If no user-facing topics are found in this file (e.g., internal utility), that is fine.
+4. If no user-facing topics are found in this file (e.g., internal utility), that is fine. You can finish without registering any topics.
 5. Say "finished" when done.
 """
 
@@ -124,6 +127,7 @@ async def run_explorer_phase(model, runtime: LocalRuntime, workspace_dir: Path) 
             model=model,
             mcp_servers=[coder_mcp],
             output_type=LibrarySummary,
+            model_settings=ModelSettings(parallel_tool_calls=True),
         )
 
         result = await explorer.run(
