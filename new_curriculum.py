@@ -1,17 +1,18 @@
 import asyncio
 import os
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 
+from agents import RunContextWrapper, function_tool
 from agents.extensions.models.litellm_model import LitellmModel
 from agents.tracing import add_trace_processor
+from coder_mcp.runtime import LocalRuntime
 from dotenv.main import load_dotenv
 from oai_utils.agent import AgentWrapper
 from oai_utils.tracing import AgentContentPrinter
 from pydantic import BaseModel
 
-from adapter_agent.exam.repository import chmod_recursive
-from coder_mcp.runtime.rust_env import RustCodingEnvironment
 from topic_db import Topic, TopicDatabase
 
 
@@ -19,10 +20,38 @@ class LibrarySummary(BaseModel):
     summary: str
 
 
+@dataclass
+class ContextType:
+    db: TopicDatabase
+    target_file_rel: str
+
+
+@function_tool
+async def register_topic(
+    wrapper: RunContextWrapper[ContextType],
+    id: str,
+    title: str,
+    description: str,
+    related_apis: list[str],
+) -> str:
+    """Register a new topic in the database."""
+    ctx = wrapper.context
+    topic = Topic(
+        id=id,
+        title=title,
+        description=description,
+        related_apis=related_apis,
+        source_file=ctx.target_file_rel,
+    )
+    print(f"  -> Registering topic: {title} ({id})")
+    ctx.db.add_topic(topic)
+    return f"Topic '{id}' registered successfully."
+
+
 # --- PROMPTS ---
 
 EXPLORER_PROMPT = """You are an expert Rust Researcher.
-Your goal is to explore the provided Rust library at `/workspace/repos/library` and generate a **Comprehensive Library Summary** in `/workspace/library_summary.md`.
+Your goal is to explore the provided Rust library at `repos/library` and generate a **Comprehensive Library Summary** in `library_summary.md`.
 
 The summary should cover:
 - High-level purpose of the library.
@@ -67,21 +96,142 @@ INSTRUCTIONS:
 # --- MAIN ---
 
 
+async def prepare_workspace(workspace_dir: Path, repository_path: Path) -> Path:
+    """Prepare the workspace and copy the library."""
+    if workspace_dir.exists():
+        shutil.rmtree(workspace_dir)
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+
+    lib_dest = workspace_dir / "repos" / "library"
+    lib_dest.parent.mkdir(parents=True, exist_ok=True)
+    if not lib_dest.exists():
+        if repository_path.exists():
+            shutil.copytree(repository_path, lib_dest, dirs_exist_ok=True)
+        else:
+            print(
+                f"Warning: Repository path {repository_path} not found. Ensure it exists."
+            )
+    return lib_dest
+
+
+async def run_explorer_phase(model, runtime: LocalRuntime, workspace_dir: Path) -> str:
+    """Phase 1: Explorer Agent."""
+    print("\n=== Phase 1: Explorer Agent ===")
+    async with runtime.coder_mcp_readonly() as coder_mcp:
+        explorer = AgentWrapper[LibrarySummary].create(
+            name="Explorer",
+            instructions=EXPLORER_PROMPT,
+            model=model,
+            mcp_servers=[coder_mcp],
+            output_type=LibrarySummary,
+        )
+
+        result = await explorer.run(
+            "Please explore the library and generate the summary. The library is located in 'repos/library'.",
+            max_turns=60,
+        )
+
+    library_summary = result.final_output().summary
+    print("✅ Library Summary Generated.")
+
+    # Save for reference
+    summary_path = workspace_dir / "library_summary.md"
+    summary_path.write_text(library_summary)
+    return library_summary
+
+
+async def run_topic_generation_phase(
+    model,
+    runtime: LocalRuntime,
+    lib_dest: Path,
+    workspace_dir: Path,
+    library_summary: str,
+):
+    """Phase 2: Detailed Topic Generation."""
+    print("\n=== Phase 2: Detailed Topic Generation ===")
+
+    # Initialize Topic DB
+    db = TopicDatabase(db_path=str(workspace_dir / "topics.json"))
+
+    # List files to process
+    src_dir = lib_dest / "src"
+    files_to_process = list(src_dir.rglob("*.rs"))
+    print(f"Found {len(files_to_process)} files to process.")
+
+    if not files_to_process:
+        return
+
+    # Select interesting files
+    interesting_files = [
+        "lib.rs",
+        "array.rs",
+        "linalg/mod.rs",
+        "stats.rs",
+        "traits/implementations.rs",
+    ]
+    selected_files = []
+    for name in interesting_files:
+        found = next((f for f in files_to_process if str(f).endswith(name)), None)
+        if found:
+            selected_files.append(found)
+
+    for f in files_to_process:
+        if len(selected_files) >= 5:
+            break
+        if f not in selected_files:
+            selected_files.append(f)
+
+    print(f"Testing Topic Extraction on {len(selected_files)} files:")
+    for f in selected_files:
+        print(f" - {f.relative_to(lib_dest)}")
+
+    # Loop over selected files
+    async with runtime.coder_mcp_readonly() as coder_mcp:
+        for target_file in selected_files:
+            relative_path = target_file.relative_to(lib_dest)
+            agent_file_path = Path("repos/library") / relative_path
+            print(f"\nProcessing: {agent_file_path}")
+
+            prompt = DETAILED_TOPIC_GENERATOR_PROMPT_TEMPLATE.format(
+                file_path=str(agent_file_path), library_summary=library_summary
+            )
+
+            topic_agent = AgentWrapper[str].create(
+                name=f"TopicGen-{relative_path.name}",
+                instructions=prompt,
+                model=model,
+                mcp_servers=[coder_mcp],
+                tools=[register_topic],
+            )
+
+            ctx = ContextType(db=db, target_file_rel=str(relative_path))
+            try:
+                await topic_agent.run(
+                    f"Analyze {agent_file_path} and register topics.",
+                    context=ctx,
+                    max_turns=30,
+                )
+            except Exception as e:
+                print(f"Error processing {relative_path}: {e}")
+
+    print("\n=== Topics in DB ===")
+    for t in db.topics:
+        print(f"- [{t.id}] {t.title}: {t.related_apis}")
+
+
 async def main():
     load_dotenv()
     add_trace_processor(AgentContentPrinter())
 
     # Config
     model_name = "gemini/gemini-3-flash-preview"
-    api_key = os.environ.get("GOOGLE_API_KEY")
+    api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        print("Error: GOOGLE_API_KEY environment variable not set.")
+        print("Error: GEMINI_API_KEY environment variable not set.")
         return
 
     workspace_dir = Path("workspace_new_curriculum").resolve()
-    repository_path = Path(
-        "repositories/numrs"
-    ).resolve()  # Default, might need adjusting
+    repository_path = Path("repositories/numrs").resolve()
 
     if not repository_path.exists():
         repository_path = Path(__file__).parent / "repositories/numrs"
@@ -90,164 +240,17 @@ async def main():
     print(f"Library: {repository_path}")
 
     # Prepare Workspace
-    if workspace_dir.exists():
-        shutil.rmtree(workspace_dir)
-    workspace_dir.mkdir(parents=True, exist_ok=True)
-    chmod_recursive(workspace_dir)
-
-    lib_dest = workspace_dir / "repos" / "library"
-    lib_dest.parent.mkdir(parents=True, exist_ok=True)
-    if not lib_dest.exists():
-        if repository_path.exists():
-            shutil.copytree(repository_path, lib_dest, dirs_exist_ok=True)
-            chmod_recursive(lib_dest)
-        else:
-            print(
-                f"Warning: Repository path {repository_path} not found. Ensure it exists."
-            )
+    lib_dest = await prepare_workspace(workspace_dir, repository_path)
 
     # Model
     model = LitellmModel(model=model_name, api_key=api_key)
 
-    # Initialize Environment
-    async with RustCodingEnvironment(
-        workspace_dir=workspace_dir, image_name="coder-mcp"
-    ) as runtime:
-        # --- Phase 1: Explorer Agent ---
-        print("\n=== Phase 1: Explorer Agent ===")
-        # Check if summary already exists (skip if debugging/re-running?)
-        # For now, always run.
-
-        async with runtime.coder_mcp() as coder_mcp:
-            explorer = AgentWrapper[LibrarySummary].create(
-                name="Explorer",
-                instructions=EXPLORER_PROMPT,
-                model=model,
-                mcp_servers=[coder_mcp],
-                output_type=LibrarySummary,
-            )
-
-            result = await explorer.run(
-                "Please explore the library and generate the summary.", max_turns=40
-            )
-
-        library_summary = result.final_output().summary
-        print("✅ Library Summary Generated.")
-
-        # Save for reference
-        summary_path = workspace_dir / "library_summary.md"
-        summary_path.write_text(library_summary)
-
-        # --- Phase 2: Detailed Topic Generation ---
-        print("\n=== Phase 2: Detailed Topic Generation ===")
-
-        # Initialize Topic DB
-        db = TopicDatabase(db_path=str(workspace_dir / "topics.json"))
-
-        # List files to process
-        # We want to process src/*.rs and maybe examples in the container
-        # But we can list them from host since it's mounted
-        src_dir = lib_dest / "src"
-        files_to_process = list(src_dir.rglob("*.rs"))
-
-        print(f"Found {len(files_to_process)} files to process.")
-
-        # Test with just 1 file for now as per Todo
-        if files_to_process:
-            # Sort files to be deterministic or just pick 5 interesting ones
-            # For now, let's pick 5 files, preferring some we know are interesting if present
-            # Include 'traits/implementations.rs' as a NEGATIVE TEST (should yield no topics)
-            interesting_files = [
-                "lib.rs",
-                "array.rs",
-                "linalg/mod.rs",
-                "stats.rs",
-                "traits/implementations.rs",
-            ]
-            selected_files = []
-
-            # First try to find interesting files
-            for name in interesting_files:
-                found = next(
-                    (f for f in files_to_process if str(f).endswith(name)), None
-                )
-                if found:
-                    selected_files.append(found)
-
-            # Fill up with others if needed
-            for f in files_to_process:
-                if len(selected_files) >= 5:
-                    break
-                if f not in selected_files:
-                    selected_files.append(f)
-
-            print(f"Testing Topic Extraction on {len(selected_files)} files:")
-            for f in selected_files:
-                print(f" - {f.relative_to(lib_dest)}")
-
-            # Context class for function tool
-            from dataclasses import dataclass
-
-            from agents import RunContextWrapper, function_tool
-
-            @dataclass
-            class ContextType:
-                db: TopicDatabase
-                target_file_rel: str
-
-            @function_tool
-            async def register_topic(
-                wrapper: RunContextWrapper[ContextType],
-                id: str,
-                title: str,
-                description: str,
-                related_apis: list[str],
-            ) -> str:
-                """Register a new topic in the database."""
-                ctx = wrapper.context
-                topic = Topic(
-                    id=id,
-                    title=title,
-                    description=description,
-                    related_apis=related_apis,
-                    source_file=ctx.target_file_rel,
-                )
-                print(f"  -> Registering topic: {title} ({id})")
-                ctx.db.add_topic(topic)
-                return f"Topic '{id}' registered successfully."
-
-            # Loop over selected files
-            async with runtime.coder_mcp() as coder_mcp:
-                for target_file in selected_files:
-                    relative_path = target_file.relative_to(lib_dest)
-                    container_path = Path("/workspace/repos/library") / relative_path
-                    print(f"\nProcessing: {container_path}")
-
-                    prompt = DETAILED_TOPIC_GENERATOR_PROMPT_TEMPLATE.format(
-                        file_path=str(container_path), library_summary=library_summary
-                    )
-
-                    topic_agent = AgentWrapper[str].create(
-                        name=f"TopicGen-{relative_path.name}",
-                        instructions=prompt,
-                        model=model,
-                        mcp_servers=[coder_mcp],
-                        tools=[register_topic],
-                    )
-
-                    ctx = ContextType(db=db, target_file_rel=str(relative_path))
-                    try:
-                        await topic_agent.run(
-                            f"Analyze {container_path} and register topics.",
-                            context=ctx,
-                            max_turns=30,  # Increased from 10
-                        )
-                    except Exception as e:
-                        print(f"Error processing {relative_path}: {e}")
-
-            print("\n=== Topics in DB ===")
-            for t in db.topics:
-                print(f"- [{t.id}] {t.title}: {t.related_apis}")
+    # Initialize Environment and Run Phases
+    async with LocalRuntime(workdir=str(workspace_dir)) as runtime:
+        library_summary = await run_explorer_phase(model, runtime, workspace_dir)
+        await run_topic_generation_phase(
+            model, runtime, lib_dest, workspace_dir, library_summary
+        )
 
 
 if __name__ == "__main__":
