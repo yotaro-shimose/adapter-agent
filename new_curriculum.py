@@ -1,3 +1,6 @@
+from oai_utils.vllm import RopeScaling
+from oai_utils.vllm import VLLMSetup
+from oai_utils.agent import AgentsSDKModel
 from agents import ModelSettings
 import asyncio
 import os
@@ -13,6 +16,8 @@ from dotenv.main import load_dotenv
 from oai_utils.agent import AgentWrapper
 from oai_utils.tracing import AgentContentPrinter
 from pydantic import BaseModel
+
+from adapter_agent.async_util import gather_with_semaphore
 
 from topic_db import Topic, TopicDatabase
 
@@ -45,7 +50,7 @@ async def register_topic(
         source_file=ctx.target_file_rel,
     )
     print(f"  -> Registering topic: {title} ({id})")
-    ctx.db.add_topic(topic)
+    await ctx.db.add_topic(topic)
     return f"Topic '{id}' registered successfully."
 
 
@@ -145,7 +150,7 @@ async def run_explorer_phase(model, runtime: LocalRuntime, workspace_dir: Path) 
 
 
 async def run_topic_generation_phase(
-    model,
+    model: AgentsSDKModel,
     runtime: LocalRuntime,
     lib_dest: Path,
     workspace_dir: Path,
@@ -189,9 +194,10 @@ async def run_topic_generation_phase(
     for f in selected_files:
         print(f" - {f.relative_to(lib_dest)}")
 
-    # Loop over selected files
+    # Process files in parallel
     async with runtime.coder_mcp_readonly() as coder_mcp:
-        for target_file in selected_files:
+
+        async def process_file(target_file: Path):
             relative_path = target_file.relative_to(lib_dest)
             agent_file_path = Path("repos/library") / relative_path
             print(f"\nProcessing: {agent_file_path}")
@@ -218,6 +224,10 @@ async def run_topic_generation_phase(
             except Exception as e:
                 print(f"Error processing {relative_path}: {e}")
 
+        await gather_with_semaphore(
+            [process_file(f) for f in selected_files], max_concurrent=5
+        )
+
     print("\n=== Topics in DB ===")
     for t in db.topics:
         print(f"- [{t.id}] {t.title}: {t.related_apis}")
@@ -228,11 +238,11 @@ async def main():
     add_trace_processor(AgentContentPrinter())
 
     # Config
-    model_name = "gemini/gemini-3-flash-preview"
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        print("Error: GEMINI_API_KEY environment variable not set.")
-        return
+    # model_name = "gemini/gemini-3-flash-preview"
+    # api_key = os.environ.get("GEMINI_API_KEY")
+    # if not api_key:
+    #     print("Error: GEMINI_API_KEY environment variable not set.")
+    #     return
 
     workspace_dir = Path("workspace_new_curriculum").resolve()
     repository_path = Path("repositories/numrs").resolve()
@@ -247,7 +257,22 @@ async def main():
     lib_dest = await prepare_workspace(workspace_dir, repository_path)
 
     # Model
-    model = LitellmModel(model=model_name, api_key=api_key)
+    # model = LitellmModel(model=model_name, api_key=api_key)
+    data_parallel_size = 1
+    yarn = 4
+    base_max_len = 32768
+    vllm_setup = VLLMSetup(
+        model="Qwen/Qwen3-8B",
+        reasoning_parser="deepseek_r1",
+        data_parallel_size=data_parallel_size,
+        quantization="fp8",
+        rope_scaling=RopeScaling(
+            rope_type="yarn",
+            factor=yarn,
+            original_max_position_embeddings=base_max_len,
+        ),
+    )
+    model = vllm_setup.as_litellm_model()
 
     # Initialize Environment and Run Phases
     async with LocalRuntime(workdir=str(workspace_dir)) as runtime:

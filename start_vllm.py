@@ -1,17 +1,24 @@
 import time
-from pathlib import Path
 
-from oai_utils.vllm import VLLMSetup
+from oai_utils.vllm import RopeScaling, VLLMSetup
+import os
 
 
 async def main():
+    os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
     data_parallel_size = 1
-    # vllm_setup = VLLMSetup.qwen3(data_parallel_size=data_parallel_size)
+    yarn = 4
+    base_max_len = 32768
     vllm_setup = VLLMSetup(
-        model="Qwen/Qwen3-4B",
-        lora_adapters={"numrs": Path("checkpoints/qwen3-4b-numrs-qra-2026-01-13")},
+        model="Qwen/Qwen3-8B",
         reasoning_parser="deepseek_r1",
         data_parallel_size=data_parallel_size,
+        quantization="fp8",
+        rope_scaling=RopeScaling(
+            rope_type="yarn",
+            factor=yarn,
+            original_max_position_embeddings=base_max_len,
+        ),
     )
     await vllm_setup.ensure_vllm_running()
     while True:
@@ -22,3 +29,7 @@ if __name__ == "__main__":
     import asyncio
 
     asyncio.run(main())
+
+
+# vllm serve Qwen/Qwen3-8B --rope-scaling '{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":32768}'
+# vllm serve Qwen/Qwen3-8B --rope-scaling '{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":32768}' --max-model-len 131072

@@ -18,8 +18,8 @@ dependencies = [
     "trl>=0.26.2",
     "flash-attn",
     "vllm>=0.13.0",
-    "oai-utils",
     "coder-mcp",
+    "oai-utils",
 ]
 
 [build-system]
@@ -31,8 +31,8 @@ no-binary-package = ["flash-attn"]
 no-build-isolation-package = ["flash-attn"]
 
 [tool.uv.sources]
-oai-utils = { path = "../oai_utils" }
-coder-mcp = { path = "../coder-mcp-maturin" }
+coder-mcp = { path = "../coder-mcp" }
+oai-utils = { path = "../oai_utils", editable = true }
 
 [project.optional-dependencies]
 test = [

@@ -1,3 +1,4 @@
+import asyncio
 from abc import ABC
 import json
 from pathlib import Path
@@ -31,6 +32,7 @@ class BaseDatabase(Generic[T], ABC):
         self.item_type = item_type
         self.db_path = Path(db_path)
         self.items: List[T] = []
+        self._lock = asyncio.Lock()
         self.load()
 
     def load(self):
@@ -47,16 +49,18 @@ class BaseDatabase(Generic[T], ABC):
         data = [t.model_dump() for t in self.items]
         self.db_path.write_text(json.dumps(data, indent=2))
 
-    def add_item(self, item: T):
-        existing = next((t for t in self.items if t.id == item.id), None)
-        if existing:
-            self.items.remove(existing)
-        self.items.append(item)
-        self.save()
+    async def add_item(self, item: T):
+        async with self._lock:
+            existing = next((t for t in self.items if t.id == item.id), None)
+            if existing:
+                self.items.remove(existing)
+            self.items.append(item)
+            self.save()
 
-    def remove_item(self, item_id: str):
-        self.items = [t for t in self.items if t.id != item_id]
-        self.save()
+    async def remove_item(self, item_id: str):
+        async with self._lock:
+            self.items = [t for t in self.items if t.id != item_id]
+            self.save()
 
     def get_item(self, item_id: str) -> Optional[T]:
         return next((t for t in self.items if t.id == item_id), None)
@@ -70,11 +74,11 @@ class TopicDatabase(BaseDatabase[Topic]):
     def topics(self):
         return self.items
 
-    def add_topic(self, topic: Topic):
-        self.add_item(topic)
+    async def add_topic(self, topic: Topic):
+        await self.add_item(topic)
 
-    def remove_topic(self, topic_id: str):
-        self.remove_item(topic_id)
+    async def remove_topic(self, topic_id: str):
+        await self.remove_item(topic_id)
 
     def search_topics(self, query: str) -> list[Topic]:
         query = query.lower()
@@ -102,11 +106,11 @@ class ExerciseDatabase(BaseDatabase[Exercise]):
     def exercises(self):
         return self.items
 
-    def add_exercise(self, exercise: Exercise):
-        self.add_item(exercise)
+    async def add_exercise(self, exercise: Exercise):
+        await self.add_item(exercise)
 
-    def remove_exercise(self, exercise_id: str):
-        self.remove_item(exercise_id)
+    async def remove_exercise(self, exercise_id: str):
+        await self.remove_item(exercise_id)
 
     def get_exercises_by_topic(self, topic_id: str) -> list[Exercise]:
         return [e for e in self.exercises if e.topic_id == topic_id]
