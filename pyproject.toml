@@ -1,0 +1,42 @@
+[project]
+name = "adapter_agent"
+version = "0.1.0"
+description = "OpenHands-quality coding agent using openai-agents-sdk"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "loguru>=0.7.3",
+    "mcp>=1.25.0",
+    "openai>=1.0.0",
+    "openai-agents>=0.6.4",
+    "peft>=0.18.1",
+    "polars>=1.37.1",
+    "python-dotenv>=1.0.0",
+    "rich>=14.2.0",
+    "torch>=2.9.0",
+    "transformers>=4.57.3",
+    "trl>=0.26.2",
+    "flash-attn",
+    "vllm>=0.13.0",
+    "oai-utils",
+    "coder-mcp",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+no-binary-package = ["flash-attn"]
+no-build-isolation-package = ["flash-attn"]
+
+[tool.uv.sources]
+oai-utils = { path = "../oai_utils" }
+coder-mcp = { path = "../coder-mcp-maturin" }
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+]
+

@@ -1,0 +1,10 @@
+/target
+/bash_events
+**/*.rs.bk
+*.pdb
+*.tmp
+*.temp
+Cargo.lock
+tasks.json
+
+/repos
