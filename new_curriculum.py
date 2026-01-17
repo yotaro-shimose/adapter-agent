@@ -3,6 +3,7 @@ from oai_utils.vllm import VLLMSetup
 from oai_utils.agent import AgentsSDKModel
 from agents import ModelSettings
 import asyncio
+import time
 import os
 import shutil
 from dataclasses import dataclass
@@ -13,13 +14,15 @@ from agents.extensions.models.litellm_model import LitellmModel
 from agents.tracing import add_trace_processor
 from coder_mcp.runtime import LocalRuntime
 from dotenv.main import load_dotenv
-from oai_utils.agent import AgentWrapper
+from oai_utils.agent import AgentWrapper, AgentRunFailure
 from oai_utils.tracing import AgentContentPrinter
 from pydantic import BaseModel
 
 from adapter_agent.async_util import gather_with_semaphore
 
 from topic_db import Topic, TopicDatabase
+import warnings
+warnings.filterwarnings("ignore", message="Pydantic serializer warnings")
 
 
 class LibrarySummary(BaseModel):
@@ -144,7 +147,7 @@ async def run_explorer_phase(model, runtime: LocalRuntime, workspace_dir: Path) 
     print("✅ Library Summary Generated.")
 
     # Save for reference
-    summary_path = workspace_dir / "library_summary.md"
+    summary_path = workspace_dir.parent / "library_summary.md"
     summary_path.write_text(library_summary)
     return library_summary
 
@@ -155,12 +158,16 @@ async def run_topic_generation_phase(
     lib_dest: Path,
     workspace_dir: Path,
     library_summary: str,
+    lib_name: str,
+    max_concurrent: int = 5,
 ):
     """Phase 2: Detailed Topic Generation."""
     print("\n=== Phase 2: Detailed Topic Generation ===")
 
     # Initialize Topic DB
-    db = TopicDatabase(db_path=str(workspace_dir / "topics.json"))
+    data_dir = workspace_dir.parent
+    db_path = data_dir / f"{lib_name}_topics.json"
+    db = TopicDatabase(db_path=str(db_path))
 
     # List files to process
     src_dir = lib_dest / "src"
@@ -170,28 +177,8 @@ async def run_topic_generation_phase(
     if not files_to_process:
         return
 
-    # Select interesting files
-    interesting_files = [
-        "lib.rs",
-        "array.rs",
-        "linalg/mod.rs",
-        "stats.rs",
-        "traits/implementations.rs",
-    ]
-    selected_files = []
-    for name in interesting_files:
-        found = next((f for f in files_to_process if str(f).endswith(name)), None)
-        if found:
-            selected_files.append(found)
-
+    print(f"Topic Extraction on {len(files_to_process)} files:")
     for f in files_to_process:
-        if len(selected_files) >= 5:
-            break
-        if f not in selected_files:
-            selected_files.append(f)
-
-    print(f"Testing Topic Extraction on {len(selected_files)} files:")
-    for f in selected_files:
         print(f" - {f.relative_to(lib_dest)}")
 
     # Process files in parallel
@@ -221,11 +208,11 @@ async def run_topic_generation_phase(
                     context=ctx,
                     max_turns=30,
                 )
-            except Exception as e:
+            except (Exception, AgentRunFailure) as e:
                 print(f"Error processing {relative_path}: {e}")
 
         await gather_with_semaphore(
-            [process_file(f) for f in selected_files], max_concurrent=5
+            [process_file(f) for f in files_to_process], max_concurrent=max_concurrent
         )
 
     print("\n=== Topics in DB ===")
@@ -243,13 +230,19 @@ async def main():
     # if not api_key:
     #     print("Error: GEMINI_API_KEY environment variable not set.")
     #     return
-
-    workspace_dir = Path("workspace_new_curriculum").resolve()
+    max_concurrent = 100
+    experiment_id = f"exp_{int(time.time())}"
+    base_dir = Path("experiments") / experiment_id
+    workspace_dir = base_dir / "workspace"
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    
     repository_path = Path("repositories/numrs").resolve()
 
     if not repository_path.exists():
         repository_path = Path(__file__).parent / "repositories/numrs"
 
+    print(f"Experiment: {experiment_id}")
+    print(f"Base Directory: {base_dir}")
     print(f"Workspace: {workspace_dir}")
     print(f"Library: {repository_path}")
 
@@ -278,7 +271,13 @@ async def main():
     async with LocalRuntime(workdir=str(workspace_dir)) as runtime:
         library_summary = await run_explorer_phase(model, runtime, workspace_dir)
         await run_topic_generation_phase(
-            model, runtime, lib_dest, workspace_dir, library_summary
+            model,
+            runtime,
+            lib_dest,
+            workspace_dir,
+            library_summary,
+            lib_name=repository_path.name,
+            max_concurrent=max_concurrent,
         )
 
 

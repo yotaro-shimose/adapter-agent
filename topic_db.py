@@ -13,7 +13,7 @@ class IdentifiableModel(BaseModel):
 
 class Topic(IdentifiableModel):
     title: str
-    source_file: str
+    source_file: Path
     related_apis: list[str] = Field(default_factory=list)
     description: str
 
@@ -28,7 +28,7 @@ T = TypeVar("T", bound=IdentifiableModel)
 
 
 class BaseDatabase(Generic[T], ABC):
-    def __init__(self, item_type: Type[T], db_path: str):
+    def __init__(self, item_type: Type[T], db_path: str | Path):
         self.item_type = item_type
         self.db_path = Path(db_path)
         self.items: List[T] = []
@@ -67,8 +67,8 @@ class BaseDatabase(Generic[T], ABC):
 
 
 class TopicDatabase(BaseDatabase[Topic]):
-    def __init__(self, db_path: str = "topics.json"):
-        super().__init__(Topic, db_path)
+    def __init__(self, db_path: str | Path = "topics.json"):
+        super().__init__(Topic, Path(db_path))
 
     @property
     def topics(self):
@@ -99,8 +99,8 @@ class TopicDatabase(BaseDatabase[Topic]):
 
 
 class ExerciseDatabase(BaseDatabase[Exercise]):
-    def __init__(self, db_path: str = "exercises.json"):
-        super().__init__(Exercise, db_path)
+    def __init__(self, db_path: str | Path = "exercises.json"):
+        super().__init__(Exercise, Path(db_path))
 
     @property
     def exercises(self):

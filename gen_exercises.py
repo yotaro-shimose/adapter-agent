@@ -1,3 +1,6 @@
+from adapter_agent.async_util import gather_with_semaphore
+from oai_utils.vllm import RopeScaling
+from oai_utils.vllm import VLLMSetup
 import asyncio
 import os
 import uuid
@@ -12,9 +15,9 @@ from coder_mcp.runtime.temp_workspace import TempWorkspace
 from dotenv.main import load_dotenv
 from oai_utils.agent import AgentWrapper
 from oai_utils.tracing import AgentContentPrinter
-
 from topic_db import Topic, TopicDatabase, Exercise, ExerciseDatabase
-
+import warnings
+warnings.filterwarnings("ignore", message="Pydantic serializer warnings")
 
 @dataclass
 class ContextType:
@@ -38,7 +41,7 @@ async def register_exercise(
         answer=answer,
     )
     print(f"  -> Registering exercise: {exercise_id}")
-    ctx.db.add_exercise(exercise)
+    await ctx.db.add_exercise(exercise)
     return f"Exercise '{exercise_id}' registered successfully."
 
 
@@ -154,22 +157,46 @@ async def run_exercise_generation_for_topic(
                 except Exception as e:
                     print(f"Error during exercise generation for {topic.id}: {e}")
 
+def get_vllm() -> LitellmModel:
+    data_parallel_size = 1
+    yarn = 4
+    base_max_len = 32768
+    vllm_setup = VLLMSetup(
+        model="Qwen/Qwen3-8B",
+        reasoning_parser="deepseek_r1",
+        data_parallel_size=data_parallel_size,
+        quantization="fp8",
+        rope_scaling=RopeScaling(
+            rope_type="yarn",
+            factor=yarn,
+            original_max_position_embeddings=base_max_len,
+        ),
+    )
+    return vllm_setup.as_litellm_model()
+
+
+def get_gemini() -> LitellmModel:
+    model_name = "gemini/gemini-3-flash-preview"
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("Error: GEMINI_API_KEY not set.")
+    return LitellmModel(model=model_name, api_key=api_key)
 
 async def main():
     load_dotenv()
     add_trace_processor(AgentContentPrinter())
 
     # Config
-    model_name = "gemini/gemini-3-flash-preview"
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        print("Error: GEMINI_API_KEY not set.")
-        return
-
+    model = get_vllm()
+    experiment_name = "exp_1768614687"
+    experiment_dir = Path("experiments").resolve() / experiment_name
+    
     library_name = "numrs"
-    workspace_dir = Path("workspace_new_curriculum").resolve()
-    library_path = Path("repositories/numrs").resolve()
-    boilerplate_dir = Path("templates/rust_boilerplate").resolve()
+    topic_path = experiment_dir / f"{library_name}_topics.json"
+    exercise_path = experiment_dir / f"{library_name}_exercises.json"
+    workspace_dir = experiment_dir / "workspace"
+    library_path = workspace_dir / "repos/library"
+    boilerplate_dir = Path("templates/rust_template").resolve()
 
     if not workspace_dir.exists():
         print(
@@ -177,10 +204,10 @@ async def main():
         )
         return
 
-    topic_db = TopicDatabase(db_path=str(workspace_dir / "topics.json"))
-    exercise_db = ExerciseDatabase(db_path=str(workspace_dir / "exercises.json"))
+    topic_db = TopicDatabase(db_path=topic_path)
+    exercise_db = ExerciseDatabase(db_path=exercise_path)
 
-    summary_path = workspace_dir / "library_summary.md"
+    summary_path = experiment_dir / "library_summary.md"
     if not summary_path.exists():
         print(f"Error: Library summary not found at {summary_path}")
         return
@@ -191,21 +218,24 @@ async def main():
         return
 
     # Process the first 3 topics
-    selected_topics = topic_db.topics[:3]
+    selected_topics = topic_db.topics
     print(f"Starting with topics: {[t.id for t in selected_topics]}")
 
-    model = LitellmModel(model=model_name, api_key=api_key)
-
-    for topic in selected_topics:
-        await run_exercise_generation_for_topic(
-            model=model,
-            topic=topic,
-            exercise_db=exercise_db,
-            library_summary=library_summary,
-            library_name=library_name,
-            boilerplate_dir=boilerplate_dir,
-            library_path=library_path,
-        )
+    await gather_with_semaphore(
+        [
+            run_exercise_generation_for_topic(
+                model=model,
+                topic=topic,
+                exercise_db=exercise_db,
+                library_summary=library_summary,
+                library_name=library_name,
+                boilerplate_dir=boilerplate_dir,
+                library_path=library_path,
+            )
+            for topic in selected_topics
+        ],
+        max_concurrent=20,
+    )
 
     print("\n=== Exercises Generated ===")
     for e in exercise_db.exercises:

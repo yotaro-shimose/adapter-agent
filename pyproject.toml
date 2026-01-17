@@ -29,14 +29,29 @@ build-backend = "hatchling.build"
 [tool.uv]
 no-binary-package = ["flash-attn"]
 no-build-isolation-package = ["flash-attn"]
+index-strategy = "unsafe-best-match"
 
 [tool.uv.sources]
 coder-mcp = { path = "../coder-mcp" }
 oai-utils = { path = "../oai_utils", editable = true }
-
+torch = [
+    { index = "pytorch-cu130" }
+]
+vllm = [
+    { index = "vllm-cu130" }
+]
 [project.optional-dependencies]
 test = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
 ]
 
+
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+
+[[tool.uv.index]]
+name = "vllm-cu130"
+url = "https://wheels.vllm.ai/0.13.0/cu130"
