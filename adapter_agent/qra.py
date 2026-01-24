@@ -1,8 +1,13 @@
 from typing import Self
-from datasets import Dataset
-import polars as pl
 
+import polars as pl
+from datasets import Dataset
 from pydantic import BaseModel
+
+
+class QA(BaseModel):
+    question: str
+    answer: str
 
 
 class QRA(BaseModel):

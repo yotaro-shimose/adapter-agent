@@ -7,8 +7,6 @@ requires-python = ">=3.12"
 dependencies = [
     "loguru>=0.7.3",
     "mcp>=1.25.0",
-    "openai>=1.0.0",
-    "openai-agents>=0.6.4",
     "peft>=0.18.1",
     "polars>=1.37.1",
     "python-dotenv>=1.0.0",
@@ -20,6 +18,9 @@ dependencies = [
     "vllm>=0.13.0",
     "coder-mcp",
     "oai-utils",
+    "openai>=2.14.0",
+    "openai-agents>=0.6.6",
+    "litellm==1.81",
 ]
 
 [build-system]
@@ -32,7 +33,7 @@ no-build-isolation-package = ["flash-attn"]
 index-strategy = "unsafe-best-match"
 
 [tool.uv.sources]
-coder-mcp = { path = "../coder-mcp" }
+coder-mcp = { path = "../coder-mcp", editable = true }
 oai-utils = { path = "../oai_utils", editable = true }
 torch = [
     { index = "pytorch-cu130" }

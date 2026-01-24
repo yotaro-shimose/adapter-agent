@@ -1,8 +1,8 @@
 import asyncio
-from abc import ABC
 import json
+from abc import ABC
 from pathlib import Path
-from typing import Generic, TypeVar, List, Optional, Type
+from typing import List, Optional, Type
 
 from pydantic import BaseModel, Field
 
@@ -24,10 +24,7 @@ class Exercise(IdentifiableModel):
     answer: str
 
 
-T = TypeVar("T", bound=IdentifiableModel)
-
-
-class BaseDatabase(Generic[T], ABC):
+class BaseDatabase[T: IdentifiableModel](ABC):
     def __init__(self, item_type: Type[T], db_path: str | Path):
         self.item_type = item_type
         self.db_path = Path(db_path)
@@ -46,7 +43,7 @@ class BaseDatabase(Generic[T], ABC):
 
     def save(self):
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        data = [t.model_dump() for t in self.items]
+        data = [t.model_dump(mode="json") for t in self.items]
         self.db_path.write_text(json.dumps(data, indent=2))
 
     async def add_item(self, item: T):
