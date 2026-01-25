@@ -61,19 +61,17 @@ class MemoryItem(BaseModel, Generic[InputT, OutputT]):
 
 class Memory(BaseModel, Generic[InputT, OutputT]):
     items: list[MemoryItem[InputT, OutputT]] = []
-    file_path: Optional[str] = None
 
     def add(self, input: InputT, output: OutputT) -> None:
         self.items.append(MemoryItem(input=input, output=output, timestamp=time.time()))
 
-    def save(self) -> None:
-        if self.file_path:
-            with open(self.file_path, "w") as f:
-                f.write(self.model_dump_json(indent=2))
+    def save(self, path: Path) -> None:
+        with path.open("w") as f:
+            f.write(self.model_dump_json(indent=2))
 
-    def load(self) -> None:
-        if self.file_path and Path(self.file_path).exists():
-            with open(self.file_path, "r") as f:
+    def load(self, path: Path) -> None:
+        if path.exists():
+            with path.open("r") as f:
                 data = f.read()
                 # Pydantic's model_validate_json handles generics if TypeAdapter is used externally,
                 # but direct method needs care.
@@ -85,6 +83,10 @@ class Memory(BaseModel, Generic[InputT, OutputT]):
 
 class TaskPool(BaseModel):
     tasks: dict[str, Task]
+
+    def save(self, path: Path) -> None:
+        with path.open("w") as f:
+            f.write(self.model_dump_json(indent=2))
 
     def register(self, task: Task) -> None:
         print(f"Details: Registering task: {task.instruction}")
@@ -108,6 +110,10 @@ class TaskPool(BaseModel):
 
 class SFTDataset(BaseModel):
     items: list[QA] = []
+
+    def save(self, path: Path) -> None:
+        with path.open("w") as f:
+            f.write(self.model_dump_json(indent=2))
 
     def register(self, qra: QA) -> None:
         print(f"Details: Registering QA: {qra.question}")
@@ -209,7 +215,6 @@ If you hit the turn limit without reporting success or failure, it will be consi
                     result = SolverResult(trajectory=trajectory)
 
                 self.memory.add(task, result)
-                self.memory.save()
                 return result
 
             except AgentRunFailure as e:
@@ -222,7 +227,6 @@ If you hit the turn limit without reporting success or failure, it will be consi
                             trajectory=trajectory, is_max_turns_exceeded=True
                         )
                         self.memory.add(task, result)
-                        self.memory.save()
                         return result
                     else:
                         # Should not happen if to_input_list works, but fallback
@@ -231,7 +235,6 @@ If you hit the turn limit without reporting success or failure, it will be consi
                             trajectory=trajectory, is_max_turns_exceeded=True
                         )
                         self.memory.add(task, result)
-                        self.memory.save()
                         return result
                 else:
                     raise
@@ -292,7 +295,6 @@ Your are not supposed to write dedicated test code. Most of the time you just ex
                 result = await agent.run("Verify the solution.", max_turns=30)
                 final_output = result.final_output()
                 self.memory.add(qra, final_output)
-                self.memory.save()
                 return final_output
             except AgentRunFailure as e:
                 print(f"Verification process failed: {e}")
@@ -349,7 +351,6 @@ Return a new Task with a clear instruction.
                 # Ensure new ID
                 task.id = str(uuid.uuid4())
                 self.memory.add(trajectory, task)
-                self.memory.save()
                 return task
             except Exception as e:
                 print(f"Analyzer failed: {e}")
@@ -364,7 +365,6 @@ class TaskList(BaseModel):
     tasks: list[Task]
 
 
-@dataclass
 class DecomposerInput(BaseModel):
     trajectory: Trajectory
     original_instruction: str
@@ -429,7 +429,6 @@ Return a list of Tasks, each with a clear, self-contained instruction.
                 ),
                 task_list,
             )
-            self.memory.save()
             return task_list.tasks
         except Exception as e:
             print(f"Decomposer failed: {e}")
@@ -449,32 +448,23 @@ class Agents:
     decomposer: Decomposer
 
     @classmethod
-    def from_model(cls, model: AgentsSDKModel, base_dir: Path):
-        base_dir.mkdir(parents=True, exist_ok=True)
+    def from_model(cls, model: AgentsSDKModel):
         return cls(
             solver=Solver(
                 model=model,
-                memory=Memory[Task, SolverResult](
-                    file_path=str(base_dir / "memory_solver.json")
-                ),
+                memory=Memory[Task, SolverResult](),
             ),
             verifier=Verifier(
                 model=model,
-                memory=Memory[QA, VerificationResult](
-                    file_path=str(base_dir / "memory_verifier.json")
-                ),
+                memory=Memory[QA, VerificationResult](),
             ),
             analyzer=Analyzer(
                 model=model,
-                memory=Memory[Trajectory, Task](
-                    file_path=str(base_dir / "memory_analyzer.json")
-                ),
+                memory=Memory[Trajectory, Task](),
             ),
             decomposer=Decomposer(
                 model=model,
-                memory=Memory[DecomposerInput, TaskList](
-                    file_path=str(base_dir / "memory_decomposer.json")
-                ),
+                memory=Memory[DecomposerInput, TaskList](),
             ),
         )
 
@@ -486,6 +476,7 @@ async def process_task(
     sft_dataset: SFTDataset,
     workspace_template_location: Path,
     host_lib_dir: Path,
+    experiment_dir: Path,
 ):
     """
     1. リファレンスも使いながらエージェントがとく。
@@ -549,6 +540,14 @@ async def process_task(
                 print(f"Generated subtask: {trajectory_analysis.instruction}")
                 task_pool.register(trajectory_analysis)
 
+    # Save state at the end of the task
+    task_pool.save(experiment_dir / "task_pool.json")
+    sft_dataset.save(experiment_dir / "sft_dataset.json")
+    agents.solver.memory.save(experiment_dir / "memory_solver.json")
+    agents.verifier.memory.save(experiment_dir / "memory_verifier.json")
+    agents.analyzer.memory.save(experiment_dir / "memory_analyzer.json")
+    agents.decomposer.memory.save(experiment_dir / "memory_decomposer.json")
+
 
 async def main():
     load_dotenv()
@@ -561,13 +560,14 @@ async def main():
     base_dir = Path("experiments") / experiment_id
     workspace_template_location = Path("templates") / "rust_template"
     lib_path = Path("repositories") / "numrs"
+    base_dir.mkdir(parents=True, exist_ok=True)
     assert workspace_template_location.exists()
     assert lib_path.exists()
 
     print(f"Experiment ID: {experiment_id}")
     print(f"Base Directory: {base_dir}")
 
-    agents = Agents.from_model(model, base_dir)
+    agents = Agents.from_model(model)
 
     task_pool = TaskPool(tasks={})
     sft_dataset = SFTDataset(items=[])
@@ -597,6 +597,7 @@ async def main():
             sft_dataset=sft_dataset,
             host_lib_dir=lib_path,
             workspace_template_location=workspace_template_location,
+            experiment_dir=base_dir,
         )
         step += 1
 
