@@ -17,10 +17,10 @@ dependencies = [
     "flash-attn",
     "vllm>=0.13.0",
     "coder-mcp",
-    "openai>=2.14.0",
-    "openai-agents>=0.6.6",
     "litellm==1.81",
     "oai-utils",
+    "openai>=2.14.0",
+    "openai-agents>=0.6.6",
 ]
 
 [build-system]
