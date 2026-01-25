@@ -4,7 +4,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Generic, Optional, TypeVar
 
 from agents import (
     RunContextWrapper,
@@ -47,6 +47,40 @@ class Trajectory(BaseModel):
 
     def add_item(self, item: TResponseInputItem) -> None:
         self.input_list.append(item)
+
+
+InputT = TypeVar("InputT")
+OutputT = TypeVar("OutputT")
+
+
+class MemoryItem(BaseModel, Generic[InputT, OutputT]):
+    input: InputT
+    output: OutputT
+    timestamp: float
+
+
+class Memory(BaseModel, Generic[InputT, OutputT]):
+    items: list[MemoryItem[InputT, OutputT]] = []
+    file_path: Optional[str] = None
+
+    def add(self, input: InputT, output: OutputT) -> None:
+        self.items.append(MemoryItem(input=input, output=output, timestamp=time.time()))
+
+    def save(self) -> None:
+        if self.file_path:
+            with open(self.file_path, "w") as f:
+                f.write(self.model_dump_json(indent=2))
+
+    def load(self) -> None:
+        if self.file_path and Path(self.file_path).exists():
+            with open(self.file_path, "r") as f:
+                data = f.read()
+                # Pydantic's model_validate_json handles generics if TypeAdapter is used externally,
+                # but direct method needs care.
+                # Actually model_validate_json on the model instance or class works if type info is preserved.
+                # However, for generic model parsing from JSON, it's safer to rely on internal structure matching.
+                loaded = self.model_validate_json(data)
+                self.items = loaded.items
 
 
 class TaskPool(BaseModel):
@@ -121,6 +155,7 @@ class SolverResult(BaseModel):
 @dataclass
 class Solver:
     model: AgentsSDKModel
+    memory: Memory[Task, SolverResult]
 
     async def try_solve(
         self, task: Task, runtime: Runtime, library_name: str
@@ -169,9 +204,13 @@ If you hit the turn limit without reporting success or failure, it will be consi
                 )
                 trajectory = Trajectory(input_list=result.to_input_list())
                 if context.qra is not None:
-                    return SolverResult(qa=context.qra, trajectory=trajectory)
+                    result = SolverResult(qa=context.qra, trajectory=trajectory)
                 else:
-                    return SolverResult(trajectory=trajectory)
+                    result = SolverResult(trajectory=trajectory)
+
+                self.memory.add(task, result)
+                self.memory.save()
+                return result
 
             except AgentRunFailure as e:
                 if e.cause == "MaxTurnsExceeded":
@@ -179,15 +218,21 @@ If you hit the turn limit without reporting success or failure, it will be consi
                     input_list = e.to_input_list()
                     if input_list:
                         trajectory = Trajectory(input_list=input_list)
-                        return SolverResult(
+                        result = SolverResult(
                             trajectory=trajectory, is_max_turns_exceeded=True
                         )
+                        self.memory.add(task, result)
+                        self.memory.save()
+                        return result
                     else:
                         # Should not happen if to_input_list works, but fallback
                         trajectory = Trajectory(input_list=[])
-                        return SolverResult(
+                        result = SolverResult(
                             trajectory=trajectory, is_max_turns_exceeded=True
                         )
+                        self.memory.add(task, result)
+                        self.memory.save()
+                        return result
                 else:
                     raise
             except Exception as e:
@@ -203,6 +248,7 @@ class VerificationResult(BaseModel):
 @dataclass
 class Verifier:
     model: AgentsSDKModel
+    memory: Memory[QA, VerificationResult]
 
     async def verify(self, qra: QA, runtime: Runtime) -> VerificationResult:
         """
@@ -244,7 +290,10 @@ Your are not supposed to write dedicated test code. Most of the time you just ex
 
             try:
                 result = await agent.run("Verify the solution.", max_turns=30)
-                return result.final_output()
+                final_output = result.final_output()
+                self.memory.add(qra, final_output)
+                self.memory.save()
+                return final_output
             except AgentRunFailure as e:
                 print(f"Verification process failed: {e}")
                 raise
@@ -253,6 +302,7 @@ Your are not supposed to write dedicated test code. Most of the time you just ex
 @dataclass
 class Analyzer:
     model: AgentsSDKModel
+    memory: Memory[Trajectory, Task]
 
     async def analyze_trajectory(
         self, trajectory: Trajectory, runtime: Runtime
@@ -298,6 +348,8 @@ Return a new Task with a clear instruction.
                 task = result.final_output()
                 # Ensure new ID
                 task.id = str(uuid.uuid4())
+                self.memory.add(trajectory, task)
+                self.memory.save()
                 return task
             except Exception as e:
                 print(f"Analyzer failed: {e}")
@@ -313,8 +365,15 @@ class TaskList(BaseModel):
 
 
 @dataclass
+class DecomposerInput(BaseModel):
+    trajectory: Trajectory
+    original_instruction: str
+
+
+@dataclass
 class Decomposer:
     model: AgentsSDKModel
+    memory: Memory[DecomposerInput, TaskList]
 
     async def decompose(
         self, trajectory: Trajectory, original_instruction: str, library_name: str
@@ -363,6 +422,14 @@ Return a list of Tasks, each with a clear, self-contained instruction.
             task_list = result.final_output()
             for task in task_list.tasks:
                 task.id = str(uuid.uuid4())
+
+            self.memory.add(
+                DecomposerInput(
+                    trajectory=trajectory, original_instruction=original_instruction
+                ),
+                task_list,
+            )
+            self.memory.save()
             return task_list.tasks
         except Exception as e:
             print(f"Decomposer failed: {e}")
@@ -382,12 +449,33 @@ class Agents:
     decomposer: Decomposer
 
     @classmethod
-    def from_model(cls, model: AgentsSDKModel):
+    def from_model(cls, model: AgentsSDKModel, base_dir: Path):
+        base_dir.mkdir(parents=True, exist_ok=True)
         return cls(
-            solver=Solver(model=model),
-            verifier=Verifier(model=model),
-            analyzer=Analyzer(model=model),
-            decomposer=Decomposer(model=model),
+            solver=Solver(
+                model=model,
+                memory=Memory[Task, SolverResult](
+                    file_path=str(base_dir / "memory_solver.json")
+                ),
+            ),
+            verifier=Verifier(
+                model=model,
+                memory=Memory[QA, VerificationResult](
+                    file_path=str(base_dir / "memory_verifier.json")
+                ),
+            ),
+            analyzer=Analyzer(
+                model=model,
+                memory=Memory[Trajectory, Task](
+                    file_path=str(base_dir / "memory_analyzer.json")
+                ),
+            ),
+            decomposer=Decomposer(
+                model=model,
+                memory=Memory[DecomposerInput, TaskList](
+                    file_path=str(base_dir / "memory_decomposer.json")
+                ),
+            ),
         )
 
 
@@ -479,7 +567,7 @@ async def main():
     print(f"Experiment ID: {experiment_id}")
     print(f"Base Directory: {base_dir}")
 
-    agents = Agents.from_model(model)
+    agents = Agents.from_model(model, base_dir)
 
     task_pool = TaskPool(tasks={})
     sft_dataset = SFTDataset(items=[])
