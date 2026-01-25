@@ -38,11 +38,26 @@ async def main():
     task_pool = TaskPool(tasks={})
     sft_dataset = SFTDataset(items=[])
 
-    # Initial Task
-    initial_task = Task.from_instruction(
-        instruction="Using the Rust programming language and the `numrs` library, implement a 2D Convolution (Conv2D) layer. The implementation should include a struct for the layer and a forward pass method.",
+    # Task 1: Conversational request (Time Series Analysis)
+    task_pool.register(
+        Task.from_instruction(
+            instruction="I'm analyzing stock prices and need to smooth the data. Could you implement a simple moving average function using `numrs`? It should take a 1D array of prices and a window size, returning the smoothed series.",
+        )
     )
-    task_pool.register(initial_task)
+
+    # Task 2: Formal specification (Machine Learning - Gradient Descent)
+    task_pool.register(
+        Task.from_instruction(
+            instruction="Implement a function `gradient_descent_step` using `numrs`. Input: Feature matrix X (2D), Target vector y (1D), Current weights w (1D), Learning rate alpha (f64). Output: Updated weights vector w_new. Formula: w_new = w - alpha * (X^T * (X * w - y)) / n_samples."
+        )
+    )
+
+    # Task 3: Direct functional instruction (Clustering / Geometry)
+    task_pool.register(
+        Task.from_instruction(
+            instruction="Write a Rust function using `numrs` that computes the pairwise Euclidean distance between two sets of row vectors, A (NxD) and B (MxD). The result should be an NxM matrix where entry (i, j) is the distance between A[i] and B[j]."
+        )
+    )
 
     # Process loop (simple version)
     # Just run until pool empty or max steps
