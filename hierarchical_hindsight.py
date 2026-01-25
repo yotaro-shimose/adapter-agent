@@ -4,19 +4,25 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional
 
-from agents import RunContextWrapper, StopAtTools, TResponseInputItem, function_tool
+from agents import (
+    RunContextWrapper,
+    StopAtTools,
+    TResponseInputItem,
+    add_trace_processor,
+    function_tool,
+)
 from coder_mcp.runtime.runtime import Runtime
 from coder_mcp.runtime.rust_env import RustCodingEnvironment
 from coder_mcp.runtime.temp_workspace import TempWorkspace
 from dotenv import load_dotenv
 from oai_utils.agent import AgentRunFailure, AgentsSDKModel, AgentWrapper
+from oai_utils.tracing import AgentContentPrinter
 from pydantic import BaseModel
 
 from adapter_agent.model_helper import get_gemini
 from adapter_agent.qra import QA
-from curriculum.library import prepare_workspace
 
 
 class Task(BaseModel):
@@ -38,6 +44,9 @@ class Trajectory(BaseModel):
             else:
                 buffer.append(str(item))
         return "\n\n".join(buffer)
+
+    def add_item(self, item: TResponseInputItem) -> None:
+        self.input_list.append(item)
 
 
 class TaskPool(BaseModel):
@@ -78,11 +87,46 @@ class SolverContext(BaseModel):
     qra: QA | None = None
 
 
+@function_tool
+def report_success(
+    wrapper: RunContextWrapper[SolverContext],
+    question: str,
+    answer: str,
+) -> None:
+    """
+    Report that the task has been successfully solved.
+    Args:
+        question: The original task instruction or a refined version of it.
+        answer: The final solution (code and explanation).
+    """
+    wrapper.context.qra = QA(
+        question=question,
+        answer=answer,
+    )
+
+
+@function_tool
+def report_failure() -> None:
+    """
+    Report that the task could not be solved.
+    Args:
+        reason: The reason for failure.
+    """
+    pass
+
+
+class SolverResult(BaseModel):
+    qa: QA | None = None
+    trajectory: Trajectory
+
+
 @dataclass
 class Solver:
     model: AgentsSDKModel
 
-    async def try_solve(self, task: Task, runtime: Runtime) -> Union[QA, Trajectory]:
+    async def try_solve(
+        self, task: Task, runtime: Runtime, library_name: str
+    ) -> SolverResult:
         """
         タスクを解いてみる。
         もしタスクを解くことができたらSolutionを生成してReturnする。
@@ -95,8 +139,10 @@ You are an expert Rust software engineer.
 Your task is to solve the following problem:
 {task.instruction}
 
-You should specifically use the `numrs` library for numerical operations if applicable. 
-Assume `numrs` is available in the environment.
+You are working in a cargo-initialized project.
+The `{library_name}` library source code is located at `workspace_dir/repos/{library_name}` in case you do not know its API usage.
+The library is just for reference and is already installed in the workspace_dir, so you do not need to run `cargo add`.
+You must not add the repository as path dependency. Stick with the version that is already installed.
 
 You have access to a coding environment. You can write and run code to test your solution.
 Once you have defined a solution and confirmed it works (to the best of your ability), you MUST call the `report_success` tool.
@@ -104,33 +150,6 @@ If you find that you cannot solve the problem, you MUST call the `report_failure
 
 If you hit the turn limit without reporting success or failure, it will be considered a failure.
 """
-
-        @function_tool
-        def report_success(
-            wrapper: RunContextWrapper[SolverContext],
-            question: str,
-            answer: str,
-        ) -> None:
-            """
-            Report that the task has been successfully solved.
-            Args:
-                question: The original task instruction or a refined version of it.
-                answer: The final solution (code and explanation).
-                reasoning: The thought process leading to the solution.
-            """
-            wrapper.context.qra = QA(
-                question=question,
-                answer=answer,
-            )
-
-        @function_tool
-        def report_failure() -> None:
-            """
-            Report that the task could not be solved.
-            Args:
-                reason: The reason for failure.
-            """
-            pass
 
         async with runtime.coder_mcp() as coder_mcp:
             agent = AgentWrapper.create(
@@ -150,12 +169,14 @@ If you hit the turn limit without reporting success or failure, it will be consi
                 result = await agent.run(
                     "Please solve the task.", max_turns=30, context=context
                 )
+                trajectory = Trajectory(input_list=result.to_input_list())
                 if context.qra is not None:
-                    return context.qra
+                    return SolverResult(qa=context.qra, trajectory=trajectory)
                 else:
-                    return Trajectory(input_list=result.to_input_list())
+                    return SolverResult(trajectory=trajectory)
 
             except AgentRunFailure as e:
+                # We have not yet decided what to do in this case.
                 print(f"Solver failed (AgentRunFailure): {e}")
                 raise NotImplementedError
             except Exception as e:
@@ -167,7 +188,7 @@ If you hit the turn limit without reporting success or failure, it will be consi
 class Verifier:
     model: AgentsSDKModel
 
-    async def verify(self, qra: QA, runtime: Runtime) -> bool:
+    async def verify(self, qra: QA, runtime: Runtime) -> VerificationResult:
         """
         Questionに対してAnswerが問題を解決できるものとなっているかどうかをコードの実行などを通じて検証して、QAが正しければTrueをリターンする。
         """
@@ -183,11 +204,14 @@ Question:
 Answer to Verify:
 {qra.answer}
 
+You are starting from the state where the Solver agent finished its implementation.
+The workspace is a cargo-initialized project.
+
 You must:
 1. Create a verification script (e.g., a Rust test or main function) that checks if the code in the Answer works as expected.
 2. Run the verification script.
 3. If it compiles and runs correctly producing the expected output, report success.
-4. If it fails, report failure with reasoning.
+4. If it fails, report failure with reasoning in JSON.
 """
         async with runtime.coder_mcp() as coder_mcp:
             agent = AgentWrapper[VerificationResult].create(
@@ -199,11 +223,11 @@ You must:
             )
 
             try:
-                result = await agent.run("Verify the solution.", max_turns=10)
-                return result.final_output().success
-            except Exception as e:
+                result = await agent.run("Verify the solution.", max_turns=30)
+                return result.final_output()
+            except AgentRunFailure as e:
                 print(f"Verification process failed: {e}")
-                return False
+                raise
 
 
 @dataclass
@@ -222,6 +246,9 @@ class Analyzer:
         PROMPT = f"""
 You are a Senior Engineer analyzing a Junior Engineer's failure.
 The Junior Engineer tried to solve a task but failed.
+You can see the current state of the workspace where the Junior Engineer finished execution.
+The workspace is a cargo-initialized project.
+
 Here is the execution log (Trajectory):
 {trajectory.as_str()}
 
@@ -267,14 +294,22 @@ class Agents:
     verifier: Verifier
     analyzer: Analyzer
 
+    @classmethod
+    def from_model(cls, model: AgentsSDKModel):
+        return cls(
+            solver=Solver(model=model),
+            verifier=Verifier(model=model),
+            analyzer=Analyzer(model=model),
+        )
+
 
 async def process_task(
     agents: Agents,
     task: Task,
     task_pool: TaskPool,
     sft_dataset: SFTDataset,
-    lib_dest: Path,
-    workspace_dir: Path,
+    workspace_template_location: Path,
+    host_lib_dir: Path,
 ):
     """
     1. リファレンスも使いながらエージェントがとく。
@@ -284,45 +319,38 @@ async def process_task(
     print(f"Processing Task: {task.instruction}")
 
     # Inject the already prepared library
-    injections = {lib_dest: "repositories/numrs"}
+    injections = {host_lib_dir: f"repositories/{host_lib_dir.name}"}
 
-    async with TempWorkspace(workspace_dir, injections=injections) as temp_workspace:
-        # We might want to persist the same rust_env for solver and verifier if we want them to share state?
-        # But usually Verifier should start fresh or verified on clean slate.
-        # The prompt says "Verifier verifies Solution". Usually independent verification is better.
-
+    async with TempWorkspace(
+        workspace_template_location, injections=injections
+    ) as temp_workspace:
         async with RustCodingEnvironment(workspace_dir=temp_workspace) as rust_env:
-            solver_result = await agents.solver.try_solve(task, rust_env)
+            solver_result = await agents.solver.try_solve(
+                task, rust_env, host_lib_dir.name
+            )
 
             if isinstance(solver_result, QA):
                 print("Solver produced a QA. Verifying...")
                 verification_result = await agents.verifier.verify(
                     solver_result, rust_env
                 )
-                if verification_result:
+                if verification_result.success:
                     print("Verification SUCCESS.")
                     sft_dataset.register(solver_result)
                     # Task is effectively done (popped from pool by caller or here?)
                     pass
                 else:
                     print("Verification FAILED.")
-                    # We will implement 5 (Analyzer) for now as fallback for any failure.
-                    # Create a synthetic input list for the fake trajectory
-                    fake_input_list: list[TResponseInputItem] = [
-                        {"role": "user", "content": f"Task: {task.instruction}"},
+                    print(verification_result.reasoning)
+                    solver_result.trajectory.add_item(
                         {
-                            "role": "assistant",
-                            "content": f"Proposed Answer: {solver_result.answer}",
-                        },
-                        {
-                            "role": "system",
-                            "content": "Verification failed. The answer did not pass the verification step.",
-                        },
-                    ]
-                    fake_trajectory = Trajectory(input_list=fake_input_list)
+                            "role": "user",
+                            "content": f"We ran verification process with another agent, but verification failed: {verification_result.reasoning}",
+                        }
+                    )
 
                     analysis = await agents.analyzer.analyze_trajectory(
-                        fake_trajectory, rust_env
+                        solver_result.trajectory, rust_env
                     )
                     print(f"Generated subtask: {analysis.instruction}")
                     task_pool.register(analysis)
@@ -340,33 +368,20 @@ async def process_task(
 
 async def main():
     load_dotenv()
+    add_trace_processor(AgentContentPrinter())
 
     model = get_gemini()
 
     # Setup Experiment Directory
     experiment_id = f"hh_exp_{int(time.time())}"
     base_dir = Path("experiments") / experiment_id
-    workspace_dir = base_dir / "workspace"
-    workspace_dir.mkdir(parents=True, exist_ok=True)
+    workspace_template_location = Path("templates") / "rust-template"
+    lib_path = Path("repositories") / "numrs"
 
     print(f"Experiment ID: {experiment_id}")
     print(f"Base Directory: {base_dir}")
 
-    # Path to numrs library source
-    repository_path = Path("/root/workspace/adapter-agent/repositories/numrs")
-    if not repository_path.exists():
-        print(f"Warning: {repository_path} does not exist. Please check path.")
-        return
-
-    # Prepare Workspace (copies lib to workspace_dir/repos/library)
-    # Note: prepare_workspace places it in `workspace_dir/repos/library`
-    lib_dest = await prepare_workspace(workspace_dir, repository_path)
-    print(f"Library prepared at: {lib_dest}")
-
-    solver = Solver(model=model)
-    verifier = Verifier(model=model)
-    analyzer = Analyzer(model=model)
-    agents = Agents(solver=solver, verifier=verifier, analyzer=analyzer)
+    agents = Agents.from_model(model)
 
     task_pool = TaskPool(tasks={})
     sft_dataset = SFTDataset(items=[])
@@ -396,8 +411,8 @@ async def main():
             task=current_task,
             task_pool=task_pool,
             sft_dataset=sft_dataset,
-            lib_dest=lib_dest,
-            workspace_dir=workspace_dir,
+            host_lib_dir=lib_path,
+            workspace_template_location=workspace_template_location,
         )
         step += 1
 

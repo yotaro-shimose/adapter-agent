@@ -38,7 +38,7 @@ async def prepare_workspace(workspace_dir: Path, repository_path: Path) -> Path:
         shutil.rmtree(workspace_dir)
     workspace_dir.mkdir(parents=True, exist_ok=True)
 
-    lib_dest = workspace_dir / "repos" / "library"
+    lib_dest = workspace_dir / "repos" / repository_path.name
     lib_dest.parent.mkdir(parents=True, exist_ok=True)
     if not lib_dest.exists():
         if repository_path.exists():
