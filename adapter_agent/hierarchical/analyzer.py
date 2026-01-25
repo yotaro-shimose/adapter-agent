@@ -67,5 +67,5 @@ Return a new Task with a clear instruction.
                 print(f"Analyzer failed: {e}")
                 # Fallback task
                 return Task.from_instruction(
-                    instruction="Read the numrs documentation and summarize basic usage.",
+                    instruction="Read the numrs2 documentation and summarize basic usage.",
                 )

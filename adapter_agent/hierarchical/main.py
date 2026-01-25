@@ -39,47 +39,56 @@ async def main():
     sft_dataset = SFTDataset(items=[])
 
     # Task 1: Conversational request (Time Series Analysis)
-    task_pool.register(
+    await task_pool.register(
         Task.from_instruction(
-            instruction="I'm analyzing stock prices and need to smooth the data. Could you implement a simple moving average function using `numrs`? It should take a 1D array of prices and a window size, returning the smoothed series.",
+            instruction="I'm analyzing stock prices and need to smooth the data. Could you implement a simple moving average function using `numrs2`? It should take a 1D array of prices and a window size, returning the smoothed series.",
         )
     )
 
     # Task 2: Formal specification (Machine Learning - Gradient Descent)
-    task_pool.register(
+    await task_pool.register(
         Task.from_instruction(
-            instruction="Implement a function `gradient_descent_step` using `numrs`. Input: Feature matrix X (2D), Target vector y (1D), Current weights w (1D), Learning rate alpha (f64). Output: Updated weights vector w_new. Formula: w_new = w - alpha * (X^T * (X * w - y)) / n_samples."
+            instruction="Implement a function `gradient_descent_step` using `numrs2`. Input: Feature matrix X (2D), Target vector y (1D), Current weights w (1D), Learning rate alpha (f64). Output: Updated weights vector w_new. Formula: w_new = w - alpha * (X^T * (X * w - y)) / n_samples."
         )
     )
 
     # Task 3: Direct functional instruction (Clustering / Geometry)
-    task_pool.register(
+    await task_pool.register(
         Task.from_instruction(
-            instruction="Write a Rust function using `numrs` that computes the pairwise Euclidean distance between two sets of row vectors, A (NxD) and B (MxD). The result should be an NxM matrix where entry (i, j) is the distance between A[i] and B[j]."
+            instruction="Write a Rust function using `numrs2` that computes the pairwise Euclidean distance between two sets of row vectors, A (NxD) and B (MxD). The result should be an NxM matrix where entry (i, j) is the distance between A[i] and B[j]."
         )
     )
 
-    # Process loop (simple version)
-    # Just run until pool empty or max steps
-    max_steps = 3
-    step = 0
+    async def worker(worker_id: int):
+        print(f"Worker {worker_id} started.")
+        while True:
+            task = await task_pool.pop_task()
+            if task is None:
+                print(f"Worker {worker_id} stopping (shutdown signal received).")
+                break
 
-    while step < max_steps:
-        current_task = task_pool.pop_random()
-        if not current_task:
-            print("Task pool empty.")
-            break
+            try:
+                await process_task(
+                    agents=agents,
+                    task=task,
+                    task_pool=task_pool,
+                    sft_dataset=sft_dataset,
+                    host_lib_dir=lib_path,
+                    workspace_template_location=workspace_template_location,
+                    experiment_dir=base_dir,
+                )
+            except Exception as e:
+                print(
+                    f"Worker {worker_id} encountered an error processing task {task.id}: {e}"
+                )
+            finally:
+                # Mark task as finished regardless of success or failure
+                await task_pool.finish_task(task)
 
-        await process_task(
-            agents=agents,
-            task=current_task,
-            task_pool=task_pool,
-            sft_dataset=sft_dataset,
-            host_lib_dir=lib_path,
-            workspace_template_location=workspace_template_location,
-            experiment_dir=base_dir,
-        )
-        step += 1
+    # Spawn workers
+    num_workers = 5
+    workers = [asyncio.create_task(worker(i)) for i in range(num_workers)]
+    await asyncio.gather(*workers)
 
 
 if __name__ == "__main__":

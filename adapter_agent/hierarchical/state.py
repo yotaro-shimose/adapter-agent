@@ -1,4 +1,5 @@
-import random
+import asyncio
+from pydantic import PrivateAttr
 from pathlib import Path
 from typing import Optional
 
@@ -11,30 +12,67 @@ from adapter_agent.qra import QA
 class TaskPool(BaseModel):
     tasks: dict[str, Task]
 
+    # Private attributes for concurrency control
+    _lock: asyncio.Lock = PrivateAttr(default=None)
+    _condition: asyncio.Condition = PrivateAttr(default=None)
+    _active_workers: int = PrivateAttr(default=0)
+
+    def __init__(self, **data):
+        super().__init__(**data)
+        # We can't init asyncio primitives here easily if loop isn't running or depends on context
+        # We will lazy init or expect explicit setup if needed.
+        # But actually, if main() runs asyncio.run(), the loop is active.
+        # Use simple lazy property or check in methods.
+
+    def _ensure_primitives(self):
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+            self._condition = asyncio.Condition(lock=self._lock)
+
+    async def register(self, task: Task) -> None:
+        self._ensure_primitives()
+        async with self._lock:
+            print(f"Details: Registering task: {task.instruction}")
+            self.tasks[task.id] = task
+            self._condition.notify_all()
+
+    async def pop_task(self) -> Optional[Task]:
+        """
+        Wait for a task to be available.
+        Returns None if no tasks are left AND no workers are active (shutdown).
+        """
+        self._ensure_primitives()
+        async with self._lock:
+            while True:
+                if self.tasks:
+                    # Atomic pop
+                    task_id = next(iter(self.tasks))
+                    task = self.tasks.pop(task_id)
+                    self._active_workers += 1
+                    return task
+
+                if self._active_workers == 0:
+                    # No tasks and no one working on tasks -> We are done.
+                    return None
+
+                # Wait for something to happen (new task registered or a worker finishing)
+                await self._condition.wait()
+
+    async def finish_task(self, task: Task) -> None:
+        """
+        Call this when a worker finishes processing a task.
+        """
+        self._ensure_primitives()
+        async with self._lock:
+            self._active_workers -= 1
+            # Notify waiters (pop_task might return None if active_workers drops to 0)
+            self._condition.notify_all()
+
     def save(self, path: Path) -> None:
+        # Note: This is synchronous and might be unsafe if called concurrently without lock.
+        # But for saving at the end, it is fine.
         with path.open("w") as f:
             f.write(self.model_dump_json(indent=2))
-
-    def register(self, task: Task) -> None:
-        # Avoid circular dependency or simply print?
-        # Original had print statements.
-        print(f"Details: Registering task: {task.instruction}")
-        self.tasks[task.id] = task
-
-    def get(self, task_id: str) -> Optional[Task]:
-        return self.tasks.get(task_id)
-
-    def delete(self, task_id: str) -> None:
-        if task_id in self.tasks:
-            del self.tasks[task_id]
-
-    def pop_random(self) -> Task | None:
-        if not self.tasks:
-            return None
-        task_id = random.choice(list(self.tasks.keys()))
-        task = self.tasks[task_id]
-        self.delete(task_id)
-        return task
 
 
 class SFTDataset(BaseModel):

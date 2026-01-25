@@ -43,7 +43,7 @@ async def process_task(
                 )
                 for new_task in new_tasks:
                     print(f"Generated practice task: {new_task.instruction}")
-                    task_pool.register(new_task)
+                    await task_pool.register(new_task)
 
             elif isinstance(solver_result.qa, QA):
                 print("Solver produced a QA. Verifying...")
@@ -69,7 +69,7 @@ async def process_task(
                         solver_result.trajectory, rust_env
                     )
                     print(f"Generated subtask: {analysis.instruction}")
-                    task_pool.register(analysis)
+                    await task_pool.register(analysis)
 
             else:
                 # Normal failure (report_failure called or other implicit failure without timeout)
@@ -78,7 +78,7 @@ async def process_task(
                     solver_result.trajectory, rust_env
                 )
                 print(f"Generated subtask: {trajectory_analysis.instruction}")
-                task_pool.register(trajectory_analysis)
+                await task_pool.register(trajectory_analysis)
 
     # Save state at the end of the task
     task_pool.save(experiment_dir / "task_pool.json")
