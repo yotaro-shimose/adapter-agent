@@ -63,7 +63,9 @@ class TaskPool(BaseModel):
         if task_id in self.tasks:
             del self.tasks[task_id]
 
-    def pop_random(self) -> Task:
+    def pop_random(self) -> Task | None:
+        if not self.tasks:
+            return None
         task_id = random.choice(list(self.tasks.keys()))
         task = self.tasks[task_id]
         self.delete(task_id)
@@ -76,11 +78,6 @@ class SFTDataset(BaseModel):
     def register(self, qra: QA) -> None:
         print(f"Details: Registering QA: {qra.question}")
         self.items.append(qra)
-
-
-class VerificationResult(BaseModel):
-    success: bool
-    reasoning: str
 
 
 class SolverContext(BaseModel):
@@ -118,6 +115,7 @@ def report_failure() -> None:
 class SolverResult(BaseModel):
     qa: QA | None = None
     trajectory: Trajectory
+    is_max_turns_exceeded: bool = False
 
 
 @dataclass
@@ -176,12 +174,30 @@ If you hit the turn limit without reporting success or failure, it will be consi
                     return SolverResult(trajectory=trajectory)
 
             except AgentRunFailure as e:
-                # We have not yet decided what to do in this case.
-                print(f"Solver failed (AgentRunFailure): {e}")
-                raise NotImplementedError
+                if e.cause == "MaxTurnsExceeded":
+                    print("Details: Solver hit MaxTurnsExceeded.")
+                    input_list = e.to_input_list()
+                    if input_list:
+                        trajectory = Trajectory(input_list=input_list)
+                        return SolverResult(
+                            trajectory=trajectory, is_max_turns_exceeded=True
+                        )
+                    else:
+                        # Should not happen if to_input_list works, but fallback
+                        trajectory = Trajectory(input_list=[])
+                        return SolverResult(
+                            trajectory=trajectory, is_max_turns_exceeded=True
+                        )
+                else:
+                    raise
             except Exception as e:
                 print(f"Solver error: {e}")
                 raise NotImplementedError
+
+
+class VerificationResult(BaseModel):
+    success: bool
+    reasoning: str
 
 
 @dataclass
@@ -204,14 +220,18 @@ Question:
 Answer to Verify:
 {qra.answer}
 
-You are starting from the state where the Solver agent finished its implementation.
 The workspace is a cargo-initialized project.
+You are starting from the state where the Solver agent finished its implementation.
 
 You must:
-1. Create a verification script (e.g., a Rust test or main function) that checks if the code in the Answer works as expected.
-2. Run the verification script.
-3. If it compiles and runs correctly producing the expected output, report success.
-4. If it fails, report failure with reasoning in JSON.
+1. First, check if the provided code works without error.
+2. After that, read the source code to check if the solution is not cheating and satisfies the question.
+3. Then, respond with JSON with the following fields:
+    - success: bool
+    - reasoning: str
+Do not waste tool calls to use them as your scratchpad.
+Include your deep analysis in the reasoning field.
+Your are not supposed to write dedicated test code. Most of the time you just execute the provided code, or add debug print statements at maximum.
 """
         async with runtime.coder_mcp() as coder_mcp:
             agent = AgentWrapper[VerificationResult].create(
@@ -256,7 +276,7 @@ Your goal is to create a *simpler* sub-task that helps bridge the gap.
 The sub-task should be:
 1. Self-contained.
 2. Easier than the original failed task.
-3. Related to the specific failure point (e.g., if they failed to import `numrs::tensor`, the task should be "Create a basic tensor in numrs").
+3. Related to the specific failure point.
 
 Return a new Task with a clear instruction.
 """
@@ -288,11 +308,78 @@ Return a new Task with a clear instruction.
                 )
 
 
+class TaskList(BaseModel):
+    tasks: list[Task]
+
+
+@dataclass
+class Decomposer:
+    model: AgentsSDKModel
+
+    async def decompose(
+        self, trajectory: Trajectory, original_instruction: str, library_name: str
+    ) -> list[Task]:
+        """
+        Solverが時間切れ(MaxTurnsExceeded)で失敗した場合に呼ばれる。
+        元のタスクが難しすぎたため、より簡単でself-containedな練習問題（サブタスク）を作成する。
+        """
+        print("Details: Decomposing task due to MaxTurnsExceeded...")
+
+        PROMPT = f"""
+You are a Teacher mentoring a student (Agent).
+The student failed to complete the following task because it was too difficult (Code limit exceeded).
+Task: "{original_instruction}"
+
+Here is the partial progress (Trajectory) of the student:
+{trajectory.as_str()}
+
+Your goal is to create 2-3 *conceptually simpler* practice tasks that isolate core concepts required for the original task.
+The goal is NOT to solve the original task, but to "practice" specific parts of it.
+
+Constraints for the new tasks:
+1. **Completely Self-contained**: Each task must be a standalone assignment. It must NOT assume any prior files, state, or context from previous attempts.
+2. **Fresh Start**: Assume the agent starts in a fresh, clean cargo project. The `{library_name}` library is already available. Do not ask the agent to create a sub-directory for the project.
+3. **No Context Continuity**: Do NOT reference the failed task's context or imply continuity (e.g., AVOID phrases like "continue with...", "before implementing X...", "as part of the previous goal..."). The task must make sense to someone seeing it for the first time without any background knowledge.
+4. **Simpler**: Must be significantly easier than the original task.
+5. **Targeted**: Focus on specific skills or API usages that the agent struggled with.
+6. **Immediate**: The agent should be able to start coding immediately.
+
+Example:
+If the original task was "Implement a complex Neural Network Layer", and they got stuck on matrix multiplication,
+a good practice task would be:
+"Write a function that performs simple matrix multiplication using the `{library_name}` library and prints the result."
+
+Return a list of Tasks, each with a clear, self-contained instruction.
+"""
+        agent = AgentWrapper[TaskList].create(
+            name="Decomposer",
+            instructions=PROMPT,
+            model=self.model,
+            output_type=TaskList,
+        )
+
+        try:
+            result = await agent.run("Create simplified practice tasks.", max_turns=10)
+            task_list = result.final_output()
+            for task in task_list.tasks:
+                task.id = str(uuid.uuid4())
+            return task_list.tasks
+        except Exception as e:
+            print(f"Decomposer failed: {e}")
+            return [
+                Task(
+                    id=str(uuid.uuid4()),
+                    instruction=f"Research the basics required for: {original_instruction}",
+                )
+            ]
+
+
 @dataclass
 class Agents:
     solver: Solver
     verifier: Verifier
     analyzer: Analyzer
+    decomposer: Decomposer
 
     @classmethod
     def from_model(cls, model: AgentsSDKModel):
@@ -300,6 +387,7 @@ class Agents:
             solver=Solver(model=model),
             verifier=Verifier(model=model),
             analyzer=Analyzer(model=model),
+            decomposer=Decomposer(model=model),
         )
 
 
@@ -329,14 +417,23 @@ async def process_task(
                 task, rust_env, host_lib_dir.name
             )
 
-            if isinstance(solver_result, QA):
+            if solver_result.is_max_turns_exceeded:
+                print("Solver timed out. Decomposing task...")
+                new_tasks = await agents.decomposer.decompose(
+                    solver_result.trajectory, task.instruction, host_lib_dir.name
+                )
+                for new_task in new_tasks:
+                    print(f"Generated practice task: {new_task.instruction}")
+                    task_pool.register(new_task)
+
+            elif isinstance(solver_result.qa, QA):
                 print("Solver produced a QA. Verifying...")
                 verification_result = await agents.verifier.verify(
-                    solver_result, rust_env
+                    solver_result.qa, rust_env
                 )
                 if verification_result.success:
                     print("Verification SUCCESS.")
-                    sft_dataset.register(solver_result)
+                    sft_dataset.register(solver_result.qa)
                     # Task is effectively done (popped from pool by caller or here?)
                     pass
                 else:
@@ -355,15 +452,14 @@ async def process_task(
                     print(f"Generated subtask: {analysis.instruction}")
                     task_pool.register(analysis)
 
-            elif isinstance(solver_result, Trajectory):
+            else:
+                # Normal failure (report_failure called or other implicit failure without timeout)
                 print("Solver failed to produce QA. Analyzing trajectory...")
                 trajectory_analysis = await agents.analyzer.analyze_trajectory(
-                    solver_result, rust_env
+                    solver_result.trajectory, rust_env
                 )
                 print(f"Generated subtask: {trajectory_analysis.instruction}")
                 task_pool.register(trajectory_analysis)
-            else:
-                raise ValueError(f"Unexpected solver result: {solver_result}")
 
 
 async def main():
@@ -375,8 +471,10 @@ async def main():
     # Setup Experiment Directory
     experiment_id = f"hh_exp_{int(time.time())}"
     base_dir = Path("experiments") / experiment_id
-    workspace_template_location = Path("templates") / "rust-template"
+    workspace_template_location = Path("templates") / "rust_template"
     lib_path = Path("repositories") / "numrs"
+    assert workspace_template_location.exists()
+    assert lib_path.exists()
 
     print(f"Experiment ID: {experiment_id}")
     print(f"Base Directory: {base_dir}")
@@ -387,8 +485,6 @@ async def main():
     sft_dataset = SFTDataset(items=[])
 
     # Initial Task
-    # "Using numrs library, create a Conv2D layer"
-    # User said: "initial task ... TaskPool ... instructions self-contained ... mention language and library"
     initial_task = Task(
         id=str(uuid.uuid4()),
         instruction="Using the Rust programming language and the `numrs` library, implement a 2D Convolution (Conv2D) layer. The implementation should include a struct for the layer and a forward pass method.",

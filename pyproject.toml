@@ -17,10 +17,10 @@ dependencies = [
     "flash-attn",
     "vllm>=0.13.0",
     "coder-mcp",
-    "oai-utils",
     "openai>=2.14.0",
     "openai-agents>=0.6.6",
     "litellm==1.81",
+    "oai-utils",
 ]
 
 [build-system]
@@ -34,13 +34,13 @@ index-strategy = "unsafe-best-match"
 
 [tool.uv.sources]
 coder-mcp = { path = "../coder-mcp", editable = true }
-oai-utils = { path = "../oai_utils", editable = true }
 torch = [
     { index = "pytorch-cu130" }
 ]
 vllm = [
     { index = "vllm-cu130" }
 ]
+oai-utils = { path = "../oai_utils", editable = true }
 [project.optional-dependencies]
 test = [
     "pytest>=8.0.0",
