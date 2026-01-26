@@ -1,0 +1,163 @@
+import asyncio
+from pathlib import Path
+from typing import List, Literal
+
+import polars as pl
+from dotenv import load_dotenv
+from google.cloud import bigquery
+from oai_utils.agent import AgentWrapper
+from pydantic import BaseModel
+
+from adapter_agent.model_helper import get_gemini
+
+load_dotenv()
+
+
+class Library(BaseModel):
+    name: str
+    local_path: Path
+
+
+class BenchmarkCase(BaseModel):
+    problem_statement: str
+    tags: List[str]
+    difficulty: Literal["Easy", "Medium", "Hard"]
+
+
+class FilterResult(BaseModel):
+    appropriate: bool
+    reason: str
+
+
+async def generate_benchmark_case(content: str, library: Library) -> BenchmarkCase:
+    # Read library README for context
+    try:
+        with open(library.local_path, "r") as f:
+            library_context = f.read()
+    except FileNotFoundError:
+        library_context = f"{library.name} is a software library."
+
+    agent = AgentWrapper[BenchmarkCase].create(
+        name=f"{library.name}BenchmarkGenerator",
+        instructions=(
+            f"You are an expert in {library.name}. "
+            f"You are generating benchmark problems for the library '{library.name}'. Here is the library's documentation:\n\n{library_context}\n\n"
+            "Your task is to analyze Python code snippets using common numerical or utility libraries (like numpy) and extract the core mathematical or logical kernel. "
+            f"Then, formulate a CONCRETE, self-contained benchmark problem statement for implementing this kernel using the '{library.name}' library. "
+            "\n### Requirements for the Problem Statement:\n"
+            "1. **Specificity**: Explicitly describe the input and output data structures and types.\n"
+            "2. **Algorithm Detail**: Describe the exact sequence of operations to perform.\n"
+            "3. **Avoid API Hallucination**: Do NOT mention specific internal function or class names of the target library as you might hallucinate them. Refer to them generically.\n"
+            "4. **No Domain Context**: Describe the task in terms of raw data and transformations, removing specific application-domain jargon.\n"
+            "5. **Data Generation**: Describe how the test data should be generated or initialized.\n"
+            "6. **Natural Language**: The final statement should be clear, professional natural language.\n\n"
+            "Do NOT provide solution code. Just describe the task clearly in the 'problem_statement' field."
+        ),
+        model=get_gemini(),
+        output_type=BenchmarkCase,
+    )
+    result = await agent.run(
+        f"Analyze this code and generate a {library.name} benchmark problem statement:\n\n```python\n{content}\n```"
+    )
+    return result.final_output()
+
+
+async def filter_benchmark_case(
+    benchmark_case: BenchmarkCase, library: Library
+) -> FilterResult:
+    # Read library README for context
+    try:
+        with open(library.local_path, "r") as f:
+            library_context = f.read()
+    except FileNotFoundError:
+        library_context = f"{library.name} is a software library."
+
+    agent = AgentWrapper[FilterResult].create(
+        name=f"{library.name}BenchmarkFilter",
+        instructions=(
+            f"You are a strict quality control agent for the '{library.name}' benchmark dataset. "
+            f"Here is the '{library.name}' library documentation:\n\n{library_context}\n\n"
+            "Evaluate whether the following benchmark problem statement is appropriate based on these CRITICAL criteria:\n"
+            f"1. **Scope Fit**: The task must reasonably fall within the scope of the library '{library.name}'.\n"
+            f"2. **No API Hallucination**: Reject tasks that mention specific internal functions, modules, or types of '{library.name}' that are not explicitly documented in the provided README. We want natural language problems, not code-like specs.\n"
+            "3. **Zero External Setup**: Reject tasks that imply external files, large datasets, or specialized hardware unless they describe how to generate/simulate them. The task should be self-contained.\n\n"
+            "If the task violates any of these, set 'appropriate' to False and provide a mandatory 'reason' explaining which criterion was failed."
+        ),
+        model=get_gemini(),
+        output_type=FilterResult,
+    )
+
+    result = await agent.run(
+        f"Evaluate this problem statement for the library '{library.name}':\n\n{benchmark_case.problem_statement}\n\nTags: {benchmark_case.tags}"
+    )
+    return result.final_output()
+
+
+async def main():
+    # Define target library
+    library = Library(name="numrs", local_path=Path("repositories/numrs/README.md"))
+
+    # 1. Initialize the BigQuery client
+    client = bigquery.Client(project="dsat2-405406")
+
+    # 2. Define your SQL query
+    sql_query = """
+    SELECT content, binary
+    FROM `bigquery-public-data.github_repos.sample_contents` 
+    WHERE content LIKE '%import numpy as np%'
+    LIMIT 20
+    """
+
+    # 3. Run the query
+    print(f"Running BigQuery for {library.name} benchmarks...")
+    query_job = client.query(sql_query)
+
+    # 4. Wait for the job to complete and get results
+    results = query_job.result()
+
+    output_file = "benchmark_dataset.csv"
+    print(f"Top 20 contents. Saving to {output_file}...")
+
+    data_rows = []
+
+    for row in results:
+        if row.binary:
+            continue
+
+        content = row.content
+        print("-" * 40)
+        print("Analyzing snippet...")
+
+        try:
+            benchmark_case = await generate_benchmark_case(content, library)
+            print(f"Generated Case: {benchmark_case.problem_statement}")
+
+            print("Filtering case...")
+            filter_result = await filter_benchmark_case(benchmark_case, library)
+            print(
+                f"Appropriate: {filter_result.appropriate}, Reason: {filter_result.reason}"
+            )
+
+            data_rows.append(
+                {
+                    "problem_statement": benchmark_case.problem_statement,
+                    "tags": ",".join(benchmark_case.tags),
+                    "difficulty": benchmark_case.difficulty,
+                    "appropriate": filter_result.appropriate,
+                    "reason": filter_result.reason,
+                }
+            )
+
+        except Exception as e:
+            print(f"Error generating/filtering case: {e}")
+
+    if data_rows:
+        df = pl.DataFrame(data_rows)
+        df.write_csv(output_file)
+        print(f"Saved {len(data_rows)} rows to {output_file}")
+    else:
+        print("No data rows generated.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
