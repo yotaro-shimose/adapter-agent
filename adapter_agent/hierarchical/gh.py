@@ -25,11 +25,17 @@ class Library(BaseModel):
 
 class BenchmarkCase(BaseModel):
     problem_statement: str
-    tags: List[str]
     difficulty: Literal["Easy", "Medium", "Hard"]
 
 
 class FilterResult(BaseModel):
+    appropriate: bool
+    reason: str
+
+
+class BenchmarkResult(BaseModel):
+    problem_statement: str
+    difficulty: Literal["Easy", "Medium", "Hard"]
     appropriate: bool
     reason: str
 
@@ -67,7 +73,8 @@ async def generate_benchmark_case(
         output_type=BenchmarkCase,
     )
     result = await agent.run(
-        f"Analyze this code and generate a {library.name} benchmark problem statement:\n\n```python\n{content}\n```"
+        f"Analyze this code and generate a {library.name} benchmark problem statement:\n\n```python\n{content}\n```",
+        time_out_seconds=60,
     )
     return result.final_output()
 
@@ -98,16 +105,15 @@ async def filter_benchmark_case(
     )
 
     result = await agent.run(
-        f"Evaluate this problem statement for the library '{library.name}':\n\n{benchmark_case.problem_statement}\n\nTags: {benchmark_case.tags}"
+        f"Evaluate this problem statement for the library '{library.name}':\n\n{benchmark_case.problem_statement}",
+        time_out_seconds=60,
     )
     return result.final_output()
 
 
-async def process_row(row, model: AgentsSDKModel, library: Library):
-    if row.binary:
-        return None
-
-    content = row.content
+async def process_row(
+    content: str, model: AgentsSDKModel, library: Library
+) -> BenchmarkResult | None:
     print("-" * 40)
     print("Analyzing snippet...")
 
@@ -121,13 +127,12 @@ async def process_row(row, model: AgentsSDKModel, library: Library):
             f"Appropriate: {filter_result.appropriate}, Reason: {filter_result.reason}"
         )
 
-        return {
-            "problem_statement": benchmark_case.problem_statement,
-            "tags": ",".join(benchmark_case.tags),
-            "difficulty": benchmark_case.difficulty,
-            "appropriate": filter_result.appropriate,
-            "reason": filter_result.reason,
-        }
+        return BenchmarkResult(
+            problem_statement=benchmark_case.problem_statement,
+            difficulty=benchmark_case.difficulty,
+            appropriate=filter_result.appropriate,
+            reason=filter_result.reason,
+        )
 
     except BaseException as e:
         print(f"Error generating/filtering case: {e}")
@@ -163,8 +168,10 @@ async def main():
     print(f"Top {limit} contents. Saving to {output_file}...")
 
     # Create tasks for all rows
-    tasks = [process_row(row, model, library) for row in results]
 
+    tasks = [
+        process_row(row.content, model, library) for row in results if not row.binary
+    ]
     # Run tasks with concurrency limit
     results_data = await gather_with_semaphore(tasks, max_concurrent=max_concurrent)
 
@@ -172,7 +179,7 @@ async def main():
     data_rows = [res for res in results_data if res is not None]
 
     if data_rows:
-        df = pl.DataFrame(data_rows)
+        df = pl.DataFrame([res.model_dump() for res in data_rows])
         df.write_csv(output_file)
         print(f"Saved {len(data_rows)} rows to {output_file}")
     else:
