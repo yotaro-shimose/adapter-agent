@@ -1,3 +1,6 @@
+from adapter_agent.model_helper import get_qwen30b_a3b
+from adapter_agent.model_helper import get_qwen8b
+from oai_utils.agent import AgentsSDKModel
 import asyncio
 from pathlib import Path
 from typing import List, Literal
@@ -29,7 +32,9 @@ class FilterResult(BaseModel):
     reason: str
 
 
-async def generate_benchmark_case(content: str, library: Library) -> BenchmarkCase:
+async def generate_benchmark_case(
+    model: AgentsSDKModel, content: str, library: Library
+) -> BenchmarkCase:
     # Read library README for context
     try:
         with open(library.local_path, "r") as f:
@@ -53,7 +58,7 @@ async def generate_benchmark_case(content: str, library: Library) -> BenchmarkCa
             "6. **Natural Language**: The final statement should be clear, professional natural language.\n\n"
             "Do NOT provide solution code. Just describe the task clearly in the 'problem_statement' field."
         ),
-        model=get_gemini(),
+        model=model,
         output_type=BenchmarkCase,
     )
     result = await agent.run(
@@ -63,7 +68,7 @@ async def generate_benchmark_case(content: str, library: Library) -> BenchmarkCa
 
 
 async def filter_benchmark_case(
-    benchmark_case: BenchmarkCase, library: Library
+    model: AgentsSDKModel, benchmark_case: BenchmarkCase, library: Library
 ) -> FilterResult:
     # Read library README for context
     try:
@@ -83,7 +88,7 @@ async def filter_benchmark_case(
             "3. **Zero External Setup**: Reject tasks that imply external files, large datasets, or specialized hardware unless they describe how to generate/simulate them. The task should be self-contained.\n\n"
             "If the task violates any of these, set 'appropriate' to False and provide a mandatory 'reason' explaining which criterion was failed."
         ),
-        model=get_gemini(),
+        model=model,
         output_type=FilterResult,
     )
 
@@ -94,6 +99,8 @@ async def filter_benchmark_case(
 
 
 async def main():
+    model = get_qwen30b_a3b()
+    limit = 1000
     # Define target library
     library = Library(name="numrs", local_path=Path("repositories/numrs/README.md"))
 
@@ -101,11 +108,11 @@ async def main():
     client = bigquery.Client(project="dsat2-405406")
 
     # 2. Define your SQL query
-    sql_query = """
+    sql_query = f"""
     SELECT content, binary
     FROM `bigquery-public-data.github_repos.sample_contents` 
     WHERE content LIKE '%import numpy as np%'
-    LIMIT 20
+    LIMIT {limit}
     """
 
     # 3. Run the query
@@ -129,11 +136,15 @@ async def main():
         print("Analyzing snippet...")
 
         try:
-            benchmark_case = await generate_benchmark_case(content, library)
+            benchmark_case = await generate_benchmark_case(
+                model.as_litellm_model(), content, library
+            )
             print(f"Generated Case: {benchmark_case.problem_statement}")
 
             print("Filtering case...")
-            filter_result = await filter_benchmark_case(benchmark_case, library)
+            filter_result = await filter_benchmark_case(
+                model.as_litellm_model(), benchmark_case, library
+            )
             print(
                 f"Appropriate: {filter_result.appropriate}, Reason: {filter_result.reason}"
             )
