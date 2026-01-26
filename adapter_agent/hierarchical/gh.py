@@ -1,5 +1,5 @@
+from agents import ModelSettings
 from adapter_agent.model_helper import get_qwen30b_a3b
-from adapter_agent.model_helper import get_qwen8b
 from oai_utils.agent import AgentsSDKModel
 import asyncio
 from pathlib import Path
@@ -12,6 +12,8 @@ from oai_utils.agent import AgentWrapper
 from pydantic import BaseModel
 
 from adapter_agent.model_helper import get_gemini
+
+from oai_utils.async_utils import gather_with_semaphore
 
 load_dotenv()
 
@@ -59,6 +61,9 @@ async def generate_benchmark_case(
             "Do NOT provide solution code. Just describe the task clearly in the 'problem_statement' field."
         ),
         model=model,
+        # model_settings=ModelSettings(
+        #     extra_body={"chat_template_kwargs": {"enable_thinking": False}}
+        # ),
         output_type=BenchmarkCase,
     )
     result = await agent.run(
@@ -98,11 +103,43 @@ async def filter_benchmark_case(
     return result.final_output()
 
 
+async def process_row(row, model: AgentsSDKModel, library: Library):
+    if row.binary:
+        return None
+
+    content = row.content
+    print("-" * 40)
+    print("Analyzing snippet...")
+
+    try:
+        benchmark_case = await generate_benchmark_case(model, content, library)
+        print(f"Generated Case: {benchmark_case.problem_statement}")
+
+        print("Filtering case...")
+        filter_result = await filter_benchmark_case(model, benchmark_case, library)
+        print(
+            f"Appropriate: {filter_result.appropriate}, Reason: {filter_result.reason}"
+        )
+
+        return {
+            "problem_statement": benchmark_case.problem_statement,
+            "tags": ",".join(benchmark_case.tags),
+            "difficulty": benchmark_case.difficulty,
+            "appropriate": filter_result.appropriate,
+            "reason": filter_result.reason,
+        }
+
+    except BaseException as e:
+        print(f"Error generating/filtering case: {e}")
+        return None
+
+
 async def main():
-    model = get_qwen30b_a3b()
-    limit = 1000
+    model = get_qwen30b_a3b().as_litellm_model()
+    limit = 100
+    max_concurrent = 100
     # Define target library
-    library = Library(name="numrs", local_path=Path("repositories/numrs/README.md"))
+    library = Library(name="numrs", local_path=Path("repositories/numrs/SUMMARY.md"))
 
     # 1. Initialize the BigQuery client
     client = bigquery.Client(project="dsat2-405406")
@@ -123,44 +160,16 @@ async def main():
     results = query_job.result()
 
     output_file = "benchmark_dataset.csv"
-    print(f"Top 20 contents. Saving to {output_file}...")
+    print(f"Top {limit} contents. Saving to {output_file}...")
 
-    data_rows = []
+    # Create tasks for all rows
+    tasks = [process_row(row, model, library) for row in results]
 
-    for row in results:
-        if row.binary:
-            continue
+    # Run tasks with concurrency limit
+    results_data = await gather_with_semaphore(tasks, max_concurrent=max_concurrent)
 
-        content = row.content
-        print("-" * 40)
-        print("Analyzing snippet...")
-
-        try:
-            benchmark_case = await generate_benchmark_case(
-                model.as_litellm_model(), content, library
-            )
-            print(f"Generated Case: {benchmark_case.problem_statement}")
-
-            print("Filtering case...")
-            filter_result = await filter_benchmark_case(
-                model.as_litellm_model(), benchmark_case, library
-            )
-            print(
-                f"Appropriate: {filter_result.appropriate}, Reason: {filter_result.reason}"
-            )
-
-            data_rows.append(
-                {
-                    "problem_statement": benchmark_case.problem_statement,
-                    "tags": ",".join(benchmark_case.tags),
-                    "difficulty": benchmark_case.difficulty,
-                    "appropriate": filter_result.appropriate,
-                    "reason": filter_result.reason,
-                }
-            )
-
-        except Exception as e:
-            print(f"Error generating/filtering case: {e}")
+    # Filter out None results
+    data_rows = [res for res in results_data if res is not None]
 
     if data_rows:
         df = pl.DataFrame(data_rows)
