@@ -1,9 +1,8 @@
 import asyncio
-from pydantic import PrivateAttr
 from pathlib import Path
 from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, PrivateAttr
 
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.qra import QA
@@ -13,16 +12,9 @@ class TaskPool(BaseModel):
     tasks: dict[str, Task]
 
     # Private attributes for concurrency control
-    _lock: asyncio.Lock = PrivateAttr(default=None)
-    _condition: asyncio.Condition = PrivateAttr(default=None)
+    _lock: asyncio.Lock | None = PrivateAttr(default=None)
+    _condition: asyncio.Condition | None = PrivateAttr(default=None)
     _active_workers: int = PrivateAttr(default=0)
-
-    def __init__(self, **data):
-        super().__init__(**data)
-        # We can't init asyncio primitives here easily if loop isn't running or depends on context
-        # We will lazy init or expect explicit setup if needed.
-        # But actually, if main() runs asyncio.run(), the loop is active.
-        # Use simple lazy property or check in methods.
 
     def _ensure_primitives(self):
         if self._lock is None:
