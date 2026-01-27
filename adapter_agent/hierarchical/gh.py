@@ -1,20 +1,19 @@
-from agents import ModelSettings
-from adapter_agent.model_helper import get_qwen30b_a3b
-from oai_utils.agent import AgentsSDKModel
 import asyncio
 from pathlib import Path
-from typing import List, Literal
+from typing import Literal
 
 import polars as pl
 from dotenv import load_dotenv
 from google.cloud import bigquery
-from oai_utils.agent import AgentWrapper
+from litellm import batch_completion
+from oai_utils.agent import AgentsSDKModel, AgentWrapper
+from oai_utils.async_utils import gather_with_semaphore
+from oai_utils.litellm import litellm_concurrent_limit
 from pydantic import BaseModel
 
-from adapter_agent.model_helper import get_gemini
+from adapter_agent.model_helper import get_qwen8b
 
-from oai_utils.async_utils import gather_with_semaphore
-
+batch_completion
 load_dotenv()
 
 
@@ -44,11 +43,7 @@ async def generate_benchmark_case(
     model: AgentsSDKModel, content: str, library: Library
 ) -> BenchmarkCase:
     # Read library README for context
-    try:
-        with open(library.local_path, "r") as f:
-            library_context = f.read()
-    except FileNotFoundError:
-        library_context = f"{library.name} is a software library."
+    library_context = library.local_path.read_text()
 
     agent = AgentWrapper[BenchmarkCase].create(
         name=f"{library.name}BenchmarkGenerator",
@@ -68,7 +63,7 @@ async def generate_benchmark_case(
         ),
         model=model,
         # model_settings=ModelSettings(
-        #     extra_body={"chat_template_kwargs": {"enable_thinking": False}}
+        # extra_body={"chat_template_kwargs": {"enable_thinking": False}}
         # ),
         output_type=BenchmarkCase,
     )
@@ -80,14 +75,12 @@ async def generate_benchmark_case(
 
 
 async def filter_benchmark_case(
-    model: AgentsSDKModel, benchmark_case: BenchmarkCase, library: Library
+    model: AgentsSDKModel,
+    benchmark_case: BenchmarkCase,
+    library: Library,
 ) -> FilterResult:
     # Read library README for context
-    try:
-        with open(library.local_path, "r") as f:
-            library_context = f.read()
-    except FileNotFoundError:
-        library_context = f"{library.name} is a software library."
+    library_context = library.local_path.read_text()
 
     agent = AgentWrapper[FilterResult].create(
         name=f"{library.name}BenchmarkFilter",
@@ -140,7 +133,8 @@ async def process_row(
 
 
 async def main():
-    model = get_qwen30b_a3b().as_litellm_model()
+    # model = get_qwen30b_a3b().as_litellm_model()
+    model = get_qwen8b().as_litellm_model()
     limit = 100
     max_concurrent = 100
     # Define target library
@@ -166,24 +160,25 @@ async def main():
 
     output_file = "benchmark_dataset.csv"
     print(f"Top {limit} contents. Saving to {output_file}...")
+    async with litellm_concurrent_limit(max_concurrent):
+        # Create tasks for all rows
+        tasks = [
+            process_row(row.content, model, library)
+            for row in results
+            if not row.binary
+        ]
+        # Run tasks with concurrency limit
+        results_data = await gather_with_semaphore(tasks, max_concurrent=max_concurrent)
 
-    # Create tasks for all rows
+        # Filter out None results
+        data_rows = [res for res in results_data if res is not None]
 
-    tasks = [
-        process_row(row.content, model, library) for row in results if not row.binary
-    ]
-    # Run tasks with concurrency limit
-    results_data = await gather_with_semaphore(tasks, max_concurrent=max_concurrent)
-
-    # Filter out None results
-    data_rows = [res for res in results_data if res is not None]
-
-    if data_rows:
-        df = pl.DataFrame([res.model_dump() for res in data_rows])
-        df.write_csv(output_file)
-        print(f"Saved {len(data_rows)} rows to {output_file}")
-    else:
-        print("No data rows generated.")
+        if data_rows:
+            df = pl.DataFrame([res.model_dump() for res in data_rows])
+            df.write_csv(output_file)
+            print(f"Saved {len(data_rows)} rows to {output_file}")
+        else:
+            print("No data rows generated.")
 
 
 if __name__ == "__main__":
