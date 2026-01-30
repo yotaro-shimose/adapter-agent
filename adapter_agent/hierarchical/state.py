@@ -1,3 +1,4 @@
+from typing import Any
 import asyncio
 from pathlib import Path
 from typing import Optional
@@ -16,13 +17,11 @@ class TaskPool(BaseModel):
     _condition: asyncio.Condition | None = PrivateAttr(default=None)
     _active_workers: int = PrivateAttr(default=0)
 
-    def _ensure_primitives(self):
-        if self._lock is None:
-            self._lock = asyncio.Lock()
-            self._condition = asyncio.Condition(lock=self._lock)
+    def model_post_init(self, context: Any):
+        self._lock = asyncio.Lock()
+        self._condition = asyncio.Condition(lock=self._lock)
 
     async def register(self, task: Task) -> None:
-        self._ensure_primitives()
         async with self._lock:
             print(f"Details: Registering task: {task.instruction}")
             self.tasks[task.id] = task
@@ -33,7 +32,6 @@ class TaskPool(BaseModel):
         Wait for a task to be available.
         Returns None if no tasks are left AND no workers are active (shutdown).
         """
-        self._ensure_primitives()
         async with self._lock:
             while True:
                 if self.tasks:
@@ -54,7 +52,6 @@ class TaskPool(BaseModel):
         """
         Call this when a worker finishes processing a task.
         """
-        self._ensure_primitives()
         async with self._lock:
             self._active_workers -= 1
             # Notify waiters (pop_task might return None if active_workers drops to 0)

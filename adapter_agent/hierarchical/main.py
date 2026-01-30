@@ -2,8 +2,10 @@ import asyncio
 import time
 from pathlib import Path
 
+import polars as pl
 from agents import add_trace_processor
 from dotenv import load_dotenv
+from oai_utils.litellm import litellm_concurrent_limit
 from oai_utils.tracing import AgentContentPrinter
 
 from adapter_agent.hierarchical.h_agent import Agents
@@ -18,10 +20,11 @@ async def main():
     add_trace_processor(AgentContentPrinter())
 
     model = get_gemini()
+    # model = get_qwen32b().as_litellm_model()
 
     # Setup Experiment Directory
     experiment_id = f"hh_exp_{int(time.time())}"
-    base_dir = Path("experiments") / experiment_id
+    base_dir = Path("experiments") / "hierarchical" / experiment_id
     workspace_template_location = Path("templates") / "rust_template"
     lib_path = Path("repositories") / "numrs"
 
@@ -38,26 +41,11 @@ async def main():
     task_pool = TaskPool(tasks={})
     sft_dataset = SFTDataset(items=[])
 
-    # Task 1: Conversational request (Time Series Analysis)
-    await task_pool.register(
-        Task.from_instruction(
-            instruction="I'm analyzing stock prices and need to smooth the data. Could you implement a simple moving average function using `numrs2`? It should take a 1D array of prices and a window size, returning the smoothed series.",
-        )
+    benchmark_df = pl.read_csv("experiments/gh/benchmark_dataset.csv").filter(
+        pl.col("appropriate")
     )
-
-    # Task 2: Formal specification (Machine Learning - Gradient Descent)
-    await task_pool.register(
-        Task.from_instruction(
-            instruction="Implement a function `gradient_descent_step` using `numrs2`. Input: Feature matrix X (2D), Target vector y (1D), Current weights w (1D), Learning rate alpha (f64). Output: Updated weights vector w_new. Formula: w_new = w - alpha * (X^T * (X * w - y)) / n_samples."
-        )
-    )
-
-    # Task 3: Direct functional instruction (Clustering / Geometry)
-    await task_pool.register(
-        Task.from_instruction(
-            instruction="Write a Rust function using `numrs2` that computes the pairwise Euclidean distance between two sets of row vectors, A (NxD) and B (MxD). The result should be an NxM matrix where entry (i, j) is the distance between A[i] and B[j]."
-        )
-    )
+    for row in benchmark_df.iter_rows(named=True):
+        await task_pool.register(Task.from_instruction(row["problem_statement"]))
 
     async def worker(worker_id: int):
         print(f"Worker {worker_id} started.")
@@ -86,9 +74,10 @@ async def main():
                 await task_pool.finish_task(task)
 
     # Spawn workers
-    num_workers = 5
-    workers = [asyncio.create_task(worker(i)) for i in range(num_workers)]
-    await asyncio.gather(*workers)
+    num_workers = 1
+    async with litellm_concurrent_limit(num_workers):
+        workers = [asyncio.create_task(worker(i)) for i in range(num_workers)]
+        await asyncio.gather(*workers)
 
 
 if __name__ == "__main__":

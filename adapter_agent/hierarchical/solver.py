@@ -71,6 +71,7 @@ You are working in a cargo-initialized project.
 The `{library_name}` library source code is located at `workspace_dir/repos/{library_name}` in case you do not know its API usage.
 The library is just for reference and is already installed in the workspace_dir, so you do not need to run `cargo add`.
 You must not add the repository as path dependency. Stick with the version that is already installed.
+You should not use release build for faster debugging.
 
 You have access to a coding environment. You can write and run code to test your solution.
 Once you have defined a solution and confirmed it works (to the best of your ability), you MUST call the `report_success` tool.

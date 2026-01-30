@@ -76,6 +76,7 @@ You must:
 Include your deep analysis in the reasoning argument, but you do not have to edit the code unless you REALLY need to check its intermediate output.
 While you have edit tools, you are not supposed to write dedicated test code.
 Most of the time you just execute the provided code, or insert debug print statements at maximum.
+You should not use release build for faster debugging.
 """
         async with runtime.coder_mcp() as coder_mcp:
             agent = AgentWrapper.create(

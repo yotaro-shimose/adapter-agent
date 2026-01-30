@@ -11,7 +11,7 @@ from oai_utils.async_utils import gather_with_semaphore
 from oai_utils.litellm import litellm_concurrent_limit
 from pydantic import BaseModel
 
-from adapter_agent.model_helper import get_qwen8b
+from adapter_agent.model_helper import get_gemini
 
 batch_completion
 load_dotenv()
@@ -134,8 +134,8 @@ async def process_row(
 
 async def main():
     # model = get_qwen30b_a3b().as_litellm_model()
-    model = get_qwen8b().as_litellm_model()
-    limit = 100
+    model = get_gemini()
+    limit = 1000
     max_concurrent = 100
     # Define target library
     library = Library(name="numrs", local_path=Path("repositories/numrs/SUMMARY.md"))

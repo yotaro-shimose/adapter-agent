@@ -60,6 +60,21 @@ def get_qwen8b(
     )
 
 
+def get_qwen32b(
+    data_parallel_size: int = 1,
+    yarn_factor: int = 4,
+    publish: bool = False,
+    quantization: Literal["fp8"] | None = None,
+) -> VLLMSetup:
+    return get_qwen3(
+        model_name="Qwen/Qwen3-32B",
+        data_parallel_size=data_parallel_size,
+        yarn_factor=yarn_factor,
+        publish=publish,
+        quantization=quantization,
+    )
+
+
 def get_qwen4b_vl_instruct(
     data_parallel_size: int = 1,
     yarn_factor: int = 1,
