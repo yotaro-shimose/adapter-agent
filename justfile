@@ -3,3 +3,6 @@ stop-docker:
 
 clean-tmp:
     rm -rf /tmp/*
+
+remove-checkpoints:
+    uv run scripts/remove_checkpoints.py
