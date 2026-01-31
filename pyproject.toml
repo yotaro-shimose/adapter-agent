@@ -12,15 +12,18 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "rich>=14.2.0",
     "torch>=2.9.0",
-    "transformers>=4.57.3",
+    "transformers>=4.56.0",
     "trl>=0.26.2",
     "flash-attn",
     "vllm>=0.13.0",
     "coder-mcp",
     "litellm==1.81",
-    "oai-utils",
     "openai>=2.14.0",
-    "openai-agents>=0.6.6",
+    "tinker>=0.9.0",
+    "chz>=0.4.0",
+    "tinker-cookbook",
+    "oai-utils",
+    "wandb>=0.24.1",
 ]
 
 [build-system]
@@ -40,6 +43,7 @@ torch = [
 vllm = [
     { index = "vllm-cu130" }
 ]
+tinker-cookbook = { git = "https://github.com/thinking-machines-lab/tinker-cookbook" }
 oai-utils = { path = "../oai_utils", editable = true }
 [project.optional-dependencies]
 test = [
