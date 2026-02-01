@@ -1,8 +1,9 @@
-from typing import Any
 import asyncio
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, Self
 
+import polars as pl
 from pydantic import BaseModel, PrivateAttr
 
 from adapter_agent.hierarchical.types import Task
@@ -13,12 +14,11 @@ class TaskPool(BaseModel):
     tasks: dict[str, Task]
 
     # Private attributes for concurrency control
-    _lock: asyncio.Lock | None = PrivateAttr(default=None)
-    _condition: asyncio.Condition | None = PrivateAttr(default=None)
+    _lock: asyncio.Lock = PrivateAttr(default_factory=asyncio.Lock)
+    _condition: asyncio.Condition = PrivateAttr(default_factory=asyncio.Condition)
     _active_workers: int = PrivateAttr(default=0)
 
     def model_post_init(self, context: Any):
-        self._lock = asyncio.Lock()
         self._condition = asyncio.Condition(lock=self._lock)
 
     async def register(self, task: Task) -> None:
@@ -63,6 +63,15 @@ class TaskPool(BaseModel):
         with path.open("w") as f:
             f.write(self.model_dump_json(indent=2))
 
+    @classmethod
+    def from_benchmark_csv(cls, path: Path) -> Self:
+        benchmark_df = pl.read_csv(path).filter(pl.col("appropriate"))
+        tasks = {}
+        for row in benchmark_df.iter_rows(named=True):
+            task = Task.from_instruction(row["problem_statement"])
+            tasks[task.id] = task
+        return cls(tasks=tasks)
+
 
 class SFTDataset(BaseModel):
     items: list[QA] = []
@@ -71,9 +80,33 @@ class SFTDataset(BaseModel):
         with path.open("w") as f:
             f.write(self.model_dump_json(indent=2))
 
-    def register(self, qra: QA) -> None:
-        print(f"Details: Registering QA: {qra.question}")
-        self.items.append(qra)
+    async def register(self, item: QA) -> None:
+        print(f"Details: Registering QA: {item.question}")
+        self.items.append(item)
+
+
+@dataclass
+class SFTPool:
+    dataset: SFTDataset
+    queue: asyncio.Queue[QA]
+
+    async def register(self, item: QA) -> None:
+        await self.queue.put(item)
+        self.dataset.items.append(item)
+
+    def get_batch(self, batch_size: int) -> list[QA]:
+        batch = []
+        for _ in range(batch_size):
+            batch.append(self.queue.get_nowait())
+        return batch
+
+    @classmethod
+    def from_sft_dataset(cls, dataset: SFTDataset) -> Self:
+        return cls(dataset=dataset, queue=asyncio.Queue())
+
+    @classmethod
+    def new(cls) -> Self:
+        return cls(dataset=SFTDataset(), queue=asyncio.Queue())
 
 
 class TaskList(BaseModel):
