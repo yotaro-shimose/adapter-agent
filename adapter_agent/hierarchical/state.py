@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Self
@@ -8,6 +9,9 @@ from pydantic import BaseModel, PrivateAttr
 
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.qra import QA
+
+
+logger = logging.getLogger(__name__)
 
 
 class TaskPool(BaseModel):
@@ -23,7 +27,7 @@ class TaskPool(BaseModel):
 
     async def register(self, task: Task) -> None:
         async with self._lock:
-            print(f"Details: Registering task: {task.instruction}")
+            logger.info(f"Details: Registering task: {task.instruction}")
             self.tasks[task.id] = task
             self._condition.notify_all()
 
@@ -35,9 +39,8 @@ class TaskPool(BaseModel):
         async with self._lock:
             while True:
                 if self.tasks:
-                    # Atomic pop
-                    task_id = next(iter(self.tasks))
-                    task = self.tasks.pop(task_id)
+                    # Atomic pop (LIFO: newest task first)
+                    _, task = self.tasks.popitem()
                     self._active_workers += 1
                     return task
 
@@ -81,7 +84,7 @@ class SFTDataset(BaseModel):
             f.write(self.model_dump_json(indent=2))
 
     async def register(self, item: QA) -> None:
-        print(f"Details: Registering QA: {item.question}")
+        logger.info(f"Details: Registering QA: {item.question}")
         self.items.append(item)
 
 

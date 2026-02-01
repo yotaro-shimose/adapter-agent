@@ -1,3 +1,5 @@
+from agents import ModelSettings
+import logging
 from dataclasses import dataclass
 
 from agents import RunContextWrapper, StopAtTools, function_tool
@@ -13,6 +15,9 @@ class SolverContext(BaseModel):
     qra: QA | None = None
 
 
+logger = logging.getLogger(__name__)
+
+
 @function_tool
 def report_success(
     wrapper: RunContextWrapper[SolverContext],
@@ -23,7 +28,7 @@ def report_success(
     Report that the task has been successfully solved.
     Args:
         question: The original task instruction or a refined version of it.
-        answer: The final solution (code and explanation).
+        answer: The answer to the question (including both code and explanation).
     """
     wrapper.context.qra = QA(
         question=question,
@@ -60,12 +65,10 @@ class Solver:
         もしタスクを解くことができたらSolutionを生成してReturnする。
         もしタスクを解くことができなければ、実行結果からTrajectoryを生成してReturnする。
         """
-        print(f"Details: Solver attempting task: {task.instruction}")
 
         PROMPT = f"""
 You are an expert Rust software engineer.
-Your task is to solve the following problem:
-{task.instruction}
+Your task is to solve user provided problem.
 
 You are working in a cargo-initialized project.
 The `{library_name}` library source code is located at `workspace_dir/repos/{library_name}` in case you do not know its API usage.
@@ -74,7 +77,11 @@ You must not add the repository as path dependency. Stick with the version that 
 You should not use release build for faster debugging.
 
 You have access to a coding environment. You can write and run code to test your solution.
+
 Once you have defined a solution and confirmed it works (to the best of your ability), you MUST call the `report_success` tool.
+Note your solution has to be fully self-contained including both source code and explanation so that we can verify the solution later.
+
+Verification will solely based on your final solution and your source code in the coding environment will be discarded in verification.
 If you find that you cannot solve the problem, you MUST call the `report_failure` tool with a reason.
 
 If you hit the turn limit without reporting success or failure, it will be considered a failure.
@@ -90,13 +97,16 @@ If you hit the turn limit without reporting success or failure, it will be consi
                 tool_use_behavior=StopAtTools(
                     stop_at_tool_names=[report_failure.name, report_success.name]
                 ),
+                model_settings=ModelSettings(),
             )
 
             context = SolverContext()
 
             try:
                 result = await agent.run(
-                    "Please solve the task.", max_turns=30, context=context
+                    f"Please solve the following problem: {task.instruction}",
+                    max_turns=20,
+                    context=context,
                 )
                 trajectory = Trajectory(input_list=result.to_input_list())
                 if context.qra is not None:
@@ -108,8 +118,12 @@ If you hit the turn limit without reporting success or failure, it will be consi
                 return result
 
             except AgentRunFailure as e:
-                if e.cause == "MaxTurnsExceeded":
-                    print("Details: Solver hit MaxTurnsExceeded.")
+                if e.cause in [
+                    "ContextWindowExceededError",
+                    "BadRequestError",
+                    "MaxTurnsExceeded",
+                ]:
+                    logger.error(f"Details: Solver hit {e.cause}.")
                     input_list = e.to_input_list()
                     if input_list:
                         trajectory = Trajectory(input_list=input_list)
@@ -129,5 +143,5 @@ If you hit the turn limit without reporting success or failure, it will be consi
                 else:
                     raise
             except Exception as e:
-                print(f"Solver error: {e}")
+                logger.error(f"Solver error: {e}")
                 raise NotImplementedError

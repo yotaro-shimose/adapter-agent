@@ -31,6 +31,14 @@ async def process_task(
     # Inject the already prepared library
     injections = {host_lib_dir: f"repositories/{host_lib_dir.name}"}
 
+    async def decompose_and_register(task: Task):
+        new_tasks = await agents.decomposer.decompose(
+            task.instruction, host_lib_dir.name
+        )
+        for new_task in new_tasks:
+            logger.info(f"Generated practice task: {new_task.instruction}")
+            await task_pool.register(new_task)
+
     async with TempWorkspace(
         workspace_template_location, injections=injections
     ) as temp_workspace:
@@ -41,12 +49,7 @@ async def process_task(
 
             if solver_result.is_max_turns_exceeded:
                 logger.info("Solver max turns exceeded. Decomposing task...")
-                new_tasks = await agents.decomposer.decompose(
-                    solver_result.trajectory, task.instruction, host_lib_dir.name
-                )
-                for new_task in new_tasks:
-                    logger.info(f"Generated practice task: {new_task.instruction}")
-                    await task_pool.register(new_task)
+                await decompose_and_register(task)
 
             elif isinstance(solver_result.qa, QA):
                 logger.info("Solver produced a QA. Verifying...")
@@ -59,29 +62,36 @@ async def process_task(
                     # Task is effectively done (popped from pool by caller or here?)
                     pass
                 else:
-                    logger.info("Verification FAILED.")
-                    logger.info(verification_result.reasoning)
-                    solver_result.trajectory.add_item(
-                        {
-                            "role": "user",
-                            "content": f"We ran verification process with another agent, but verification failed: {verification_result.reasoning}",
-                        }
-                    )
+                    # logger.info("Verification FAILED.")
+                    # logger.info(verification_result.reasoning)
+                    # solver_result.trajectory.add_item(
+                    #     {
+                    #         "role": "user",
+                    #         "content": f"We ran verification process with another agent, but verification failed: {verification_result.reasoning}",
+                    #     }
+                    # )
 
-                    analysis = await agents.analyzer.analyze_trajectory(
-                        solver_result.trajectory, rust_env
-                    )
-                    logger.info(f"Generated subtask: {analysis.instruction}")
-                    await task_pool.register(analysis)
-
+                    # analysis = await agents.analyzer.analyze_trajectory(
+                    #     solver_result.trajectory, rust_env
+                    # )
+                    # logger.info(f"Generated subtask: {analysis.instruction}")
+                    # await task_pool.register(analysis)
+                    logger.info("Verification FAILED, Decomposing task...")
+                    await decompose_and_register(task)
             else:
                 # Normal failure (report_failure called or other implicit failure without timeout)
-                logger.info("Solver failed to produce QA. Analyzing trajectory...")
-                trajectory_analysis = await agents.analyzer.analyze_trajectory(
-                    solver_result.trajectory, rust_env
-                )
-                logger.info(f"Generated subtask: {trajectory_analysis.instruction}")
-                await task_pool.register(trajectory_analysis)
+                # logger.info("Solver failed to produce QA. Analyzing trajectory...")
+                # try:
+                #     trajectory_analysis = await agents.analyzer.analyze_trajectory(
+                #         solver_result.trajectory, rust_env
+                #     )
+                # except AgentRunFailure as e:
+                #     logger.error(f"Analyzer failed: {e}, skipping task.")
+                #     return
+                # logger.info(f"Generated subtask: {trajectory_analysis.instruction}")
+                # await task_pool.register(trajectory_analysis)
+                logger.info("Normal failure, Decomposing task...")
+                await decompose_and_register(task)
 
     # Save state at the end of the task
     if experiment_dir is not None:

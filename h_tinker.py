@@ -81,8 +81,7 @@ class OptimizerConfig(BaseModel):
 
 class Config(BaseModel):
     optimizer_config: OptimizerConfig = Field(default_factory=OptimizerConfig)
-    model_name: str = "Qwen/Qwen3-30B-A3B"
-    max_tokens: int = 32768
+    model_name: str = "Qwen/Qwen3-235B-A22B-Instruct-2507"
     temperature: float = 1.0
     lora_rank: int = 32
     sft_batch_size: int = 16
@@ -92,7 +91,7 @@ class Config(BaseModel):
     kl_discount_factor: float = 0.0
     kl_reference_config: KLReferenceConfig | None = None
 
-    num_rollout_workers: int = 1  # TODO: increase this
+    num_rollout_workers: int = 4  # TODO: increase this
 
     logging_config: LoggingConfig = Field(default_factory=LoggingConfig)
     base_url: str | None = None
@@ -154,7 +153,7 @@ def setup_tinkermodel(
         tokenizer=tokenizer,
     )
     tinker_llm.rewrite_litellm_custom_providers()
-    litellm_model_name = f"agl-tinker/{model_name}"
+    litellm_model_name = f"tinker/{model_name}"
     model = LogprobLitellmModel(
         model=litellm_model_name,
         sampling_client=sampling_client,
@@ -167,6 +166,7 @@ def setup_logger():
     logging.getLogger("pylatexenc").setLevel(logging.WARNING)
     logging.getLogger("LiteLLM").setLevel(logging.WARNING)
     logging.getLogger("litellm").setLevel(logging.WARNING)
+    logging.getLogger("mcp.client.streamable_http").setLevel(logging.ERROR)
 
 
 async def initialization(cfg: Config):
@@ -230,7 +230,7 @@ async def main(cfg: Config):
     ) = await initialization(cfg)
     setup_logger()
 
-    async def rollout_worker(worker_id: int):
+    async def rollout_worker(worker_id: str):
         logging.info(f"Worker {worker_id} started.")
         while True:
             task = await task_pool.pop_task()
@@ -249,14 +249,14 @@ async def main(cfg: Config):
                     experiment_dir=cfg.experiment_config.experiment_dir,
                 )
             except Exception as e:
-                logging.info(
+                logging.error(
                     f"Worker {worker_id} encountered an error processing task {task.id}: {e}"
                 )
             finally:
                 # Mark task as finished regardless of success or failure
                 await task_pool.finish_task(task)
 
-    async def train_worker(worker_id: int):
+    async def train_worker(worker_id: str):
         logging.info(f"Worker {worker_id} started.")
         while True:
             if not sft_pool.queue.qsize() >= cfg.sft_batch_size:
@@ -281,9 +281,10 @@ async def main(cfg: Config):
 
     async with litellm_concurrent_limit(cfg.num_rollout_workers):
         workers = [
-            asyncio.create_task(rollout_worker(i))
+            asyncio.create_task(rollout_worker(f"rollout-{i}"))
             for i in range(cfg.num_rollout_workers)
         ]
+        workers.append(asyncio.create_task(train_worker("train-0")))
         await asyncio.gather(*workers)
 
 

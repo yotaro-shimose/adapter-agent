@@ -557,7 +557,7 @@ async def do_agent_rollout_and_filter_constant_reward(
     enable_logging: bool = True,
 ) -> TrajectoryGroup | None:
     # We use a dummy model name because the actual routing is handled by litellm + TinkerLLM custom provider
-    litellm_model_name = f"agl-tinker/{model_name}"
+    litellm_model_name = f"tinker/{model_name}"
     model = LogprobLitellmModel(model=litellm_model_name)
 
     async def run_single_agent(env: Env) -> Trajectory:

@@ -1,10 +1,13 @@
 from dataclasses import dataclass
+import logging
 
 from coder_mcp.runtime.runtime import Runtime
 from oai_utils.agent import AgentsSDKModel, AgentWrapper
 from pydantic import BaseModel
 
 from adapter_agent.hierarchical.types import Memory, Task, Trajectory
+
+logger = logging.getLogger(__name__)
 
 
 class TaskResponse(BaseModel):
@@ -26,7 +29,7 @@ class Analyzer:
         Trajectoryを分析してなぜSolverが失敗したのかを理解する。
         Solverが解けるであろうより小さな問題を生成する。
         """
-        print("Details: Analyzing failure trajectory...")
+        logger.info("Details: Analyzing failure trajectory...")
 
         PROMPT = f"""
 You are a Senior Engineer analyzing a Junior Engineer's failure.
@@ -56,16 +59,9 @@ Return a new Task with a clear instruction.
                 output_type=TaskResponse,
             )
 
-            try:
-                result = await agent.run(
-                    "Analyze the trajectory and generate a sub-task.", max_turns=30
-                )
-                task = result.final_output().to_task()
-                self.memory.add(trajectory, task)
-                return task
-            except Exception as e:
-                print(f"Analyzer failed: {e}")
-                # Fallback task
-                return Task.from_instruction(
-                    instruction="Read the numrs2 documentation and summarize basic usage.",
-                )
+            result = await agent.run(
+                "Analyze the trajectory and generate a sub-task.", max_turns=30
+            )
+            task = result.final_output().to_task()
+            self.memory.add(trajectory, task)
+            return task
