@@ -8,6 +8,7 @@ from adapter_agent.hierarchical.solver import Solver, SolverResult
 from adapter_agent.hierarchical.state import TaskList
 from adapter_agent.hierarchical.types import Memory, Task, Trajectory
 from adapter_agent.hierarchical.verifier import QA, VerificationResult, Verifier
+from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
 
 
 @dataclass
@@ -18,15 +19,17 @@ class Agents:
     decomposer: Decomposer
 
     @classmethod
-    def from_model(cls, model: AgentsSDKModel):
+    def from_model(cls, model: AgentsSDKModel, rust_doc_analyzer: RustDocAnalyzer):
         return cls(
             solver=Solver(
                 model=model,
                 memory=Memory[Task, SolverResult](),
+                rust_doc_analyzer=rust_doc_analyzer,
             ),
             verifier=Verifier(
                 model=model,
                 memory=Memory[QA, VerificationResult](),
+                rust_doc_analyzer=rust_doc_analyzer,
             ),
             analyzer=Analyzer(
                 model=model,

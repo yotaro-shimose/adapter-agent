@@ -28,9 +28,6 @@ async def process_task(
     """
     logger.info(f"Processing Task: {task.instruction}")
 
-    # Inject the already prepared library
-    injections = {host_lib_dir: f"repositories/{host_lib_dir.name}"}
-
     async def decompose_and_register(task: Task):
         new_tasks = await agents.decomposer.decompose(
             task.instruction, host_lib_dir.name
@@ -39,9 +36,7 @@ async def process_task(
             logger.info(f"Generated practice task: {new_task.instruction}")
             await task_pool.register(new_task)
 
-    async with TempWorkspace(
-        workspace_template_location, injections=injections
-    ) as temp_workspace:
+    async with TempWorkspace(workspace_template_location) as temp_workspace:
         async with RustCodingEnvironment(workspace_dir=temp_workspace) as rust_env:
             solver_result = await agents.solver.try_solve(
                 task, rust_env, host_lib_dir.name

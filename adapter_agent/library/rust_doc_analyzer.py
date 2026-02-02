@@ -1,5 +1,7 @@
+from typing import Self
 import logging
 import json
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -57,6 +59,7 @@ class SearchResult(BaseModel):
     kind: str
     score: int
     snippet: str
+    signature: Optional[str] = None
 
 
 class RustDocAnalyzer:
@@ -70,14 +73,18 @@ class RustDocAnalyzer:
         data: CrateData,
         parent_map: Dict[str, str],
         impl_to_type_map: Dict[str, str],
+        pubapi_path: Optional[Path] = None,
     ):
         self.data = data
         self.parent_map = parent_map
         self.impl_to_type_map = impl_to_type_map
         self._memo_paths: Dict[str, str] = {}
+        self.pubapi_map: Dict[str, List[str]] = defaultdict(list)
+        if pubapi_path:
+            self._load_pubapi(pubapi_path)
 
     @classmethod
-    def from_json(cls, path: Path) -> "RustDocAnalyzer":
+    def from_json(cls, path: Path, pubapi_path: Optional[Path] = None) -> Self:
         """
         Factory method to load and parse the JSON file.
         Performs all IO and heavy processing before returning an instance.
@@ -118,7 +125,56 @@ class RustDocAnalyzer:
                 for variant_id in inner["enum"].get("variants", []):
                     parent_map[str(variant_id)] = i_id
 
-        return cls(crate_data, parent_map, impl_to_type_map)
+        return cls(crate_data, parent_map, impl_to_type_map, pubapi_path)
+
+    def _load_pubapi(self, path: Path) -> None:
+        """Load and parse pubapi.txt."""
+        if not path.exists():
+            logger.warning(f"pubapi file not found at {path}")
+            return
+
+        logger.info(f"Loading pubapi from {path}...")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line.startswith("pub "):
+                        continue
+
+                    # Extract definition for normalization
+                    # Heuristic: split by space, find first part with '::' that might be the item
+                    # e.g. "pub fn numrs2::array::Array<f32>::simd_fma(...)"
+
+                    parts = line.split(" ")
+                    name_part = None
+                    for p in parts:
+                        if "::" in p:
+                            # Taking the part before '(' if it's a function
+                            if "(" in p:
+                                name_part = p.split("(")[0]
+                            else:
+                                name_part = p
+                            break
+
+                    if name_part:
+                        normalized = self._normalize_name(name_part)
+                        self.pubapi_map[normalized].append(line)
+        except Exception as e:
+            logger.error(f"Failed to load pubapi: {e}")
+
+    def _normalize_name(self, name: str) -> str:
+        """
+        Normalize a name by removing generic parameters.
+        numrs2::array::Array<f32>::simd_fma -> numrs2::array::Array::simd_fma
+        """
+        prev = name
+        while True:
+            # Non-greedy match for <...>
+            new = re.sub(r"<[^<>]*>", "", prev)
+            if new == prev:
+                break
+            prev = new
+        return prev
 
     def resolve_full_name(self, item_id: str, depth: int = 0) -> str:
         """Resolve the fully qualified name of an item recursively."""
@@ -166,6 +222,90 @@ class RustDocAnalyzer:
 
         return f"<Anonymous {item_id}>"
 
+    def _render_type(self, type_obj: Dict[str, Any]) -> str:
+        """Render a type dictionary into a string."""
+        if not type_obj:
+            return "_"
+
+        if "primitive" in type_obj:
+            return type_obj["primitive"]
+
+        if "resolved_path" in type_obj:
+            path_obj = type_obj["resolved_path"]
+            name = path_obj.get("name", "")
+            if not name and "path" in path_obj:
+                name = path_obj[
+                    "path"
+                ]  # Older versions might use 'path' string? Newer seems to have name/id?
+                # The logged example showed: "resolved_path": { "path": "Array", ... }
+
+            args = path_obj.get("args")
+            if args:
+                if "angle_bracketed" in args:
+                    ab = args["angle_bracketed"]
+                    arg_list = []
+                    for arg in ab.get("args", []):
+                        if "type" in arg:
+                            arg_list.append(self._render_type(arg["type"]))
+                        elif "const" in arg:
+                            arg_list.append(
+                                f"const {arg.get('const', {}).get('expr', '_')}"
+                            )
+
+                    if arg_list:
+                        return f"{name}<{', '.join(arg_list)}>"
+            return name
+
+        if "borrowed_ref" in type_obj:
+            ref = type_obj["borrowed_ref"]
+            mutable = "mut " if ref.get("is_mutable") else ""
+            inner = self._render_type(ref.get("type", {}))
+            return f"&{mutable}{inner}"
+
+        if "generic" in type_obj:
+            return type_obj["generic"]
+
+        if "tuple" in type_obj:
+            types = [self._render_type(t) for t in type_obj["tuple"]]
+            return f"({', '.join(types)})"
+
+        if "slice" in type_obj:
+            return f"[{self._render_type(type_obj['slice'])}]"
+
+        return "_"
+
+    def _render_signature(self, item: Item) -> Optional[str]:
+        """Render function signature if available."""
+        # Try pubapi first
+        if self.pubapi_map:
+            full_name = self.resolve_full_name(str(item.id))
+            if full_name:
+                matches = self.pubapi_map.get(full_name)
+                if matches:
+                    return "\n".join(matches)
+
+        if not item.inner or "function" not in item.inner:
+            return None
+
+        fn_obj = item.inner["function"]
+        sig = fn_obj.get("sig", {})
+
+        inputs = []
+        for arg in sig.get("inputs", []):
+            # arg is [name, type]
+            if len(arg) == 2:
+                name, type_val = arg
+                type_str = self._render_type(type_val)
+                inputs.append(f"{name}: {type_str}")
+
+        output_str = ""
+        output = sig.get("output")
+        if output:
+            output_str = f" -> {self._render_type(output)}"
+
+        fn_name = item.name or "_"
+        return f"fn {fn_name}({', '.join(inputs)}){output_str}"
+
     def search_docs(self, query: str, limit: int = 10) -> List[SearchResult]:
         """Search documentation (docstrings) for the given query."""
         query_lower = query.lower()
@@ -193,8 +333,16 @@ class RustDocAnalyzer:
                 if end < len(item.docs):
                     snippet = snippet + "..."
 
+                signature = self._render_signature(item)
+
                 matches.append(
-                    SearchResult(name=fullname, kind=kind, score=score, snippet=snippet)
+                    SearchResult(
+                        name=fullname,
+                        kind=kind,
+                        score=score,
+                        snippet=snippet,
+                        signature=signature,
+                    )
                 )
 
         matches.sort(key=lambda x: x.score, reverse=True)
@@ -234,8 +382,16 @@ class RustDocAnalyzer:
                 if len(snippet) < len(item.docs):
                     snippet += "..."
 
+            signature = self._render_signature(item)
+
             matches.append(
-                SearchResult(name=fullname, kind=kind, score=score, snippet=snippet)
+                SearchResult(
+                    name=fullname,
+                    kind=kind,
+                    score=score,
+                    snippet=snippet,
+                    signature=signature,
+                )
             )
 
         matches.sort(key=lambda x: x.score, reverse=True)

@@ -1,3 +1,4 @@
+from adapter_agent.hierarchical.state import SFTPool
 import asyncio
 import time
 from pathlib import Path
@@ -10,9 +11,12 @@ from oai_utils.tracing import AgentContentPrinter
 
 from adapter_agent.hierarchical.h_agent import Agents
 from adapter_agent.hierarchical.runner import process_task
-from adapter_agent.hierarchical.state import SFTDataset, TaskPool
+from adapter_agent.hierarchical.state import TaskPool
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.model_helper import get_gemini
+
+
+from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
 
 
 async def main():
@@ -36,10 +40,30 @@ async def main():
     print(f"Experiment ID: {experiment_id}")
     print(f"Base Directory: {base_dir}")
 
-    agents = Agents.from_model(model)
+    # Initialize RustDocAnalyzer
+    doc_path = lib_path / "target" / "doc"
+    pubapi_path = lib_path / "pubapi.txt"
+    json_path = None
+    if doc_path.exists():
+        if (doc_path / "numrs2.json").exists():
+            json_path = doc_path / "numrs2.json"
+        else:
+            jsons = list(doc_path.glob("*.json"))
+            if jsons:
+                json_path = jsons[0]
+
+    if json_path and json_path.exists():
+        print(f"Loading RustDocAnalyzer from {json_path}")
+        rust_doc_analyzer = RustDocAnalyzer.from_json(
+            json_path, pubapi_path=pubapi_path
+        )
+    else:
+        raise FileNotFoundError(f"Could not find rustdoc json in {doc_path}")
+
+    agents = Agents.from_model(model, rust_doc_analyzer)
 
     task_pool = TaskPool(tasks={})
-    sft_dataset = SFTDataset(items=[])
+    sft_pool = SFTPool.new()
 
     benchmark_df = pl.read_csv("experiments/gh/benchmark_dataset.csv").filter(
         pl.col("appropriate")
@@ -60,7 +84,7 @@ async def main():
                     agents=agents,
                     task=task,
                     task_pool=task_pool,
-                    sft_dataset=sft_dataset,
+                    sft_pool=sft_pool,
                     host_lib_dir=lib_path,
                     workspace_template_location=workspace_template_location,
                     experiment_dir=base_dir,

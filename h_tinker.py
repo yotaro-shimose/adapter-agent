@@ -1,40 +1,26 @@
-from pydantic import Field
-from pydantic import BaseModel
-from adapter_agent.hierarchical.state import SFTPool
 import asyncio
 import logging
 import os
-import sys
-import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypeVar
-import tinker.types as ttypes
+
 import chz
-import polars as pl
 import tinker
-import torch
-from oai_utils import AgentsSDKModel
+import tinker.types as ttypes
 from oai_utils.litellm import litellm_concurrent_limit
 from oai_utils.tinker import LogprobLitellmModel
 from oai_utils.tinker.litellm_model import TinkerLLM
-from tinker.types import LossFnType
+from pydantic import BaseModel, Field
 from tinker_cookbook import checkpoint_utils, model_info, renderers
-from tinker_cookbook.completers import TokensWithLogprobs
-from tinker_cookbook.rl.data_processing import assemble_training_data
-from tinker_cookbook.rl.types import Trajectory, TrajectoryGroup, Transition
-from tinker_cookbook.tokenizer_utils import Tokenizer, get_tokenizer
+from tinker_cookbook.tokenizer_utils import Tokenizer
 from tinker_cookbook.utils import ml_log
-from tinker_cookbook.utils.misc_utils import split_list, timed
-from tinker_cookbook.utils.trace import scope, update_scope_context
+from tinker_cookbook.utils.trace import scope
 
 # Imports from hierarchical agent
 from adapter_agent.hierarchical.h_agent import Agents
 from adapter_agent.hierarchical.runner import process_task
-from adapter_agent.hierarchical.state import SFTDataset, TaskPool
-from adapter_agent.hierarchical.types import Task
+from adapter_agent.hierarchical.state import SFTPool, TaskPool
+from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
 from adapter_agent.qra import QA
-from tinker_hello import build_config_blueprint
 
 logger = logging.getLogger(__name__)
 
@@ -180,6 +166,37 @@ async def initialization(cfg: Config):
 
     logger.info(f"Loaded {len(task_pool.tasks)} tasks.")
 
+    # Init RustDocAnalyzer
+    repo_path = Path(cfg.experiment_config.host_lib_dir)
+    doc_path = repo_path / "target" / "doc"
+    pubapi_path = repo_path / "pubapi.txt"
+
+    # Try to find the json file
+    json_path = None
+    if doc_path.exists():
+        # Heuristic: find numrs2.json or {repo_name}.json
+        # Check specific known case first
+        if (doc_path / "numrs2.json").exists():
+            json_path = doc_path / "numrs2.json"
+        else:
+            # Fallback to any json
+            jsons = list(doc_path.glob("*.json"))
+            if jsons:
+                json_path = jsons[0]
+
+    if json_path and json_path.exists():
+        logger.info(f"Loading RustDocAnalyzer from {json_path}")
+        rust_doc_analyzer = RustDocAnalyzer.from_json(
+            json_path, pubapi_path=pubapi_path
+        )
+    else:
+        logger.warning(
+            f"Could not find rustdoc json in {doc_path}. Using dummy analyzer path (will fail on use)."
+        )
+        # Initialize with a non-existent path or fail?
+        # Agents.from_model needs it. Failing is better than hidden bugs.
+        raise FileNotFoundError(f"Could not find rustdoc json in {doc_path}")
+
     # Init Tinker Clients
     ml_logger = ml_log.setup_logging(
         log_dir=cfg.logging_config.log_path,
@@ -192,7 +209,7 @@ async def initialization(cfg: Config):
     model, tokenizer = setup_tinkermodel(
         service_client, training_client, cfg.model_name
     )
-    agents = Agents.from_model(model)
+    agents = Agents.from_model(model, rust_doc_analyzer)
     return agents, training_client, ml_logger, task_pool, sft_pool, tokenizer
 
 
