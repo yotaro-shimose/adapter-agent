@@ -1,11 +1,12 @@
-from dataclasses import dataclass
 import logging
+from dataclasses import dataclass
 
 from coder_mcp.runtime.runtime import Runtime
 from oai_utils.agent import AgentsSDKModel, AgentWrapper
 from pydantic import BaseModel
 
-from adapter_agent.hierarchical.types import Memory, Task, Trajectory
+from adapter_agent.hierarchical.agent.base import BaseAgent
+from adapter_agent.hierarchical.types import Task, Trajectory
 
 logger = logging.getLogger(__name__)
 
@@ -17,11 +18,8 @@ class TaskResponse(BaseModel):
         return Task.from_instruction(self.instruction)
 
 
-@dataclass
-class Analyzer:
-    model: AgentsSDKModel
-    memory: Memory[Trajectory, Task]
-
+@dataclass(kw_only=True)
+class Analyzer[T: AgentsSDKModel](BaseAgent[T, Trajectory, Task]):
     async def analyze_trajectory(
         self, trajectory: Trajectory, runtime: Runtime
     ) -> Task:
@@ -63,5 +61,5 @@ Return a new Task with a clear instruction.
                 "Analyze the trajectory and generate a sub-task.", max_turns=30
             )
             task = result.final_output().to_task()
-            self.memory.add(trajectory, task)
+            self.maybe_add_to_memory(trajectory, task)
             return task

@@ -57,3 +57,11 @@ class Memory[InputT: BaseModel | Json, OutputT: BaseModel | Json](BaseModel):
                 data = f.read()
                 loaded = self.model_validate_json(data)
                 self.items = loaded.items
+
+
+class TaskInstruction(BaseModel):
+    instruction: str
+
+
+class TaskInstructionList(BaseModel):
+    tasks: list[TaskInstruction]

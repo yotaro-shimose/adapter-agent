@@ -1,18 +1,22 @@
+import logging
 from dataclasses import dataclass
 
 from agents import ModelSettings, RunContextWrapper, StopAtTools, function_tool
 from coder_mcp.runtime.runtime import Runtime
+from coder_mcp.types import CoderToolName
 from oai_utils.agent import AgentRunFailure, AgentsSDKModel, AgentWrapper
 from pydantic import BaseModel
 
-from adapter_agent.hierarchical.types import Memory
-from adapter_agent.qra import QA
+from adapter_agent.hierarchical.agent.base import BaseAgent
+from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
 from adapter_agent.library.rust_doc_tools import (
     WithRustDocAnalyzer,
     search_docs,
     search_symbol,
 )
-from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
+from adapter_agent.qra import QA
+
+logger = logging.getLogger(__name__)
 
 
 class VerificationResult(BaseModel):
@@ -22,6 +26,13 @@ class VerificationResult(BaseModel):
 
 class VerifierContext(WithRustDocAnalyzer):
     result: VerificationResult | None = None
+
+
+VERIFIER_CODER_TOOLS: list[CoderToolName] = [
+    "bash",
+    "view_file",
+    "list_directory",
+]
 
 
 @function_tool
@@ -56,13 +67,13 @@ def report_failure(
     )
 
 
-@dataclass
-class Verifier:
-    model: AgentsSDKModel
-    memory: Memory[QA, VerificationResult]
+@dataclass(kw_only=True)
+class Verifier[T: AgentsSDKModel](BaseAgent[T, QA, VerificationResult]):
     rust_doc_analyzer: RustDocAnalyzer
 
-    async def verify(self, qra: QA, runtime: Runtime) -> VerificationResult:
+    async def verify(
+        self, qra: QA, runtime: Runtime, tree_structure: str
+    ) -> VerificationResult:
         """
         Questionに対してAnswerが問題を解決できるものとなっているかどうかをコードの実行などを通じて検証して、QAが正しければTrueをリターンする。
         """
@@ -83,19 +94,23 @@ You have access to documentation tools to understand the codebase:
 - `search_symbol`: Find specific types/functions by name.
 
 You must:
-1. First, check if the provided code works without error.
+1. First, check if the provided code works without error. If it fails, report failure.
 2. After that, read the source code to check if the solution is not cheating and satisfies the question.
 3. Then, report your finding using the `report_success` or `report_failure` tool.
 </HowTo>
 
 <Guidelines>
-You should not use release build for faster debugging.
-Include your deep analysis in the reasoning argument, but you do not have to edit the code unless you REALLY need to check its intermediate output.
-While you have edit tools, you are not supposed to write dedicated test code.
-Most of the time you just execute the provided code, or insert debug print statements at maximum.
+- You should not use release build for faster debugging.
+- You should carefully check if the code provided is corresponding to the task.
+    - Typical mistake is to provide the solution in a workspace but not in the answer.
+- If you do not see any solution in the answer, you can immediately report failure.
+- If provided code does not compile, you can immediately report failure.
+- You are not allowed to edit the code unless you REALLY need to check its intermediate output.
 </Guidelines>
 """
-        async with runtime.coder_mcp() as coder_mcp:
+        async with runtime.coder_mcp(
+            allowed_tool_names=VERIFIER_CODER_TOOLS,
+        ) as coder_mcp:
             agent = AgentWrapper.create(
                 name="Verifier",
                 instructions=PROMPT,
@@ -128,25 +143,33 @@ Most of the time you just execute the provided code, or insert debug print state
 {qra.answer}
 </Answer to Verify>
 
+<Current Directory Structure>
+{tree_structure}
+</Current Directory Structure>
+
 <Crate Overview>
 {crate_overview}
 </Crate Overview>
 """
 
             try:
-                await agent.run(input_prompt, max_turns=30, context=context)
+                await agent.run(input_prompt, max_turns=10, context=context)
                 if context.result is None:
                     # Should not happen because of StopAtTools or MaxTurnsExceeded (which raises)
                     # But if the agent stops without calling a tool (e.g. natural stop), treating as failure
-                    print("Verifier finished without calling report tool.")
                     return VerificationResult(
                         success=False,
                         reasoning="Verifier finished without reporting success or failure.",
                     )
 
                 final_output = context.result
-                self.memory.add(qra, final_output)
+                self.maybe_add_to_memory(qra, final_output)
                 return final_output
             except AgentRunFailure as e:
-                print(f"Verification process failed: {e}")
+                if e.cause == "MaxTurnsExceeded":
+                    return VerificationResult(
+                        success=False,
+                        reasoning="Verifier exceeded maximum number of turns.",
+                    )
+                logger.error(f"Verification process failed: {e}")
                 raise

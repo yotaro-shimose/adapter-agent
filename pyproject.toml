@@ -19,11 +19,11 @@ dependencies = [
     "coder-mcp",
     "litellm==1.81",
     "openai>=2.14.0",
-    "tinker>=0.9.0",
     "chz>=0.4.0",
     "tinker-cookbook",
     "oai-utils",
     "wandb>=0.24.1",
+    "tinker>=0.9.0",
 ]
 
 [build-system]
@@ -36,7 +36,6 @@ no-build-isolation-package = ["flash-attn"]
 index-strategy = "unsafe-best-match"
 
 [tool.uv.sources]
-coder-mcp = { path = "../coder-mcp", editable = true }
 torch = [
     { index = "pytorch-cu130" }
 ]
@@ -45,6 +44,7 @@ vllm = [
 ]
 tinker-cookbook = { git = "https://github.com/thinking-machines-lab/tinker-cookbook" }
 oai-utils = { path = "../oai_utils", editable = true }
+coder-mcp = { path = "../coder-mcp", editable = true }
 [project.optional-dependencies]
 test = [
     "pytest>=8.0.0",

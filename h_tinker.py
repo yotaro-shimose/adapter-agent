@@ -7,20 +7,20 @@ import chz
 import tinker
 import tinker.types as ttypes
 from oai_utils.litellm import litellm_concurrent_limit
-from oai_utils.tinker import LogprobLitellmModel
-from oai_utils.tinker.litellm_model import TinkerLLM
+from oai_utils.tinker import LogprobLitellmModel, setup_tinkermodel
 from pydantic import BaseModel, Field
-from tinker_cookbook import checkpoint_utils, model_info, renderers
+from tinker_cookbook import checkpoint_utils
 from tinker_cookbook.tokenizer_utils import Tokenizer
 from tinker_cookbook.utils import ml_log
 from tinker_cookbook.utils.trace import scope
 
 # Imports from hierarchical agent
-from adapter_agent.hierarchical.h_agent import Agents
-from adapter_agent.hierarchical.runner import process_task
-from adapter_agent.hierarchical.state import SFTPool, TaskPool
+from adapter_agent.hierarchical.agent.h_agent import Agents
+from adapter_agent.hierarchical.process.runner import process_task
+from adapter_agent.hierarchical.state import RLPool, SFTPool, TaskPool
 from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
 from adapter_agent.qra import QA
+from adapter_agent.util.logger_util import setup_base_loglevel
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +38,7 @@ class AsyncConfig(BaseModel):
 class ExperimentConfig(BaseModel):
     workspace_template_location: Path = Path("templates/rust_template")
     host_lib_dir: Path = Path("repositories/numrs")
-    experiment_dir: Path = Path("experiments/hierarchical_tinker_run")
+    experiment_dir: Path = Path("experiments/hierarchical_tinker_run_260203")
     benchmark_path: Path = Path("experiments/gh/benchmark_dataset.csv")
 
 
@@ -71,13 +71,14 @@ class Config(BaseModel):
     temperature: float = 1.0
     lora_rank: int = 32
     sft_batch_size: int = 16
+    group_size: int = 4
 
     compute_post_kl: bool = False
     kl_penalty_coef: float = 0.0
     kl_discount_factor: float = 0.0
     kl_reference_config: KLReferenceConfig | None = None
 
-    num_rollout_workers: int = 4  # TODO: increase this
+    num_rollout_workers: int = 30  # TODO: increase this
 
     logging_config: LoggingConfig = Field(default_factory=LoggingConfig)
     base_url: str | None = None
@@ -122,54 +123,10 @@ async def load_training_client(cfg: Config, service_client: tinker.ServiceClient
     return training_client
 
 
-def setup_tinkermodel(
-    service_client: tinker.ServiceClient,
-    training_client: tinker.TrainingClient,
-    model_name: str,
-) -> tuple[LogprobLitellmModel, Tokenizer]:
-    sampling_client = service_client.create_sampling_client(base_model=model_name)
-    tokenizer = training_client.get_tokenizer()
-
-    renderer_name = model_info.get_recommended_renderer_name(model_name)
-    renderer = renderers.get_renderer(renderer_name, tokenizer)
-    # Register tinker litellm model
-    tinker_llm = TinkerLLM(
-        model_name=model_name,
-        renderer=renderer,
-        tokenizer=tokenizer,
-    )
-    tinker_llm.rewrite_litellm_custom_providers()
-    litellm_model_name = f"tinker/{model_name}"
-    model = LogprobLitellmModel(
-        model=litellm_model_name,
-        sampling_client=sampling_client,
-    )
-    return model, tokenizer
-
-
-def setup_logger():
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("pylatexenc").setLevel(logging.WARNING)
-    logging.getLogger("LiteLLM").setLevel(logging.WARNING)
-    logging.getLogger("litellm").setLevel(logging.WARNING)
-    logging.getLogger("mcp.client.streamable_http").setLevel(logging.ERROR)
-
-
-async def initialization(cfg: Config):
-    # Setup
-    exp_dir = Path(cfg.experiment_config.experiment_dir).absolute()
-    exp_dir.mkdir(parents=True, exist_ok=True)
-
-    # Init TaskPool
-    task_pool = TaskPool.from_benchmark_csv(cfg.experiment_config.benchmark_path)
-    sft_pool = SFTPool.new()
-
-    logger.info(f"Loaded {len(task_pool.tasks)} tasks.")
-
+def setup_rust_doc_analyzer(host_lib_dir: Path) -> RustDocAnalyzer:
     # Init RustDocAnalyzer
-    repo_path = Path(cfg.experiment_config.host_lib_dir)
-    doc_path = repo_path / "target" / "doc"
-    pubapi_path = repo_path / "pubapi.txt"
+    doc_path = host_lib_dir / "target" / "doc"
+    pubapi_path = host_lib_dir / "pubapi.txt"
 
     # Try to find the json file
     json_path = None
@@ -179,10 +136,7 @@ async def initialization(cfg: Config):
         if (doc_path / "numrs2.json").exists():
             json_path = doc_path / "numrs2.json"
         else:
-            # Fallback to any json
-            jsons = list(doc_path.glob("*.json"))
-            if jsons:
-                json_path = jsons[0]
+            raise ValueError(f"Could not find rustdoc json in {doc_path}")
 
     if json_path and json_path.exists():
         logger.info(f"Loading RustDocAnalyzer from {json_path}")
@@ -196,6 +150,22 @@ async def initialization(cfg: Config):
         # Initialize with a non-existent path or fail?
         # Agents.from_model needs it. Failing is better than hidden bugs.
         raise FileNotFoundError(f"Could not find rustdoc json in {doc_path}")
+    return rust_doc_analyzer
+
+
+async def initialization(cfg: Config):
+    # Setup
+    exp_dir = Path(cfg.experiment_config.experiment_dir).absolute()
+    exp_dir.mkdir(parents=True, exist_ok=True)
+
+    # Init TaskPool
+    logger.warning(
+        f"Loading only 1 tasks from {cfg.experiment_config.benchmark_path} for debugging."
+    )
+    task_pool = TaskPool.from_benchmark_csv(cfg.experiment_config.benchmark_path, 1)
+    sft_pool = SFTPool.new()
+
+    logger.info(f"Loaded {len(task_pool.tasks)} tasks.")
 
     # Init Tinker Clients
     ml_logger = ml_log.setup_logging(
@@ -206,11 +176,11 @@ async def initialization(cfg: Config):
     )
     service_client = tinker.ServiceClient(base_url=cfg.base_url)
     training_client = await load_training_client(cfg, service_client)
-    model, tokenizer = setup_tinkermodel(
-        service_client, training_client, cfg.model_name
-    )
+    model, tokenizer, _renderer = setup_tinkermodel(service_client, cfg.model_name)
+    rust_doc_analyzer = setup_rust_doc_analyzer(cfg.experiment_config.host_lib_dir)
     agents = Agents.from_model(model, rust_doc_analyzer)
-    return agents, training_client, ml_logger, task_pool, sft_pool, tokenizer
+    rl_pool = RLPool.new()
+    return agents, training_client, ml_logger, task_pool, sft_pool, rl_pool, tokenizer
 
 
 def qa2sample(qa: QA, tokenizer: Tokenizer) -> ttypes.Datum:
@@ -243,16 +213,17 @@ async def main(cfg: Config):
         ml_logger,
         task_pool,
         sft_pool,
+        rl_pool,
         tokenizer,
     ) = await initialization(cfg)
-    setup_logger()
+    setup_base_loglevel()
 
     async def rollout_worker(worker_id: str):
-        logging.info(f"Worker {worker_id} started.")
+        logger.info(f"Worker {worker_id} started.")
         while True:
             task = await task_pool.pop_task()
             if task is None:
-                logging.info(f"Worker {worker_id} stopping (shutdown signal received).")
+                logger.info(f"Worker {worker_id} stopping (shutdown signal received).")
                 break
 
             try:
@@ -261,12 +232,14 @@ async def main(cfg: Config):
                     task=task,
                     task_pool=task_pool,
                     sft_pool=sft_pool,
-                    host_lib_dir=cfg.experiment_config.host_lib_dir,
                     workspace_template_location=cfg.experiment_config.workspace_template_location,
+                    host_lib_dir=cfg.experiment_config.host_lib_dir,
                     experiment_dir=cfg.experiment_config.experiment_dir,
+                    rl_pool=rl_pool,
+                    group_size=cfg.group_size,
                 )
             except Exception as e:
-                logging.error(
+                logger.error(
                     f"Worker {worker_id} encountered an error processing task {task.id}: {e}"
                 )
             finally:
@@ -274,11 +247,37 @@ async def main(cfg: Config):
                 await task_pool.finish_task(task)
 
     async def train_worker(worker_id: str):
-        logging.info(f"Worker {worker_id} started.")
+        logger.info(f"Worker {worker_id} started.")
         while True:
+            # Check RL pool first
+            if (
+                rl_pool.queue.qsize() >= cfg.sft_batch_size
+            ):  # Using sft_batch_size as batch size for now
+                # This might need to be cfg.async_config.groups_per_batch
+                groups = rl_pool.get_batch(cfg.sft_batch_size)
+
+                # Compute GRPO loss and backward
+                from adapter_agent.hierarchical.grpo import compute_grpo_loss
+
+                loss = await compute_grpo_loss(groups, training_client)
+                # TODO: reorder task registering and consumption of its future
+                optim_future = await training_client.optim_step_async(
+                    cfg.optimizer_config.to_tinker_adam_params()
+                )
+                optim_result = await optim_future.result_async()
+
+                new_client = (
+                    await training_client.save_weights_and_get_sampling_client_async()
+                )
+                update_agents_sampling_client(agents, new_client)
+                logger.info(f"Worker {worker_id} finished GRPO step. Loss: {loss}")
+                continue
+
             if not sft_pool.queue.qsize() >= cfg.sft_batch_size:
                 await asyncio.sleep(0.1)
                 continue
+
+            # SFT Fallback (or mixed training)
             samples = sft_pool.get_batch(cfg.sft_batch_size)
             data = [qa2sample(sample, tokenizer) for sample in samples]
             fwd_bwd_future = await training_client.forward_backward_async(
@@ -293,7 +292,7 @@ async def main(cfg: Config):
                 await training_client.save_weights_and_get_sampling_client_async()
             )
             update_agents_sampling_client(agents, new_client)
-            logging.info(f"Worker {worker_id} finished SFT step.")
+            logger.info(f"Worker {worker_id} finished SFT step.")
             # TODO: add metrics
 
     async with litellm_concurrent_limit(cfg.num_rollout_workers):
@@ -306,7 +305,9 @@ async def main(cfg: Config):
 
 
 if __name__ == "__main__":
-    config = Config()
+    config = Config(
+        model_name="Qwen/Qwen3-30B-A3B-Instruct-2507",
+    )
     log_path = os.path.expanduser(config.logging_config.log_path)
     if os.path.exists(log_path):
         logger.warning(f"Log directory {log_path} already exists.")

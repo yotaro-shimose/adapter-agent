@@ -9,9 +9,15 @@ from pydantic import BaseModel, PrivateAttr
 
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.qra import QA
+from tinker_cookbook.rl.types import Trajectory
 
 
 logger = logging.getLogger(__name__)
+
+
+class RLGroup(BaseModel):
+    trajectories: list[Trajectory]
+    rewards: list[float]
 
 
 class TaskPool(BaseModel):
@@ -27,7 +33,6 @@ class TaskPool(BaseModel):
 
     async def register(self, task: Task) -> None:
         async with self._lock:
-            logger.info(f"Details: Registering task: {task.instruction}")
             self.tasks[task.id] = task
             self._condition.notify_all()
 
@@ -67,8 +72,10 @@ class TaskPool(BaseModel):
             f.write(self.model_dump_json(indent=2))
 
     @classmethod
-    def from_benchmark_csv(cls, path: Path) -> Self:
+    def from_benchmark_csv(cls, path: Path, num_tasks: int | None = None) -> Self:
         benchmark_df = pl.read_csv(path).filter(pl.col("appropriate"))
+        if num_tasks is not None:
+            benchmark_df = benchmark_df.head(num_tasks)
         tasks = {}
         for row in benchmark_df.iter_rows(named=True):
             task = Task.from_instruction(row["problem_statement"])
@@ -110,6 +117,44 @@ class SFTPool:
     @classmethod
     def new(cls) -> Self:
         return cls(dataset=SFTDataset(), queue=asyncio.Queue())
+
+
+@dataclass
+class RLPool:
+    queue: asyncio.Queue[RLGroup]
+
+    async def register(self, group: RLGroup) -> None:
+        await self.queue.put(group)
+
+    def get_batch(self, batch_size: int) -> list[RLGroup]:
+        batch = []
+        for _ in range(batch_size):
+            if self.queue.empty():
+                break
+            batch.append(self.queue.get_nowait())
+        return batch
+
+    @classmethod
+    def new(cls) -> Self:
+        return cls(queue=asyncio.Queue())
+
+    def save(self, path: Path) -> None:
+        """
+        Save the current state of the RLPool to a JSON file.
+        Note: This inspects the internal queue without consuming items.
+        """
+        # Access internal deque to get all items without popping
+        # items is a list of RLGroup
+        items = list(self.queue._queue)  # type: ignore
+
+        # Serialize items
+        serialized_items = [item.model_dump(mode="json") for item in items]
+
+        with path.open("w") as f:
+            # We can use json.dump since we already converted pydantic models to dicts/json-safe types
+            import json
+
+            json.dump(serialized_items, f, indent=2)
 
 
 class TaskList(BaseModel):

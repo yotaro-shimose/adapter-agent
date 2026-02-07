@@ -1,22 +1,14 @@
-from oai_utils.agent import AgentRunFailure
-
-from dataclasses import dataclass
 import logging
-from oai_utils.agent import AgentsSDKModel, AgentWrapper
+from dataclasses import dataclass
+
+from oai_utils.agent import AgentRunFailure, AgentsSDKModel, AgentWrapper
 from pydantic import BaseModel
 
+from adapter_agent.hierarchical.agent.base import BaseAgent
 from adapter_agent.hierarchical.state import TaskList
-from adapter_agent.hierarchical.types import Memory, Task
+from adapter_agent.hierarchical.types import Task, TaskInstructionList
 
 logger = logging.getLogger(__name__)
-
-
-class DecomposedTask(BaseModel):
-    instruction: str
-
-
-class DecomposedTaskList(BaseModel):
-    tasks: list[DecomposedTask]
 
 
 class DecomposerInput(BaseModel):
@@ -24,10 +16,7 @@ class DecomposerInput(BaseModel):
 
 
 @dataclass
-class Decomposer:
-    model: AgentsSDKModel
-    memory: Memory[DecomposerInput, TaskList]
-
+class Decomposer[T: AgentsSDKModel](BaseAgent[T, DecomposerInput, TaskList]):
     async def decompose(
         self, original_instruction: str, library_name: str
     ) -> list[Task]:
@@ -68,8 +57,8 @@ a good practice task would be:
 </Example>
 
 <OutputFormat>
-You must return a `DecomposedTaskList` object which contains a list of `DecomposedTask` objects.
-Each `DecomposedTask` must have:
+You must return a `TaskInstructionList` object which contains a list of `TaskInstruction` objects.
+Each `TaskInstruction` must have:
 - `instruction`: The string instruction for the practice task.
 
 IMPORTANT: Your output must be PURE JSON. Do NOT include any markdown formatting such as ```json ... ```.
@@ -86,11 +75,11 @@ Example Output:
 }}
 </OutputFormat>
 """
-        agent = AgentWrapper[DecomposedTaskList].create(
+        agent = AgentWrapper[TaskInstructionList].create(
             name="Decomposer",
             instructions=PROMPT,
             model=self.model,
-            output_type=DecomposedTaskList,
+            output_type=TaskInstructionList,
         )
 
         try:
@@ -105,7 +94,7 @@ Example Output:
 
             task_list = TaskList(tasks=new_tasks)
 
-            self.memory.add(
+            self.maybe_add_to_memory(
                 DecomposerInput(original_instruction=original_instruction),
                 task_list,
             )
