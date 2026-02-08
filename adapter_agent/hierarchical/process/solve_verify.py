@@ -80,6 +80,7 @@ async def solve_verify(
                 verification_result = await verifier.verify(
                     qa, rust_env, tree_structure
                 )
+                logger.info(f"Verification result: {verification_result.success}")
                 if not verification_result.success:
                     reasoning = verification_result.reasoning
             else:

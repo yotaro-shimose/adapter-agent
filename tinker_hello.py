@@ -17,7 +17,7 @@ import tinker
 import torch
 from agents import ModelSettings
 from oai_utils.agent import AgentWrapper
-from oai_utils.tinker.litellm_model import TinkerLLM, result_to_trajectory
+from oai_utils.tinker.litellm_model import TinkerLLM, new_items_to_trajectory
 from oai_utils.tinker.model_with_logprob import LogprobLitellmModel
 from tinker.types import LossFnType
 from tinker_cookbook import checkpoint_utils, model_info, renderers
@@ -580,7 +580,7 @@ async def do_agent_rollout_and_filter_constant_reward(
         )
 
         result = await agent_wrapper.run(prompt_text)
-        return result_to_trajectory(result)
+        return new_items_to_trajectory(result)
 
     with logtree.optional_enable_logging(enable_logging):
         envs_G = await env_group_builder.make_envs()

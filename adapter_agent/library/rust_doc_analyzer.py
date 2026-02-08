@@ -530,3 +530,21 @@ class RustDocAnalyzer:
 
         print_node(self.data.root, is_root=True)
         return "\n".join(lines)
+
+    @classmethod
+    def from_libdir(cls, host_lib_dir: Path) -> Self:
+        doc_path = host_lib_dir / "target" / "doc"
+        pubapi_path = host_lib_dir / "pubapi.txt"
+        json_path = None
+        if doc_path.exists():
+            if (doc_path / "numrs2.json").exists():
+                json_path = doc_path / "numrs2.json"
+
+        if json_path and json_path.exists():
+            return RustDocAnalyzer.from_json(json_path, pubapi_path=pubapi_path)
+        else:
+            # Fallback or error
+            # For debug script, we might want to try finding it or just fail
+            raise FileNotFoundError(
+                f"Could not find rustdoc json in {doc_path}. Ensure you are in the workspace root or path is correct."
+            )

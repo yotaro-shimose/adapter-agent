@@ -1,3 +1,4 @@
+from agents import AgentsException
 import logging
 from dataclasses import dataclass
 
@@ -6,7 +7,7 @@ from coder_mcp.runtime.runtime import Runtime
 from coder_mcp.types import CoderToolName
 from oai_utils import RunResultWrapper
 from oai_utils.agent import AgentRunFailure, AgentsSDKModel, AgentWrapper
-from oai_utils.tinker.litellm_model import result_to_trajectory
+from oai_utils.tinker.litellm_model import new_items_to_trajectory
 from pydantic import BaseModel
 from tinker_cookbook.rl.types import Trajectory
 
@@ -178,7 +179,7 @@ You should not use release build for faster debugging.
                     context=context,
                 )
                 if collect_trajectory:
-                    trajectory = result_to_trajectory(ret)
+                    trajectory = new_items_to_trajectory(ret.result.new_items)
                 else:
                     trajectory = None
                 if context.qra is not None:
@@ -196,6 +197,10 @@ You should not use release build for faster debugging.
                     "MaxTurnsExceeded",
                 ]:
                     result = SolverResult(trajectory=None, is_max_turns_exceeded=True)
+                    self.maybe_add_to_memory(task, result)
+                    return result
+                elif e.cause == "ModelBehaviourError":
+                    result = SolverResult(trajectory=None, is_max_turns_exceeded=False)
                     self.maybe_add_to_memory(task, result)
                     return result
                 else:
@@ -289,7 +294,7 @@ You should not use release build for faster debugging.
                     context=context,
                 )
                 if collect_trajectory:
-                    trajectory = result_to_trajectory(ret)
+                    trajectory = new_items_to_trajectory(ret.result.new_items)
                 else:
                     trajectory = None
                 if context.qra is not None:
@@ -301,16 +306,39 @@ You should not use release build for faster debugging.
                 return result
 
             except AgentRunFailure as e:
+                if (
+                    isinstance(e.original, AgentsException)
+                    and e.original.run_data is not None
+                    and e.original.run_data.new_items
+                ):
+                    trajectory = new_items_to_trajectory(e.original.run_data.new_items)
+                else:
+                    trajectory = None
                 if e.cause in [
                     "ContextWindowExceededError",
                     "BadRequestError",
                     "MaxTurnsExceeded",
                 ]:
-                    result = SolverResult(trajectory=None, is_max_turns_exceeded=True)
+                    result = SolverResult(
+                        trajectory=trajectory, is_max_turns_exceeded=True
+                    )
+                    self.maybe_add_to_memory(task, result)
+                    return result
+                elif e.cause == "ModelBehaviourError":
+                    result = SolverResult(
+                        trajectory=trajectory, is_max_turns_exceeded=False
+                    )
                     self.maybe_add_to_memory(task, result)
                     return result
                 else:
                     raise
             except Exception as e:
+                if "Request Entity Too Large" in str(e):
+                    logger.warning(
+                        "Somehow Request Entity Too Large. Returning empty trajectory with failure."
+                    )
+                    result = SolverResult(trajectory=None, is_max_turns_exceeded=False)
+                    self.maybe_add_to_memory(task, result)
+                    return result
                 logger.error(f"Solver error: {e}")
                 raise NotImplementedError

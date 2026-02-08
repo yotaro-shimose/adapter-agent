@@ -231,7 +231,7 @@ async def main():
         logger.info("SFT Training Skipped (num_train_steps == 0). Using Base Model.")
 
     # --- Evaluation ---
-    rust_doc_analyzer = setup_rust_doc_analyzer(cfg.library.local_path)
+    rust_doc_analyzer = RustDocAnalyzer.from_libdir(cfg.library.local_path)
     # Agents for evaluation
     sampling_client = await training_client.save_weights_and_get_sampling_client_async()
     model.update_sampling_client(sampling_client)
