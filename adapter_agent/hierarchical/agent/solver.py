@@ -158,8 +158,6 @@ You should not use release build for faster debugging.
 
             context = SolverContext(rust_doc_analyzer=self.rust_doc_analyzer)
 
-            crate_overview = self.rust_doc_analyzer.get_overview()
-
             try:
                 ret: RunResultWrapper = await agent.run(
                     f"""
@@ -171,9 +169,7 @@ You should not use release build for faster debugging.
 {tree_structure}
 </Current Directory Structure>
 
-<Library Overview>
-{crate_overview}
-</Library Overview>
+
 """,
                     max_turns=max_turns,
                     context=context,
@@ -273,8 +269,6 @@ You should not use release build for faster debugging.
 
             context = SolverContext(rust_doc_analyzer=self.rust_doc_analyzer)
 
-            crate_overview = self.rust_doc_analyzer.get_overview()
-
             try:
                 ret: RunResultWrapper = await agent.run(
                     f"""
@@ -286,9 +280,7 @@ You should not use release build for faster debugging.
 {tree_structure}
 </Current Directory Structure>
 
-<Library Overview>
-{crate_overview}
-</Library Overview>
+
 """,
                     max_turns=max_turns,
                     context=context,

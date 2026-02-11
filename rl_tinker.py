@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from datetime import datetime
 
 import torch
+import wandb
 from oai_utils.async_utils import gather_with_semaphore
 from oai_utils.tinker import setup_tinkermodel
 from tinker.types.loss_fn_type import LossFnType
@@ -31,6 +32,11 @@ from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
 from adapter_agent.model_helper import get_gemini
 from adapter_agent.qra import QA
 from adapter_agent.util.logger_util import setup_base_loglevel
+import litellm
+
+litellm.add_function_to_prompt
+
+logger = logging.getLogger(__name__)
 
 
 class RLConfig(BaseModel):
@@ -45,17 +51,14 @@ class RLConfig(BaseModel):
     adam_params: tinker.AdamParams = tinker.AdamParams(
         learning_rate=1e-4, beta1=0.9, beta2=0.95, eps=1e-8
     )
-    num_substeps: int = 4
     loss_fn: str = "importance_sampling"
-    num_groups_per_batch: int = 8  # TODO: Increase this
-    num_train_updates: int = 3
-    num_rollout_workers: int = 32  # TODO: Increase this
+    num_groups_per_batch: int = 1  # TODO: Increase this
+    num_rollout_workers: int = 1  # TODO: Increase this
+    num_substeps: int = 1
     rollouts_per_question: int = 4
     max_turns: int = 15
+    image_name: str = "coder-mcp-numrs2:latest"
     library: Library = Library(name="numrs2", local_path=Path("repositories/numrs"))
-
-
-logger = logging.getLogger(__name__)
 
 
 # Filter out specific openai.agents warning
@@ -163,11 +166,73 @@ def prepare_minibatch_simplified(trajectory_groups: list[TrajectoryGroup]):
     return data_D
 
 
+def create_wandb_samples_table(
+    data_D: list[tinker.Datum],
+    tokenizer: Any,
+    step_counter: int,
+) -> wandb.Table | None:
+    if not data_D:
+        return None
+    try:
+        table = wandb.Table(columns=["step", "full_text", "mean_advantage"])
+        for datum in data_D:
+            # Decode text
+            tokens = []
+            for chunk in datum.model_input.chunks:
+                if isinstance(chunk, tinker.EncodedTextChunk):
+                    tokens.extend(chunk.tokens)
+            full_text = tokenizer.decode(tokens)
+
+            # Extract advantage
+            advantages = datum.loss_fn_inputs["advantages"].to_torch()
+            mean_adv = advantages.mean().item()
+
+            table.add_data(step_counter, full_text, mean_adv)
+
+        return table
+    except Exception as e:
+        logger.warning(f"Failed to log wandb table: {e}")
+        return None
+
+
+def _compute_batch_metrics(
+    batch_trajectory_groups: list[TrajectoryGroup],
+    data_D: list[tinker.Datum],
+) -> dict[str, Any]:
+    all_rewards = []
+    for group in batch_trajectory_groups:
+        all_rewards.extend(group.final_rewards_G)
+
+    mean_reward = sum(all_rewards) / len(all_rewards) if all_rewards else 0.0
+
+    return {
+        "train/num_samples": len(data_D),
+        "train/mean_reward": mean_reward,
+        "train/num_groups": len(batch_trajectory_groups),
+    }
+
+
+def _log_metrics_and_table(
+    metrics: dict[str, Any],
+    data_D: list[tinker.Datum],
+    step_counter: int,
+    tokenizer: Any,
+    ml_logger: Any,
+    cfg: RLConfig,
+) -> None:
+    ml_logger.log_metrics(metrics, step=step_counter)
+
+    if cfg.wandb_project is not None:
+        if (
+            table := create_wandb_samples_table(data_D, tokenizer, step_counter)
+        ) is not None:
+            wandb.log({"train/samples": table}, step=step_counter)
+
+
 async def main():
     setup_base_loglevel()
     # Add trace processor for printing behavior
     # add_trace_processor(AgentContentPrinter())
-
     cfg = RLConfig()
     cfg.log_path = f"{cfg.log_path}/{cfg.experiment_name}"
 
@@ -236,24 +301,17 @@ async def main():
 
     async def solve_for_question(question_text: str):
         task = Task.from_instruction(question_text)
-        exclude = ["target", ".git"]
-        workspace_template = Path("templates/rust_template")
-        library_name = "numrs2"
-        max_turns = cfg.max_turns
-        collect_trajectory = True
-
         results = await gather_with_semaphore(
             [
                 solve_verify(
                     solver=solver,
                     verifier=verifier,
                     task=task,
-                    workspace_template=workspace_template,
-                    library_name=library_name,
-                    max_turns=max_turns,
-                    collect_trajectory=collect_trajectory,
+                    image_name=cfg.image_name,
+                    library_name=cfg.library.name,
+                    max_turns=cfg.max_turns,
+                    collect_trajectory=True,
                     use_search=False,
-                    exclude=exclude,
                 )
                 for _ in range(cfg.rollouts_per_question)
             ],
@@ -316,8 +374,8 @@ async def main():
 
         logger.info(f"Rollout Worker {worker_id} finished.")
 
-    async def train_worker():
-        logger.info("Train Worker started.")
+    async def train_worker(worker_id: int):
+        logger.info(f"[Train Worker {worker_id}] started.")
         batch_trajectory_groups = []
         step_counter = 0
 
@@ -333,77 +391,87 @@ async def main():
             if len(batch_trajectory_groups) >= cfg.num_groups_per_batch:
                 step_counter += 1
                 logger.info(
-                    f"Training Batch {step_counter} with {len(batch_trajectory_groups)} groups..."
+                    f"[Train Worker {worker_id}] Training Batch {step_counter} with {len(batch_trajectory_groups)} groups..."
                 )
 
                 data_D = prepare_minibatch_simplified(batch_trajectory_groups)
+                metrics_step = {}
 
                 if len(data_D) > 0:
-                    accumulated_metrics = {}
-                    # Update multiple times
-                    for update_i in range(cfg.num_train_updates):
-                        metrics_step = {}
-                        training_logprobs = await train_step(
-                            data_D=data_D,
-                            training_client=training_client,
-                            adam_params=cfg.adam_params,
-                            num_substeps=cfg.num_substeps,
-                            loss_fn=cfg.loss_fn,
-                            metrics=metrics_step,
-                        )
-                        logger.info(
-                            f"  -> Update {update_i + 1}/{cfg.num_train_updates} completed. Metrics: {metrics_step}"
-                        )
-                        for k, v in metrics_step.items():
-                            if isinstance(v, (int, float)):
-                                if k not in accumulated_metrics:
-                                    accumulated_metrics[k] = []
-                                accumulated_metrics[k].append(v)
+                    training_logprobs = await train_step(
+                        data_D=data_D,
+                        training_client=training_client,
+                        adam_params=cfg.adam_params,
+                        num_substeps=cfg.num_substeps,
+                        loss_fn=cfg.loss_fn,
+                        metrics=metrics_step,
+                    )
+                    logger.info(
+                        f"[Train Worker {worker_id}]   -> Update completed. Metrics: {metrics_step}"
+                    )
 
                     # Update sampling client
                     new_client = await training_client.save_weights_and_get_sampling_client_async()
                     solver.model.update_sampling_client(new_client)
-                    logger.info("  -> Solver sampling client updated.")
-
-                    # Calculate metrics
-                    all_rewards = []
-                    for group in batch_trajectory_groups:
-                        all_rewards.extend(group.final_rewards_G)
-
-                    mean_reward = (
-                        sum(all_rewards) / len(all_rewards) if all_rewards else 0.0
+                    logger.info(
+                        f"[Train Worker {worker_id}]   -> Solver sampling client updated."
                     )
 
-                    metrics = {
-                        "train/num_samples": len(data_D),
-                        "train/mean_reward": mean_reward,
-                        "train/num_groups": len(batch_trajectory_groups),
-                    }
+                # Calculate metrics (always log environmental rewards)
+                metrics = _compute_batch_metrics(batch_trajectory_groups, data_D)
+                if metrics_step:
+                    metrics.update(metrics_step)
 
-                    # Add mean of accumulated metrics
-                    for k, v_list in accumulated_metrics.items():
-                        if v_list:
-                            metrics[f"train/{k}"] = sum(v_list) / len(v_list)
-
-                    ml_logger.log_metrics(metrics, step=step_counter)
+                _log_metrics_and_table(
+                    metrics,
+                    data_D,
+                    step_counter,
+                    tokenizer,
+                    ml_logger,
+                    cfg,
+                )
 
                 batch_trajectory_groups = []
 
-        logger.info("Train Worker finished.")
+        logger.info(f"[Train Worker {worker_id}] finished.")
 
     # Start Workers
+    train_worker_task = asyncio.create_task(train_worker(0))
     rollout_workers_tasks = [
         asyncio.create_task(rollout_worker(i)) for i in range(cfg.num_rollout_workers)
     ]
-    train_worker_task = asyncio.create_task(train_worker())
 
-    # Wait for producers to finish
-    await asyncio.gather(*rollout_workers_tasks)
+    # Wait for producers to finish, or trainer to crash
+    rollouts_task = asyncio.gather(*rollout_workers_tasks)
+    done, pending = await asyncio.wait(
+        {rollouts_task, train_worker_task}, return_when=asyncio.FIRST_COMPLETED
+    )
 
-    # Wait for consumer to finish processing all items
-    await queue_trajectories.join()
+    if train_worker_task in done:
+        # Train worker finished early (likely crashed)
+        # Cancel rollouts
+        rollouts_task.cancel()
+        try:
+            await rollouts_task
+        except asyncio.CancelledError:
+            pass
+        # Propagate trainer exception
+        await train_worker_task
 
-    # Cancel consumer
+    # Rollouts finished successfully
+    # Wait for consumer to finish processing all items, or trainer to crash
+    queue_task = asyncio.create_task(queue_trajectories.join())
+    done, pending = await asyncio.wait(
+        {queue_task, train_worker_task}, return_when=asyncio.FIRST_COMPLETED
+    )
+
+    if train_worker_task in done:
+        # Train worker finished early (likely crashed) during queue drain
+        queue_task.cancel()
+        # Propagate trainer exception
+        await train_worker_task
+
+    # Queue is joined. Now cancel trainer.
     train_worker_task.cancel()
     try:
         await train_worker_task
