@@ -242,6 +242,8 @@ You must end with a call to `report_success` to create your final answer to the 
 <Guidelines>
 Use main.rs as a playground to test your solution.
 There is no API documentation for you. You are trained on the dataset containing the usage of the library and needs to recall the usage of the library.
+You must not read documents or source codes of the library.
+Your actions are recorded. If you try to find library source code in the current directory, it will be considered as a failure.
 You have turn limit of {max_turns}.
 If you hit the turn limit without reporting success, it will be considered as a failure.
 Note your solution has to be fully self-contained including both source code and explanation so that we can verify the solution later.
@@ -292,6 +294,7 @@ You should not use release build for faster debugging.
                 if context.qra is not None:
                     result = SolverResult(qa=context.qra, trajectory=trajectory)
                 else:
+                    logger.debug("Solver failed to produce a QA after successful run.")
                     result = SolverResult(trajectory=trajectory)
 
                 self.maybe_add_to_memory(task, result)
@@ -311,12 +314,14 @@ You should not use release build for faster debugging.
                     "BadRequestError",
                     "MaxTurnsExceeded",
                 ]:
+                    logger.debug(f"Solver failed to produce a QA due to {e.cause}")
                     result = SolverResult(
                         trajectory=trajectory, is_max_turns_exceeded=True
                     )
                     self.maybe_add_to_memory(task, result)
                     return result
                 elif e.cause == "ModelBehaviourError":
+                    logger.debug(f"Solver failed to produce a QA due to {e.cause}")
                     result = SolverResult(
                         trajectory=trajectory, is_max_turns_exceeded=False
                     )

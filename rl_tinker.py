@@ -20,7 +20,7 @@ from tinker_cookbook.rl.data_processing import (
 )
 from tinker_cookbook.rl.types import Trajectory, TrajectoryGroup
 from tinker_cookbook.utils import ml_log
-from tinker_cookbook.utils.misc_utils import split_list
+
 from tinker_cookbook.utils.trace import scope
 
 from adapter_agent.hierarchical.agent.solver import Solver
@@ -52,9 +52,9 @@ class RLConfig(BaseModel):
         learning_rate=1e-4, beta1=0.9, beta2=0.95, eps=1e-8
     )
     loss_fn: str = "importance_sampling"
-    num_groups_per_batch: int = 1  # TODO: Increase this
-    num_rollout_workers: int = 1  # TODO: Increase this
-    num_substeps: int = 1
+    num_groups_per_batch: int = 16  # TODO: Increase this
+    num_rollout_workers: int = 12  # TODO: Increase this
+    num_steps: int = 10
     rollouts_per_question: int = 4
     max_turns: int = 15
     image_name: str = "coder-mcp-numrs2:latest"
@@ -93,36 +93,36 @@ async def train_step(
     data_D: list[tinker.Datum],
     training_client: tinker.TrainingClient,
     adam_params: tinker.AdamParams,
-    num_substeps: int,
+    num_steps: int,
     loss_fn: LossFnType,
     loss_fn_config: dict[str, Any] | None = None,
     metrics: dict[str, Any] | None = None,
 ) -> list[torch.Tensor]:
     """Train the model on collected trajectories.
 
+    Uses the whole batch and updates the model num_steps times.
     Pipelines forward_backward and optim_step so they land on the same clock cycle.
     """
-    batches = split_list(data_D, min(num_substeps, len(data_D)))
-    if not batches:
+    if not data_D:
         return []
 
     training_logprobs_D: list[torch.Tensor] = []
     optim_result: tinker.OptimStepResponse | None = None
     fwd_bwd_result: tinker.ForwardBackwardOutput | None = None
 
-    # Enqueue first batch
+    # Enqueue first step
     fwd_bwd_future = await training_client.forward_backward_async(
-        [_remove_mask(d) for d in batches[0]],
+        [_remove_mask(d) for d in data_D],
         loss_fn=loss_fn,
         loss_fn_config=loss_fn_config,
     )
     optim_future = await training_client.optim_step_async(adam_params)
 
-    for i in range(len(batches)):
-        # Enqueue next batch before consuming current results (to stay on same clock cycle)
-        if i + 1 < len(batches):
+    for i in range(num_steps):
+        # Enqueue next step before consuming current results (to stay on same clock cycle)
+        if i + 1 < num_steps:
             next_fwd_bwd_future = await training_client.forward_backward_async(
-                [_remove_mask(d) for d in batches[i + 1]],
+                [_remove_mask(d) for d in data_D],
                 loss_fn=loss_fn,
                 loss_fn_config=loss_fn_config,
             )
@@ -252,6 +252,7 @@ async def main():
         logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     )
     logging.getLogger().addHandler(file_handler)
+    logging.getLogger("adapter_agent.hierarchical.agent.solver").setLevel(logging.DEBUG)
 
     service_client = tinker.ServiceClient()
     path = (
@@ -402,7 +403,7 @@ async def main():
                         data_D=data_D,
                         training_client=training_client,
                         adam_params=cfg.adam_params,
-                        num_substeps=cfg.num_substeps,
+                        num_steps=cfg.num_steps,
                         loss_fn=cfg.loss_fn,
                         metrics=metrics_step,
                     )
