@@ -1,26 +1,25 @@
+from pydantic import Field
+from datetime import datetime
 from adapter_agent.hierarchical.gh import Library
 import asyncio
+import csv
 import logging
+import threading
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
-
+import litellm
 import tinker
-from pydantic import BaseModel, Field
-from datetime import datetime
-
 import torch
 import wandb
 from oai_utils.async_utils import gather_with_semaphore
 from oai_utils.tinker import setup_tinkermodel
 from tinker.types.loss_fn_type import LossFnType
 from tinker_cookbook.rl.data_processing import (
-    assemble_training_data,
-    compute_advantages,
     remove_constant_reward_groups,
 )
 from tinker_cookbook.rl.types import Trajectory, TrajectoryGroup
 from tinker_cookbook.utils import ml_log
-
 from tinker_cookbook.utils.trace import scope
 
 from adapter_agent.hierarchical.agent.solver import Solver
@@ -31,34 +30,14 @@ from adapter_agent.hierarchical.types import Task
 from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
 from adapter_agent.model_helper import get_gemini
 from adapter_agent.qra import QA
+from adapter_agent.rl.advantage import compute_advantages, get_traj_output_token_count
+from adapter_agent.rl.config import RLConfig
+from adapter_agent.rl.trajectory import prepare_minibatch_simplified
 from adapter_agent.util.logger_util import setup_base_loglevel
-import litellm
 
 litellm.add_function_to_prompt
 
 logger = logging.getLogger(__name__)
-
-
-class RLConfig(BaseModel):
-    model_name: str = "Qwen/Qwen3-VL-30B-A3B-Instruct"
-    base_url: str | None = None
-    lora_rank: int = 32
-    log_path: str = "logs/hoge_rl"
-    wandb_project: str | None = "Hoge RL"
-    experiment_name: str = Field(
-        default_factory=lambda: f"Hoge_RL_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    )
-    adam_params: tinker.AdamParams = tinker.AdamParams(
-        learning_rate=1e-4, beta1=0.9, beta2=0.95, eps=1e-8
-    )
-    loss_fn: str = "importance_sampling"
-    num_groups_per_batch: int = 16  # TODO: Increase this
-    num_rollout_workers: int = 12  # TODO: Increase this
-    num_steps: int = 10
-    rollouts_per_question: int = 4
-    max_turns: int = 15
-    image_name: str = "coder-mcp-numrs2:latest"
-    library: Library = Library(name="numrs2", local_path=Path("repositories/numrs"))
 
 
 # Filter out specific openai.agents warning
@@ -72,7 +51,7 @@ class OpenAITracingFilter(logging.Filter):
         return True
 
 
-logging.getLogger("openai.agents").addFilter(OpenAITracingFilter())
+# logging.getLogger("openai.agents").addFilter(OpenAITracingFilter())
 
 
 def _remove_mask(datum: tinker.Datum) -> tinker.Datum:
@@ -80,6 +59,31 @@ def _remove_mask(datum: tinker.Datum) -> tinker.Datum:
         model_input=datum.model_input,
         loss_fn_inputs={k: v for k, v in datum.loss_fn_inputs.items() if k != "mask"},
     )
+
+
+@dataclass
+class ResultRecord:
+    original_question: str
+    original_answer: str
+    generated_question: str
+    generated_answer: str
+    cause: str
+    reward: float
+    has_trajectory: bool
+    sampler_id: int
+
+
+def _save_results_csv(results: list[ResultRecord], path: str) -> None:
+    """Save results to CSV, overwriting the file each time."""
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [f.name for f in fields(ResultRecord)]
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for record in results:
+            row = {fn: getattr(record, fn) for fn in fieldnames}
+            writer.writerow(row)
 
 
 def _training_logprobs_from_fwd_bwd(
@@ -151,21 +155,6 @@ def uniform_reward(rewards: list[float]) -> bool:
     return all(r == rewards[0] for r in rewards)
 
 
-def prepare_minibatch_simplified(trajectory_groups: list[TrajectoryGroup]):
-    trajectory_groups = remove_constant_reward_groups(trajectory_groups)
-    if not trajectory_groups:
-        return []
-
-    advantages_G = compute_advantages(trajectory_groups)
-
-    # Assert any of the advantages are non-zero
-    all_advantages = torch.cat(advantages_G)
-    assert torch.any(all_advantages != 0), "All advantages are zero!"
-
-    data_D, _metadata_D = assemble_training_data(trajectory_groups, advantages_G)
-    return data_D
-
-
 def create_wandb_samples_table(
     data_D: list[tinker.Datum],
     tokenizer: Any,
@@ -229,11 +218,80 @@ def _log_metrics_and_table(
             wandb.log({"train/samples": table}, step=step_counter)
 
 
+def _log_correlation_data(
+    batch_trajectory_groups: list[TrajectoryGroup],
+    cfg: RLConfig,
+) -> None:
+    """Save correlation data before training step."""
+    filtered_groups = remove_constant_reward_groups(batch_trajectory_groups)
+    if not filtered_groups:
+        return
+
+    advantages_P = compute_advantages(filtered_groups, cfg.advantage_regularizer)
+    correlation_csv = Path(cfg.correlation_csv_path)
+    correlation_csv.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = correlation_csv.exists()
+
+    with open(correlation_csv, "a", newline="") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["tokens", "turns", "reward", "advantage"]
+        )
+        if not file_exists:
+            writer.writeheader()
+
+        for tg, adv_G in zip(filtered_groups, advantages_P):
+            for traj, reward, adv, metrics in zip(
+                tg.trajectories_G,
+                tg.get_total_rewards(),
+                adv_G,
+                tg.metrics_G,
+            ):
+                writer.writerow(
+                    {
+                        "tokens": get_traj_output_token_count(traj),
+                        "turns": metrics.get("turns", 0),
+                        "reward": float(reward),
+                        "advantage": float(adv),
+                    }
+                )
+
+
 async def main():
     setup_base_loglevel()
     # Add trace processor for printing behavior
     # add_trace_processor(AgentContentPrinter())
-    cfg = RLConfig()
+
+    cfg = RLConfig(
+        model_name="Qwen/Qwen3-VL-30B-A3B-Instruct",
+        base_url=None,
+        lora_rank=32,
+        log_path="logs/hoge_rl",
+        wandb_project="Hoge RL",
+        experiment_name=Field(
+            default_factory=lambda: (
+                f"Hoge_RL_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            ),
+        ),
+        adam_params=tinker.AdamParams(
+            learning_rate=1e-8,
+            beta1=0.9,
+            beta2=0.95,
+            eps=1e-12,
+        ),
+        loss_fn="dro",
+        advantage_regularizer="output_token",
+        num_groups_per_batch=2,  # TODO: Increase this
+        num_rollout_workers=1,  # TODO: Increase this
+        num_steps=1,
+        rollouts_per_question=4,
+        per_group_concurrency=1,
+        max_turns=10,
+        image_name="coder-mcp-numrs2:latest",
+        library=Library(name="numrs2", local_path=Path("repositories/numrs")),
+        r_min=0.5,
+        csv_output_path="logs/rl_results.csv",
+        correlation_csv_path="logs/rl_correlation.csv",
+    )
     cfg.log_path = f"{cfg.log_path}/{cfg.experiment_name}"
 
     # Setup logging
@@ -297,8 +355,14 @@ async def main():
     queue_questions: asyncio.Queue[QA] = asyncio.Queue()
     queue_trajectories: asyncio.Queue[TrajectoryGroup] = asyncio.Queue()
 
-    for item in qas_data:
-        queue_questions.put_nowait(item)
+    # Temporarily use only the first question for all workers
+    first_qa = qas_data[1]
+    for _ in range(cfg.num_rollout_workers * 12):
+        queue_questions.put_nowait(first_qa)
+
+    # Shared results list for CSV export
+    all_results: list[ResultRecord] = []
+    results_lock = threading.Lock()
 
     async def solve_for_question(question_text: str):
         task = Task.from_instruction(question_text)
@@ -316,7 +380,7 @@ async def main():
                 )
                 for _ in range(cfg.rollouts_per_question)
             ],
-            max_concurrent=cfg.rollouts_per_question,
+            max_concurrent=cfg.per_group_concurrency,
         )
         return results
 
@@ -329,22 +393,47 @@ async def main():
                 break
 
             question_text = qa_item.question
-            # logger.info(f"Worker {worker_id} processing: {question_text[:30]}...")
-
+            sampler_id = id(solver.model.sampling_client)
             results = await solve_for_question(question_text)
 
             trajectories: list[Trajectory] = []
             final_rewards: list[float] = []
+            metrics_G_worker: list[dict[str, Any]] = []
 
             for idx, res in enumerate(results):
+                # Record every result for CSV
+                if res.verification_result and res.verification_result.success:
+                    normalized_turns = res.turns / cfg.max_turns
+                    reward = 1.0 - (1.0 - cfg.r_min) * normalized_turns
+                    reward = max(reward, cfg.r_min)
+                else:
+                    reward = 0.0
+                record = ResultRecord(
+                    original_question=qa_item.question,
+                    original_answer=qa_item.answer,
+                    generated_question=res.qa.question if res.qa else "",
+                    generated_answer=res.qa.answer if res.qa else "",
+                    cause=res.cause or "",
+                    reward=reward,
+                    has_trajectory=res.trajectory is not None,
+                    sampler_id=sampler_id,
+                )
+                with results_lock:
+                    all_results.append(record)
+
                 if res.trajectory is not None:
                     trajectories.append(res.trajectory)
-                    if res.verification_result and res.verification_result.success:
-                        final_rewards.append(1.0)
-                    else:
-                        final_rewards.append(0.0)
+                    final_rewards.append(reward)
+                    metrics_G_worker.append({"turns": res.turns})
                 else:
                     logger.warning(f"Trajectory {idx} is None.")
+
+            # Save CSV after each question
+            with results_lock:
+                _save_results_csv(all_results, cfg.csv_output_path)
+            logger.info(
+                f"Worker {worker_id} saved CSV ({len(all_results)} records) to {cfg.csv_output_path}"
+            )
 
             if not trajectories:
                 logger.info(
@@ -361,11 +450,10 @@ async def main():
                 queue_questions.task_done()
                 continue
 
-            metrics_G = [{} for _ in range(len(trajectories))]
             tg = TrajectoryGroup(
                 trajectories_G=trajectories,
                 final_rewards_G=final_rewards,
-                metrics_G=metrics_G,
+                metrics_G=metrics_G_worker,
             )
             await queue_trajectories.put(tg)
             queue_questions.task_done()
@@ -395,7 +483,13 @@ async def main():
                     f"[Train Worker {worker_id}] Training Batch {step_counter} with {len(batch_trajectory_groups)} groups..."
                 )
 
-                data_D = prepare_minibatch_simplified(batch_trajectory_groups)
+                data_D = prepare_minibatch_simplified(
+                    batch_trajectory_groups, cfg.advantage_regularizer
+                )
+
+                # Save correlation data before training step
+                _log_correlation_data(batch_trajectory_groups, cfg)
+
                 metrics_step = {}
 
                 if len(data_D) > 0:

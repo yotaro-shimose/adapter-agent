@@ -19,6 +19,8 @@ class SolveVerifyResult:
     trajectory: Trajectory | None
     reasoning: str | None = None
     is_max_turns_exceeded: bool = False
+    cause: str | None = None
+    turns: int = 0
 
 
 async def solve_verify(
@@ -69,14 +71,19 @@ async def solve_verify(
         qa = solver_result.qa
         trajectory = solver_result.trajectory if collect_trajectory else None
         is_max_turns_exceeded = solver_result.is_max_turns_exceeded
+        cause = solver_result.cause
         verification_result = None
         reasoning = None
+
+        # Count turns from trajectory transitions
+        turns = len(trajectory.transitions) if trajectory else 0
 
         if qa:
             logger.info("Solver produced a QA. Verifying...")
             verification_result = await verifier.verify(qa, rust_env, tree_structure)
             if not verification_result.success:
                 reasoning = verification_result.reasoning
+                cause = "verification_failed"
         else:
             logger.info("Solver failed to produce a QA.")
 
@@ -86,4 +93,6 @@ async def solve_verify(
             trajectory=trajectory,
             reasoning=reasoning,
             is_max_turns_exceeded=is_max_turns_exceeded,
+            cause=cause,
+            turns=turns,
         )

@@ -61,6 +61,7 @@ class SolverResult(BaseModel):
     qa: QA | None = None
     trajectory: Trajectory | None
     is_max_turns_exceeded: bool = False
+    cause: str | None = None
 
 
 SOLVER_CODER_TOOLS: list[CoderToolName] = [
@@ -181,22 +182,36 @@ You should not use release build for faster debugging.
                 if context.qra is not None:
                     result = SolverResult(qa=context.qra, trajectory=trajectory)
                 else:
-                    result = SolverResult(trajectory=trajectory)
+                    result = SolverResult(trajectory=trajectory, cause="no_qa_produced")
 
                 self.maybe_add_to_memory(task, result)
                 return result
 
             except AgentRunFailure as e:
+                cause_map = {
+                    "ContextWindowExceededError": "context_window_exceeded",
+                    "BadRequestError": "bad_request",
+                    "MaxTurnsExceeded": "max_turns_exceeded",
+                    "ModelBehaviourError": "model_behaviour_error",
+                }
                 if e.cause in [
                     "ContextWindowExceededError",
                     "BadRequestError",
                     "MaxTurnsExceeded",
                 ]:
-                    result = SolverResult(trajectory=None, is_max_turns_exceeded=True)
+                    result = SolverResult(
+                        trajectory=None,
+                        is_max_turns_exceeded=True,
+                        cause=cause_map[e.cause],
+                    )
                     self.maybe_add_to_memory(task, result)
                     return result
                 elif e.cause == "ModelBehaviourError":
-                    result = SolverResult(trajectory=None, is_max_turns_exceeded=False)
+                    result = SolverResult(
+                        trajectory=None,
+                        is_max_turns_exceeded=False,
+                        cause="model_behaviour_error",
+                    )
                     self.maybe_add_to_memory(task, result)
                     return result
                 else:
@@ -218,7 +233,6 @@ You should not use release build for faster debugging.
         タスクを解いてみる。ドキュメント検索等の探索ツールは使用しない。
         エージェントが既に知識を持っている (memorized) かどうかをテストするために使用する。
         """
-
         PROMPT = f"""
 <Role>
 You are an expert Rust software engineer.
@@ -295,7 +309,7 @@ You should not use release build for faster debugging.
                     result = SolverResult(qa=context.qra, trajectory=trajectory)
                 else:
                     logger.debug("Solver failed to produce a QA after successful run.")
-                    result = SolverResult(trajectory=trajectory)
+                    result = SolverResult(trajectory=trajectory, cause="no_qa_produced")
 
                 self.maybe_add_to_memory(task, result)
                 return result
@@ -309,6 +323,12 @@ You should not use release build for faster debugging.
                     trajectory = new_items_to_trajectory(e.original.run_data.new_items)
                 else:
                     trajectory = None
+                cause_map = {
+                    "ContextWindowExceededError": "context_window_exceeded",
+                    "BadRequestError": "bad_request",
+                    "MaxTurnsExceeded": "max_turns_exceeded",
+                    "ModelBehaviourError": "model_behaviour_error",
+                }
                 if e.cause in [
                     "ContextWindowExceededError",
                     "BadRequestError",
@@ -316,14 +336,18 @@ You should not use release build for faster debugging.
                 ]:
                     logger.debug(f"Solver failed to produce a QA due to {e.cause}")
                     result = SolverResult(
-                        trajectory=trajectory, is_max_turns_exceeded=True
+                        trajectory=trajectory,
+                        is_max_turns_exceeded=True,
+                        cause=cause_map[e.cause],
                     )
                     self.maybe_add_to_memory(task, result)
                     return result
                 elif e.cause == "ModelBehaviourError":
                     logger.debug(f"Solver failed to produce a QA due to {e.cause}")
                     result = SolverResult(
-                        trajectory=trajectory, is_max_turns_exceeded=False
+                        trajectory=trajectory,
+                        is_max_turns_exceeded=False,
+                        cause="model_behaviour_error",
                     )
                     self.maybe_add_to_memory(task, result)
                     return result
@@ -334,7 +358,11 @@ You should not use release build for faster debugging.
                     logger.warning(
                         "Somehow Request Entity Too Large. Returning empty trajectory with failure."
                     )
-                    result = SolverResult(trajectory=None, is_max_turns_exceeded=False)
+                    result = SolverResult(
+                        trajectory=None,
+                        is_max_turns_exceeded=False,
+                        cause="request_entity_too_large",
+                    )
                     self.maybe_add_to_memory(task, result)
                     return result
                 logger.error(f"Solver error: {e}")
