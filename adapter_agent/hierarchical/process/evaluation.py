@@ -1,5 +1,4 @@
 import logging
-from pathlib import Path
 
 from oai_utils.async_utils import gather_with_semaphore
 
@@ -17,7 +16,6 @@ async def evaluate_sample(
     qa: QA,
     solver: Solver,
     verifier: Verifier,
-    workspace_template: Path,
 ) -> bool:
     logger.info(f"Evaluating Test Sample {i + 1}: {qa.question}")
 
@@ -27,12 +25,11 @@ async def evaluate_sample(
         solver=solver,
         verifier=verifier,
         task=task,
-        workspace_template=workspace_template,
-        library_name="numrs",
-        max_turns=15,
+        image_name="coder-mcp-numrs2:latest",
+        library_name="numrs2",
+        max_turns=5,
         collect_trajectory=False,
         use_search=False,
-        exclude=["target", ".git"],
     )
 
     if result.qa:
@@ -57,13 +54,11 @@ async def run_evaluation(
     qas: list[QA],
     solver: Solver,
     verifier: Verifier,
-    workspace_template: Path,
 ):
     logger.info(f"Starting Evaluation on {name} Set ({len(qas)} samples)...")
 
     evaluation_tasks = [
-        evaluate_sample(i, qa, solver, verifier, workspace_template)
-        for i, qa in enumerate(qas)
+        evaluate_sample(i, qa, solver, verifier) for i, qa in enumerate(qas)
     ]
 
     results = await gather_with_semaphore(evaluation_tasks, max_concurrent=16)

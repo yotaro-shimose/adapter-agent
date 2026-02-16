@@ -92,16 +92,16 @@ class RustDocAnalyzer:
         if not path.exists():
             raise FileNotFoundError(f"JSON file not found at {path}")
 
-        logger.info(f"Loading JSON from {path}...")
+        logger.debug(f"Loading JSON from {path}...")
         raw_data = json.loads(path.read_text(encoding="utf-8"))
 
         if "root" in raw_data:
             raw_data["root"] = str(raw_data["root"])
 
-        logger.info("Parsing data into Pydantic models...")
+        logger.debug("Parsing data into Pydantic models...")
         crate_data = CrateData(**raw_data)
 
-        logger.info("Building index maps...")
+        logger.debug("Building index maps...")
         parent_map: Dict[str, str] = {}
         impl_to_type_map: Dict[str, str] = {}
 
@@ -133,7 +133,7 @@ class RustDocAnalyzer:
             logger.warning(f"pubapi file not found at {path}")
             return
 
-        logger.info(f"Loading pubapi from {path}...")
+        logger.debug(f"Loading pubapi from {path}...")
         try:
             with open(path, "r", encoding="utf-8") as f:
                 for line in f:

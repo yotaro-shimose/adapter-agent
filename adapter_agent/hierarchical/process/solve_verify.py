@@ -79,8 +79,19 @@ async def solve_verify(
         turns = len(trajectory.transitions) if trajectory else 0
 
         if qa:
-            logger.info("Solver produced a QA. Verifying...")
-            verification_result = await verifier.verify(qa, rust_env, tree_structure)
+            logger.info("Solver produced a QA. Running code and verifying...")
+
+            # Pre-run execution and fetching content for the Verifier
+            execution_output = await rust_env.run_cargo()
+            main_rs_content = await rust_env.view_file("src/main.rs")
+
+            verification_result = await verifier.verify(
+                qra=qa,
+                tree_structure=tree_structure,
+                execution_output=execution_output,
+                main_rs_content=main_rs_content,
+            )
+
             if not verification_result.success:
                 reasoning = verification_result.reasoning
                 cause = "verification_failed"

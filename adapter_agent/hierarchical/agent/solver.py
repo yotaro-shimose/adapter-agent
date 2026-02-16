@@ -7,7 +7,7 @@ from coder_mcp.runtime.runtime import Runtime
 from coder_mcp.types import CoderToolName
 from oai_utils import RunResultWrapper
 from oai_utils.agent import AgentRunFailure, AgentsSDKModel, AgentWrapper
-from oai_utils.tinker.litellm_model import new_items_to_trajectory
+from oai_utils.tinker.model_with_logprob import raw_responses_to_trajectory
 from pydantic import BaseModel
 from tinker_cookbook.rl.types import Trajectory
 
@@ -176,7 +176,7 @@ You should not use release build for faster debugging.
                     context=context,
                 )
                 if collect_trajectory:
-                    trajectory = new_items_to_trajectory(ret.result.new_items)
+                    trajectory = raw_responses_to_trajectory(ret.result.raw_responses)
                 else:
                     trajectory = None
                 if context.qra is not None:
@@ -302,7 +302,7 @@ You should not use release build for faster debugging.
                     context=context,
                 )
                 if collect_trajectory:
-                    trajectory = new_items_to_trajectory(ret.result.new_items)
+                    trajectory = raw_responses_to_trajectory(ret.result.raw_responses)
                 else:
                     trajectory = None
                 if context.qra is not None:
@@ -318,9 +318,11 @@ You should not use release build for faster debugging.
                 if (
                     isinstance(e.original, AgentsException)
                     and e.original.run_data is not None
-                    and e.original.run_data.new_items
+                    and e.original.run_data.raw_responses
                 ):
-                    trajectory = new_items_to_trajectory(e.original.run_data.new_items)
+                    trajectory = raw_responses_to_trajectory(
+                        e.original.run_data.raw_responses
+                    )
                 else:
                     trajectory = None
                 cause_map = {

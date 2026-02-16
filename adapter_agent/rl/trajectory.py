@@ -9,11 +9,13 @@ from tinker_cookbook.rl.data_processing import (
     _is_prefix,
     remove_constant_reward_groups,
 )
+from tinker_cookbook.rl.metrics import incorporate_kl_penalty
 from tinker_cookbook.rl.types import Trajectory, TrajectoryGroup
 from tinker_cookbook.supervised.common import (
     create_rightshifted_model_input_and_leftshifted_targets,
 )
 from tinker_cookbook.utils.misc_utils import safezip
+from tinker_cookbook.utils.trace import scope
 
 from adapter_agent.rl.advantage import AdvantageRegularizer, compute_advantages
 
@@ -113,9 +115,7 @@ def trajectory_to_data(
     if SequenceAccumulator.full_sequence:
         data.append(make_datum_from_state())
 
-    # TODO: fixthis
-
-    return data[-1:]
+    return data
 
 
 def assemble_training_data(
@@ -142,13 +142,18 @@ def assemble_training_data(
     return data_D, metadata_D
 
 
-def prepare_minibatch_simplified(
+@scope
+async def prepare_minibatch_simplified(
     trajectory_groups: list[TrajectoryGroup],
     regularization: AdvantageRegularizer = "output_token",
-):
+    kl_reference_client: tinker.SamplingClient | None = None,
+    kl_penalty_coef: float = 0.0,
+    kl_discount_factor: float = 0.0,
+) -> tuple[list[tinker.Datum], dict[str, float]]:
+    metrics = {}
     trajectory_groups = remove_constant_reward_groups(trajectory_groups)
     if not trajectory_groups:
-        return []
+        return [], metrics
 
     advantages_G = compute_advantages(trajectory_groups, regularization)
 
@@ -157,4 +162,14 @@ def prepare_minibatch_simplified(
     assert torch.any(all_advantages != 0), "All advantages are zero!"
 
     data_D, _metadata_D = assemble_training_data(trajectory_groups, advantages_G)
-    return data_D
+
+    if kl_penalty_coef > 0 and kl_reference_client is not None:
+        kl_penalty_metrics = await incorporate_kl_penalty(
+            data_D,
+            kl_reference_client,
+            kl_penalty_coef,
+            kl_discount_factor,
+        )
+        metrics.update(kl_penalty_metrics)
+
+    return data_D, metrics

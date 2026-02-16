@@ -1,3 +1,4 @@
+import os
 import logging
 
 
@@ -47,8 +48,10 @@ def setup_base_loglevel():
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("pylatexenc").setLevel(logging.WARNING)
     logging.getLogger("LiteLLM").setLevel(logging.WARNING)
-    logging.getLogger("litellm").setLevel(logging.WARNING)
+    # logging.getLogger("litellm").setLevel(logging.WARNING)
     logging.getLogger("mcp.client.streamable_http").setLevel(logging.ERROR)
+    logging.getLogger("weave").setLevel(logging.ERROR)
+    os.environ["WEAVE_LOG_LEVEL"] = "ERROR"
 
     # Apply truncating filter to openai.agents
     agent_logger = logging.getLogger("openai.agents")

@@ -50,7 +50,8 @@ class DataConfig(BaseModel):
 
 
 class SFTConfig(BaseModel):
-    model_name: str = "Qwen/Qwen3-VL-30B-A3B-Instruct"
+    model_name: str = "Qwen/Qwen3-4B-Instruct-2507"
+    # model_name: str = "Qwen/Qwen3-VL-30B-A3B-Instruct"
     # model_name: str = "Qwen/Qwen3-235B-A22B-Instruct-2507"
     optimizer_config: OptimizerConfig = Field(default_factory=OptimizerConfig)
     base_url: str | None = None
@@ -243,7 +244,7 @@ async def main():
         model=verifier_model, rust_doc_analyzer=rust_doc_analyzer, memory=None
     )
     # await run_evaluation("Train", train_qas, solver, verifier, cfg.workspace_template)
-    await run_evaluation("Test", test_qas, solver, verifier, cfg.workspace_template)
+    await run_evaluation("Test", test_qas, solver, verifier)
 
 
 if __name__ == "__main__":
