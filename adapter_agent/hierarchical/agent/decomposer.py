@@ -2,7 +2,6 @@ import logging
 from dataclasses import dataclass
 
 from oai_utils.agent import AgentRunFailure, AgentsSDKModel, AgentWrapper
-from pydantic import BaseModel
 
 from adapter_agent.hierarchical.agent.base import BaseAgent
 from adapter_agent.hierarchical.state import TaskList
@@ -11,12 +10,8 @@ from adapter_agent.hierarchical.types import Task, TaskInstructionList
 logger = logging.getLogger(__name__)
 
 
-class DecomposerInput(BaseModel):
-    original_instruction: str
-
-
 @dataclass
-class Decomposer[T: AgentsSDKModel](BaseAgent[T, DecomposerInput, TaskList]):
+class Decomposer[T: AgentsSDKModel](BaseAgent[T]):
     async def decompose(
         self, original_instruction: str, library_name: str
     ) -> list[Task]:
@@ -94,10 +89,6 @@ Example Output:
 
             task_list = TaskList(tasks=new_tasks)
 
-            self.maybe_add_to_memory(
-                DecomposerInput(original_instruction=original_instruction),
-                task_list,
-            )
             return task_list.tasks
         except AgentRunFailure as e:
             logger.error(f"Decomposer failed: {e}, skipping.")

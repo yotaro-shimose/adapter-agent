@@ -54,12 +54,12 @@ def report_failure(
 
 
 @dataclass(kw_only=True)
-class Verifier[T: AgentsSDKModel](BaseAgent[T, QA, VerificationResult]):
+class Verifier[T: AgentsSDKModel](BaseAgent[T]):
     rust_doc_analyzer: RustDocAnalyzer
 
     async def verify(
         self,
-        qra: QA,
+        qa: QA,
         tree_structure: str,
         execution_output: str,
         main_rs_content: str,
@@ -89,7 +89,7 @@ You must:
 <Guidelines>
 - If the execution output indicates a compilation error or runtime panic, report failure.
 - If the output is logically incorrect for the question, report failure.
-- If providing the solution in `main.rs` but the answer text says otherwise, verify based on the code's effectiveness.
+- If the provided answer is not self-contained verifiable answer, report failure, even when the execution output and main.rs are correct.
 </Guidelines>
 """
         agent = AgentWrapper.create(
@@ -115,11 +115,11 @@ You must:
 
         input_prompt = f"""\
 <Task>
-{qra.question}
+{qa.question}
 </Task>
 
 <Answer to Verify>
-{qra.answer}
+{qa.answer}
 </Answer to Verify>
 
 <Current Directory Structure>
@@ -148,7 +148,6 @@ You must:
                 )
 
             final_output = context.result
-            self.maybe_add_to_memory(qra, final_output)
             return final_output
         except AgentRunFailure as e:
             if e.cause == "MaxTurnsExceeded":

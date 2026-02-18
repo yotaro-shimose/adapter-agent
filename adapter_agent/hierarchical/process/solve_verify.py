@@ -82,11 +82,21 @@ async def solve_verify(
             logger.info("Solver produced a QA. Running code and verifying...")
 
             # Pre-run execution and fetching content for the Verifier
-            execution_output = await rust_env.run_cargo()
+            execution_output, success = await rust_env.run_cargo()
+            if not success:
+                return SolveVerifyResult(
+                    qa=None,
+                    verification_result=None,
+                    trajectory=trajectory,
+                    reasoning=None,
+                    is_max_turns_exceeded=is_max_turns_exceeded,
+                    cause="code_compilation_failed",
+                    turns=turns,
+                )
             main_rs_content = await rust_env.view_file("src/main.rs")
 
             verification_result = await verifier.verify(
-                qra=qa,
+                qa=qa,
                 tree_structure=tree_structure,
                 execution_output=execution_output,
                 main_rs_content=main_rs_content,

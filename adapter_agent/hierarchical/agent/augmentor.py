@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from oai_utils.agent import AgentRunFailure, AgentsSDKModel, AgentWrapper
 
 from adapter_agent.hierarchical.agent.base import BaseAgent
-from adapter_agent.hierarchical.state import TaskList
 from adapter_agent.hierarchical.types import Task, TaskInstructionList
 from adapter_agent.qra import QA
 
@@ -12,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(kw_only=True)
-class Augmentor[T: AgentsSDKModel](BaseAgent[T, QA, TaskList]):
+class Augmentor[T: AgentsSDKModel](BaseAgent[T]):
     async def augment(self, qa: QA, num_augmentations: int = 3) -> list[Task]:
         """
         １つのQAからこれと同じトピックを違う観点で学習するための複数のTask(Instruction)を生成する.
@@ -74,9 +73,6 @@ IMPORTANT: Your output must be PURE JSON. Do NOT include any markdown formatting
             for instr in generated_list.tasks:
                 new_tasks.append(Task.from_instruction(instr.instruction))
 
-            task_list = TaskList(tasks=new_tasks)
-
-            self.maybe_add_to_memory(qa, task_list)
             return new_tasks
         except AgentRunFailure as e:
             logger.error(f"Augmentor failed: {e}, skipping.")

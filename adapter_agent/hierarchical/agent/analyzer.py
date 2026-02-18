@@ -19,7 +19,7 @@ class TaskResponse(BaseModel):
 
 
 @dataclass(kw_only=True)
-class Analyzer[T: AgentsSDKModel](BaseAgent[T, Trajectory, Task]):
+class Analyzer[T: AgentsSDKModel](BaseAgent[T]):
     async def analyze_trajectory(
         self, trajectory: Trajectory, runtime: Runtime
     ) -> Task:
@@ -61,5 +61,4 @@ Return a new Task with a clear instruction.
                 "Analyze the trajectory and generate a sub-task.", max_turns=30
             )
             task = result.final_output().to_task()
-            self.maybe_add_to_memory(trajectory, task)
             return task

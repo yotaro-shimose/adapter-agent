@@ -1,18 +1,20 @@
+from adapter_agent.util.logger_util import setup_base_loglevel
+from adapter_agent.hierarchical.agent.simplified_solver import SimplifiedSolver
+from oai_utils import gather_with_semaphore
+from datetime import datetime
+from pydantic import Field
+from pydantic import BaseModel
 import asyncio
 import logging
 from pathlib import Path
 
-from agents import add_trace_processor
 from dotenv import load_dotenv
-from oai_utils.async_utils import gather_with_semaphore
-from oai_utils.tracing import AgentContentPrinter
 
 from adapter_agent.hierarchical.agent.augmentor import Augmentor
-from adapter_agent.hierarchical.agent.solver import Solver
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.process.solve_verify import solve_verify
 from adapter_agent.hierarchical.state import SFTDataset
-from adapter_agent.hierarchical.types import Memory, Task
+from adapter_agent.hierarchical.types import Task
 from adapter_agent.model_helper import get_gemini
 from adapter_agent.qra import QA
 from h_tinker import setup_rust_doc_analyzer
@@ -20,97 +22,142 @@ from h_tinker import setup_rust_doc_analyzer
 logger = logging.getLogger(__name__)
 
 
-async def main():
-    model = get_gemini()
-    rust_doc_analyzer = setup_rust_doc_analyzer(Path("repositories/numrs"))
+async def augment(
+    qa: QA | None,
+    solver: SimplifiedSolver,
+    verifier: Verifier,
+    augmentor: Augmentor,
+    num_questions: int,
+) -> list[QA]:
+    if qa is None:
+        return []
+    verified_qas: list[QA] = [qa]
+    while len(verified_qas) < num_questions:
+        augmented_tasks = await augmentor.augment(qa)
+        results = await gather_with_semaphore(
+            [
+                solve_verify(
+                    solver, verifier, task, "coder-mcp-numrs2:latest", "numrs2"
+                )
+                for task in augmented_tasks
+            ],
+            max_concurrent=10,
+        )
+        successful_qas = [
+            result.qa
+            for result in results
+            if result.qa
+            and result.verification_result
+            and result.verification_result.success
+        ]
+        if len(successful_qas) == 0:
+            logger.warning("No successful QAs generated in this iteration. Stop.")
+            return verified_qas
+        verified_qas.extend(successful_qas)
+        logger.info(
+            f"Augmented {len(successful_qas)} new QAs. Total: {len(verified_qas)}"
+        )
+    return verified_qas
 
-    solver = Solver(model=model, memory=Memory(), rust_doc_analyzer=rust_doc_analyzer)
-    verifier = Verifier(
-        model=model, memory=Memory(), rust_doc_analyzer=rust_doc_analyzer
-    )
-    NUM_GENERATED_QUESTIONS = 64
-    augmentor = Augmentor(model=model, memory=None)
 
-    task = Task.from_instruction(
-        instruction="Please tell me how I can get the sum of a tensor on a specific dimension in numrs.",
-    )
-
-    verified_qas: list[QA] = []
-    # Queue of tasks to process. Start with the initial task.
-    tasks_to_process = [task]
-
-    async def process_task(task: Task) -> list[Task]:
-        logger.info(f"Processing Task: {task.instruction}")
-        new_tasks = []
+async def gen_qa(
+    task: Task, solver: SimplifiedSolver, verifier: Verifier, max_retry: int = 3
+) -> QA | None:
+    for _ in range(max_retry):
         result = await solve_verify(
             solver=solver,
             verifier=verifier,
             task=task,
-            workspace_template=Path("templates/rust_template"),
-            library_name="numrs",
+            image_name="coder-mcp-numrs2:latest",
+            library_name="numrs2",
             collect_trajectory=False,
             use_search=True,
         )
+        if (
+            result.qa
+            and result.verification_result
+            and result.verification_result.success
+        ):
+            return result.qa
+    logger.warning(f"Failed to generate QA for task: {task.instruction}")
+    return None
 
-        logger.info(f"Solver Result: {result.qa}")
 
-        if result.qa:
-            if result.verification_result:
-                logger.info(f"Verification Result: {result.verification_result}")
-                if result.verification_result.success:
-                    logger.info("Verification SUCCESS. Adding to dataset.")
-                    verified_qas.append(result.qa)
-
-                    if len(verified_qas) < NUM_GENERATED_QUESTIONS:
-                        logger.info("Augmenting verified QA...")
-                        augmented_tasks = await augmentor.augment(result.qa)
-                        logger.info(f"Generated {len(augmented_tasks)} new tasks.")
-                        new_tasks.extend(augmented_tasks)
-                else:
-                    logger.info(f"Verification FAILED: {result.reasoning}")
-            else:
-                # Should not happen if qa is present, unless helper logic changes
-                logger.info("Solver produced QA but verification result is missing.")
-        else:
-            logger.info("Solver failed to produce a QA.")
-        return new_tasks
-
-    while len(verified_qas) < NUM_GENERATED_QUESTIONS and tasks_to_process:
-        # Take a batch of tasks to process in parallel
-        # We can process all currently available tasks, but maybe limit concurrency
-        current_batch = tasks_to_process
-        tasks_to_process = []
-
-        logger.info(f"Starting batch of {len(current_batch)} tasks...")
-
-        # Run tasks in parallel with semaphore
-        results = await gather_with_semaphore(
-            [process_task(t) for t in current_batch],
-            max_concurrent=20,
+class GenSFTConfig(BaseModel):
+    experiment_dir: Path = Field(
+        default_factory=lambda: Path(
+            f"data/sft/gen_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         )
+    )
+    questions_per_task: int = 4
+    max_retry: int = 3
+    tasks: list[Task]
 
-        # Collect new tasks from results
-        for task_list in results:
-            tasks_to_process.extend(task_list)
 
-        # Shuffle or prioritize? For now, just extend.
-        # If verified_qas reached 16 during execution, we stop at the start of next loop.
+async def main():
+    setup_base_loglevel()
+    logging.getLogger("adapter_agent.hierarchical.agent.simplified_solver").setLevel(
+        logging.DEBUG
+    )
+    config = GenSFTConfig(
+        tasks=[
+            Task.from_instruction(
+                "How do I create a multi-dimensional array or tensor (equivalent to `numpy.ndarray` or `torch.Tensor`) in this library?"
+            ),
+            Task.from_instruction(
+                "What is the API for initializing a tensor with specific values: `zeros`, `ones`, `constant`, and `identity`?"
+            ),
+            Task.from_instruction(
+                "How do I perform random initialization (specifically `uniform`, `normal`, and `truncated_normal`)? Please provide the syntax for setting a manual seed."
+            ),
+            Task.from_instruction(
+                "What is the exact API for Matrix Multiplication (GEMM)? Does it use an operator (like `@`) or a function (like `matmul` or `dot`)?"
+            ),
+            Task.from_instruction(
+                "How does the library handle **broadcasting**? If I add a 1D bias vector to a 2D result matrix, what are the syntax requirements to ensure it 'stretches' correctly?"
+            ),
+            Task.from_instruction(
+                "What are the APIs for matrix manipulation: `transpose`, `reshape`, `flatten`, `squeeze`, and `unsqueeze` (adding dimensions)?"
+            ),
+            Task.from_instruction(
+                "How do I perform basic element-wise arithmetic (addition, subtraction, multiplication) between tensors of different shapes?"
+            ),
+        ]
+    )
+    model = get_gemini()
+    rust_doc_analyzer = setup_rust_doc_analyzer(Path("repositories/numrs"))
 
-    logger.info(f"Collected {len(verified_qas)} verified QAs.")
+    solver = SimplifiedSolver(model=model, rust_doc_analyzer=rust_doc_analyzer)
+    verifier = Verifier(model=model, rust_doc_analyzer=rust_doc_analyzer)
+    augmentor = Augmentor(model=model)
 
-    # Save to SFTDataset
-    dataset_path = Path("generated_qas.json")
-    dataset = SFTDataset(items=verified_qas)
-    dataset.save(dataset_path)
-    logger.info(f"Saved dataset to {dataset_path.absolute()}")
-
-    for i, qa in enumerate(verified_qas):
-        logger.info(f"QA {i + 1}: {qa.question}")
+    qas = await gather_with_semaphore(
+        [gen_qa(task, solver, verifier, max_retry=3) for task in config.tasks],
+        max_concurrent=10,
+    )
+    verified_qas = await gather_with_semaphore(
+        [
+            augment(
+                qa=qa,
+                solver=solver,
+                verifier=verifier,
+                augmentor=augmentor,
+                num_questions=config.questions_per_task,
+            )
+            for qa in qas
+        ],
+        max_concurrent=4,
+    )
+    config.experiment_dir.mkdir(parents=True, exist_ok=True)
+    for seed, qa_list in zip(config.tasks, verified_qas):
+        dataset = SFTDataset(items=qa_list)
+        dataset.save(config.experiment_dir / f"seed_{seed.instruction[:10]}.json")
+    logger.info(f"Saved dataset to {config.experiment_dir.absolute()}")
 
 
 if __name__ == "__main__":
     load_dotenv()
-    add_trace_processor(AgentContentPrinter())
+    # add_trace_processor(AgentContentPrinter())
 
     logging.basicConfig(level=logging.INFO)
     asyncio.run(main())

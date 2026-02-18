@@ -1,6 +1,4 @@
-import tinker_cookbook.checkpoint_utils
-import weave
-from tinker import TrainingClient
+import weave  # noqa: F401
 import asyncio
 import csv
 import logging
@@ -12,14 +10,15 @@ from typing import Any
 
 import litellm
 import tinker
+import tinker_cookbook.checkpoint_utils
 import torch
 from oai_utils.async_utils import gather_with_semaphore
 from oai_utils.tinker import LogprobLitellmModel, setup_tinkermodel
-from tinker import SamplingClient
+from tinker import SamplingClient, TrainingClient
 from tinker.types.loss_fn_type import LossFnType
-
 from tinker_cookbook.rl.types import Trajectory, TrajectoryGroup
 from tinker_cookbook.utils import ml_log
+from tinker_cookbook.utils.ml_log import Logger as MLLogger
 from tinker_cookbook.utils.trace import scope
 
 from adapter_agent.hierarchical.agent.simplified_solver import SimplifiedSolver
@@ -41,7 +40,6 @@ from adapter_agent.rl.config import (
 )
 from adapter_agent.rl.trajectory import prepare_minibatch_simplified
 from adapter_agent.util.logger_util import setup_base_loglevel
-from tinker_cookbook.utils.ml_log import Logger as MLLogger
 
 litellm.add_function_to_prompt
 
@@ -119,7 +117,6 @@ class RLState:
         return SimplifiedSolver[LogprobLitellmModel](
             model=self.get_latest_model(),
             rust_doc_analyzer=self.rust_doc_analyzer,
-            memory=None,
         )
 
 
@@ -487,9 +484,7 @@ async def main():
     # Verifier
     logger.info("Initializing Verifier...")
     verifier_model = get_gemini()
-    verifier = Verifier(
-        model=verifier_model, rust_doc_analyzer=rust_doc_analyzer, memory=None
-    )
+    verifier = Verifier(model=verifier_model, rust_doc_analyzer=rust_doc_analyzer)
     if cfg.optimizer_params.kl_penalty_coef > 0:
         logger.info("Initializing KL reference client...")
         # Create a sampling client for the reference model

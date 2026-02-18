@@ -236,13 +236,11 @@ async def main():
     # Agents for evaluation
     sampling_client = await training_client.save_weights_and_get_sampling_client_async()
     model.update_sampling_client(sampling_client)
-    solver = Solver(model=model, rust_doc_analyzer=rust_doc_analyzer, memory=None)
+    solver = Solver(model=model, rust_doc_analyzer=rust_doc_analyzer)
 
     # Use Gemini for verifier
     verifier_model = get_gemini()
-    verifier = Verifier(
-        model=verifier_model, rust_doc_analyzer=rust_doc_analyzer, memory=None
-    )
+    verifier = Verifier(model=verifier_model, rust_doc_analyzer=rust_doc_analyzer)
     # await run_evaluation("Train", train_qas, solver, verifier, cfg.workspace_template)
     await run_evaluation("Test", test_qas, solver, verifier)
 
