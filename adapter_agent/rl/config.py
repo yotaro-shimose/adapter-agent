@@ -31,6 +31,7 @@ class EnvParams(BaseModel):
     r_min: float = 0.5
     library: Library
     image_name: str
+    dataset_path: Path
 
 
 class ExperimentSettings(BaseModel):
@@ -47,7 +48,7 @@ class ExperimentSettings(BaseModel):
 
 
 class ModelLoadingSettings(BaseModel):
-    model_name: str = "Qwen/Qwen3-VL-30B-A3B-Instruct"
+    model_name: str
     resume_trainer_path: str | None = None
     resume_sampler_path: str | None = None
     lora_rank: int = 32
@@ -72,5 +73,6 @@ class RLConfig(BaseModel):
         r_min=0.5,
         library=Library(name="numrs2", local_path=Path("repositories/numrs")),
         image_name="coder-mcp-numrs2:latest",
+        dataset_path="generated_qas.json",
     )
     model_loading_settings: ModelLoadingSettings

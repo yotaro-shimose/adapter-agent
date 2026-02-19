@@ -401,53 +401,7 @@ async def train_worker(
     logger.info(f"[Train Worker {worker_id}] finished.")
 
 
-async def main():
-
-    cfg = RLConfig(
-        experiment_setting=ExperimentSettings(
-            wandb_project="Adapter Agent",
-            experiment_name=f"Adapter Agent_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-        ),
-        optimizer_params=OptimizerParams(
-            adam_params=tinker.AdamParams(
-                learning_rate=3e-5,
-                beta1=0.9,
-                beta2=0.95,
-                eps=1e-12,
-            ),
-            loss_fn="ppo",
-            advantage_regularizer="output_token",
-            num_steps=1,
-            # kl_penalty_coef=1e-8,
-        ),
-        rollout_params=RolloutParams(
-            num_groups_per_batch=8,
-            num_rollout_workers=8,
-            rollouts_per_question=8,
-            per_group_concurrency=8,
-            temperature=0.7,
-        ),
-        env_params=EnvParams(
-            max_turns=5,
-            r_min=0.5,
-            library=Library(name="numrs2", local_path=Path("repositories/numrs")),
-            image_name="coder-mcp-numrs2:latest",
-        ),
-        model_loading_settings=ModelLoadingSettings(
-            model_name="Qwen/Qwen3-4B-Instruct-2507",
-            # model_name="Qwen/Qwen3-VL-30B-A3B-Instruct",
-            lora_rank=32,
-            resume_sampler_path="tinker://1bc694fc-033d-5b20-877e-519888a70c1d:train:0/sampler_weights/000030",
-            resume_trainer_path="tinker://1bc694fc-033d-5b20-877e-519888a70c1d:train:0/weights/000030",
-            # resume_sampler_path=(
-            #     "tinker://15349118-db43-54bd-88b5-6f187dc6ba28:train:0/sampler_weights/000030"
-            # ),
-            # resume_trainer_path=(
-            #     "tinker://15349118-db43-54bd-88b5-6f187dc6ba28:train:0/weights/000030"
-            # ),
-        ),
-    )
-
+def setup_logging(cfg: RLConfig) -> MLLogger:
     # Setup logging
     log_root = cfg.experiment_setting.log_root()
     log_root.mkdir(parents=True, exist_ok=True)
@@ -463,6 +417,63 @@ async def main():
     logging.getLogger("adapter_agent.hierarchical.agent.simplified_solver").setLevel(
         logging.DEBUG
     )
+    return ml_logger
+
+
+def load_qas(cfg: RLConfig) -> list[QA]:
+    # Load questions
+    logger.info("Loading questions from generated_qas.json...")
+    qas_data_raw = SFTDataset.model_validate_json(
+        cfg.env_params.dataset_path.read_text()
+    )
+    # Parse into QA objects
+    qas_data = qas_data_raw.shuffled()
+    logger.info(f"Loaded {len(qas_data)} questions.")
+
+    return qas_data
+
+
+async def main():
+    cfg = RLConfig(
+        experiment_setting=ExperimentSettings(
+            wandb_project="Adapter Agent",
+            experiment_name=f"Adapter Agent_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        ),
+        optimizer_params=OptimizerParams(
+            adam_params=tinker.AdamParams(
+                learning_rate=3e-5,
+                beta1=0.9,
+                beta2=0.95,
+                eps=1e-12,
+            ),
+            loss_fn="ppo",
+            advantage_regularizer="output_token",
+            num_steps=1,
+            kl_penalty_coef=0.0,
+        ),
+        rollout_params=RolloutParams(
+            num_groups_per_batch=8,
+            num_rollout_workers=1,
+            rollouts_per_question=8,
+            per_group_concurrency=1,
+            temperature=0.7,
+        ),
+        env_params=EnvParams(
+            max_turns=5,
+            r_min=0.5,
+            library=Library(name="numrs2", local_path=Path("repositories/numrs")),
+            image_name="coder-mcp-numrs2:latest",
+            dataset_path=Path("data/sft/gen_20260218_182450/sft_dataset.json"),
+        ),
+        model_loading_settings=ModelLoadingSettings(
+            model_name="Qwen/Qwen3-8B",
+            lora_rank=32,
+            # resume_trainer_path="tinker://708870c0-3f33-5060-9c27-239d31f83b6c:train:0/weights/000030",
+            # resume_sampler_path="tinker://708870c0-3f33-5060-9c27-239d31f83b6c:train:0/sampler_weights/000030",
+        ),
+    )
+
+    ml_logger = setup_logging(cfg)
 
     # Setup agents
     service_client = tinker.ServiceClient()
@@ -497,15 +508,8 @@ async def main():
         )
     else:
         kl_reference_client = None
-    # Load questions
-    logger.info("Loading questions from generated_qas.json...")
-    qas_path = Path("generated_qas.json")
-    qas_data_raw = SFTDataset.model_validate_json(qas_path.read_text())
 
-    # Parse into QA objects
-    qas_data = qas_data_raw.items
-
-    logger.info(f"Loaded {len(qas_data)} questions.")
+    qas_data = load_qas(cfg)
 
     # Initialize Training Client
     logger.info("Initializing Training Client...")
@@ -529,7 +533,7 @@ async def main():
         sampling_client_manager=sampling_client_manager,
         all_results=[],
         results_lock=threading.Lock(),
-        csv_output_path=log_root / "rl_results.csv",
+        csv_output_path=cfg.experiment_setting.log_root() / "rl_results.csv",
         rust_doc_analyzer=rust_doc_analyzer,
         litellm_model_name=model.model,
         training_client=training_client,

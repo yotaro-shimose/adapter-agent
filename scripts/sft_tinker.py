@@ -1,3 +1,4 @@
+from adapter_agent.hierarchical.agent.simplified_solver import SimplifiedSolver
 from oai_utils.tinker import setup_tinkermodel
 from adapter_agent.hierarchical.process.evaluation import run_evaluation
 import asyncio
@@ -64,7 +65,7 @@ class SFTConfig(BaseModel):
         default_factory=lambda: f"SFT_Tinker_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     )
     data_config: DataConfig = Field(default_factory=DataConfig)
-    num_train_steps: int = 30
+    num_train_steps: int = 25
     ttl_seconds: int = 604800  # 7 days
 
 
@@ -203,7 +204,12 @@ def setup_logger(cfg: SFTConfig):
 
 # --- Main Logic ---
 async def main():
-    cfg = SFTConfig(num_train_steps=30)
+    cfg = SFTConfig(
+        num_train_steps=30,
+        data_config=DataConfig(
+            data_path=Path("data/sft/gen_20260218_182450/sft_dataset.json")
+        ),
+    )
     # Update log_path to include experiment_name
     cfg.log_path = f"{cfg.log_path}/{cfg.experiment_name}"
     setup_logger(cfg)
@@ -236,7 +242,7 @@ async def main():
     # Agents for evaluation
     sampling_client = await training_client.save_weights_and_get_sampling_client_async()
     model.update_sampling_client(sampling_client)
-    solver = Solver(model=model, rust_doc_analyzer=rust_doc_analyzer)
+    solver = SimplifiedSolver(model=model, rust_doc_analyzer=rust_doc_analyzer)
 
     # Use Gemini for verifier
     verifier_model = get_gemini()

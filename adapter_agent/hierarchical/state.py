@@ -1,3 +1,4 @@
+import random
 import asyncio
 import logging
 from dataclasses import dataclass
@@ -93,6 +94,11 @@ class SFTDataset(BaseModel):
     async def register(self, item: QA) -> None:
         logger.info(f"Details: Registering QA: {item.question}")
         self.items.append(item)
+
+    def shuffled(self) -> list[QA]:
+        items = [item.model_copy(deep=True) for item in self.items]
+        random.shuffle(items)
+        return items
 
 
 @dataclass

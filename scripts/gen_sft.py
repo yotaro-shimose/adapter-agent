@@ -79,8 +79,7 @@ async def gen_qa(
             and result.verification_result.success
         ):
             return result.qa
-    logger.warning(f"Failed to generate QA for task: {task.instruction}")
-    return None
+    raise ValueError(f"Failed to generate QA for task: {task.instruction}")
 
 
 class GenSFTConfig(BaseModel):
@@ -89,9 +88,9 @@ class GenSFTConfig(BaseModel):
             f"data/sft/gen_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         )
     )
-    questions_per_task: int = 4
-    max_retry: int = 3
-    tasks: list[Task]
+    questions_per_task: int = 16
+    max_retry: int = 5
+    seeds: list[Task]
 
 
 async def main():
@@ -100,7 +99,7 @@ async def main():
         logging.DEBUG
     )
     config = GenSFTConfig(
-        tasks=[
+        seeds=[
             Task.from_instruction(
                 "How do I create a multi-dimensional array or tensor (equivalent to `numpy.ndarray` or `torch.Tensor`) in this library?"
             ),
@@ -122,8 +121,10 @@ async def main():
             Task.from_instruction(
                 "How do I perform basic element-wise arithmetic (addition, subtraction, multiplication) between tensors of different shapes?"
             ),
-        ]
+        ],
+        checkpoint_dir=Path("data/sft/gen_20260216_233815"),
     )
+
     model = get_gemini()
     rust_doc_analyzer = setup_rust_doc_analyzer(Path("repositories/numrs"))
 
@@ -132,7 +133,10 @@ async def main():
     augmentor = Augmentor(model=model)
 
     qas = await gather_with_semaphore(
-        [gen_qa(task, solver, verifier, max_retry=3) for task in config.tasks],
+        [
+            gen_qa(task, solver, verifier, max_retry=config.max_retry)
+            for task in config.seeds
+        ],
         max_concurrent=10,
     )
     verified_qas = await gather_with_semaphore(
@@ -149,9 +153,8 @@ async def main():
         max_concurrent=4,
     )
     config.experiment_dir.mkdir(parents=True, exist_ok=True)
-    for seed, qa_list in zip(config.tasks, verified_qas):
-        dataset = SFTDataset(items=qa_list)
-        dataset.save(config.experiment_dir / f"seed_{seed.instruction[:10]}.json")
+    sft_dataset = SFTDataset(items=[qa for qa_list in verified_qas for qa in qa_list])
+    sft_dataset.save(config.experiment_dir / "sft_dataset.json")
     logger.info(f"Saved dataset to {config.experiment_dir.absolute()}")
 
 
