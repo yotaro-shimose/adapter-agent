@@ -7,7 +7,7 @@ from coder_mcp.runtime import RustCodingEnvironment
 from pydantic import ValidationError
 from tinker_cookbook.completers import StopCondition
 from tinker_cookbook.renderers import Renderer
-from tinker_cookbook.renderers.base import Message
+from tinker_cookbook.renderers.base import Message, ToolSpec
 from tinker_cookbook.renderers.base import Message as TinkerMessage
 from tinker_cookbook.rl.message_env import EnvFromMessageEnv
 from tinker_cookbook.rl.types import Action, Env, Observation, StepResult
@@ -16,7 +16,7 @@ from tinker_cookbook.tool_use.agent_tool_message_env import (
     AgentToolMessageEnv,
     RewardFn,
 )
-from tinker_cookbook.tool_use.types import Tool
+from tinker_cookbook.tool_use.types import Tool, ToolResult
 
 from adapter_agent.hierarchical.agent.solver import (
     CONTEXT,
@@ -42,30 +42,37 @@ class CoderEnvTool:
     rust_env: RustCodingEnvironment
 
     @tool
-    async def run(self) -> str:
+    async def run(self) -> ToolResult:
         """
         Run `cargo run` in the workspace. Returns the combined stdout/stderr output and exit code.
         """
         output, success = await self.rust_env.run_cargo()
         self.remaining_turns -= 1
-        return self.with_remaining_turns(output)
+        ret_str = self.with_remaining_turns(output)
+        return ToolResult(messages=[TinkerMessage(role="tool", content=ret_str)])
 
     @tool
-    async def str_replace(self, old_str: str, new_str: str) -> str:
+    async def str_replace(self, old_str: str, new_str: str) -> ToolResult:
         """
         Find and replace an exact string in src/main.rs. The file target is always src/main.rs. Returns error if string not found or multiple matches. Shows context snippet after edit.
         """
         output = await self.rust_env.str_replace(old_str, new_str)
         self.remaining_turns -= 1
-        return self.with_remaining_turns(output)
+        return ToolResult(
+            messages=[
+                TinkerMessage(role="tool", content=self.with_remaining_turns(output))
+            ]
+        )
 
     @tool
-    async def report_success(self, question: str, answer: str) -> str:
+    async def report_success(self, question: str, answer: str) -> ToolResult:
         """
         Report success to the verifier.
         """
         self.remaining_turns -= 1
-        return self.with_remaining_turns("")
+        return ToolResult(
+            messages=[TinkerMessage(role="tool", content="")], should_stop=True
+        )
 
     def with_remaining_turns(self, text: str) -> str:
         return f"{text}\n<RemainingTurns>{self.remaining_turns}</RemainingTurns>"
@@ -144,10 +151,12 @@ class RustCoderEnv(Env):
         tools = [tool_set.run, tool_set.str_replace, tool_set.report_success]
         internal = build_agent_tool_env(
             renderer=renderer,
-            tools=tools,  # type: ignore
+            tools=tools,
             initial_messages=_get_initial_messages(
                 env_state=env_state,
                 tree_structure=tree_structure,
+                tools=tools,
+                renderer=renderer,
             ),
             reward_fn=LLMAsAJudge(
                 rust_env=rust_env,
@@ -156,7 +165,7 @@ class RustCoderEnv(Env):
             ),
             max_trajectory_tokens=max_trajectory_tokens,
             max_turns=env_state.remaining_turns,
-            turn_count=env_state.remaining_turns,
+            turn_count=env_state.max_turns - env_state.remaining_turns,
         )
 
         return cls(
@@ -186,25 +195,24 @@ async def build_coder_env(
 def _get_initial_messages(
     env_state: EnvState,
     tree_structure: str,
+    tools: list[ToolSpec],
+    renderer: Renderer,
 ) -> list[TinkerMessage]:
     if env_state.messages is not None:
         return env_state.messages
     system_prompt = f"""
 <Role>
 You are an expert Rust software engineer.
-Your task is to answer user provided question with verified solution.
+Your task is to solve user provided problem.
 </Role>
 
 {CONTEXT.format(library_name=env_state.library_name)}
 
 <HowTo>
-You have a simplified coding environment with the following tools:
+You have a simplified coding environment with only two tools:
 - `str_replace`: Edit src/main.rs by finding and replacing an exact string. The target file is always src/main.rs.
 - `run`: Run `cargo run` to compile and execute the code.
-- `search_docs`: Use this to find functionality keywords, concepts, or how-to guides in the documentation.
-- `search_symbol`: Use this to find specific types, functions, or traits by name.
-
-You can access library documents via search tools.
+You DO NOT have access to library documents or source codes. You are expected to solve the problem based on your knowledge / recall.
 Once you have created a solution, you must run the code and confirm it works (to the best of your ability).
 You must end with a call to `report_success` to create your final answer to the question.
 </HowTo>
@@ -212,7 +220,8 @@ You must end with a call to `report_success` to create your final answer to the 
 {EFFICIENCY_GUIDELINES}
 
 <Guidelines>
-You can edit src/main.rs using str_replace tool. The current content of src/main.rs is provided below.
+You can only edit src/main.rs. The current content of src/main.rs is provided below.
+You must not read documents or source codes of the library.
 You have turn limit of {env_state.max_turns}.
 If you hit the turn limit without reporting success, it will be considered as a failure.
 Note your solution has to be fully self-contained including both source code and explanation so that we can verify the solution later.
@@ -220,7 +229,9 @@ Verification will solely based on your final solution and your source code in th
 You should not use release build for faster debugging.
 </Guidelines>
 """
-
+    system_prompt_with_tools = _inject_tools_into_prompt(
+        renderer, [tool.to_spec() for tool in tools], system_prompt
+    )
     initial_message = f"""
 <Task>
 {env_state.task.instruction}
@@ -235,9 +246,8 @@ You should not use release build for faster debugging.
 </Current src/main.rs>
 
 """
-    return [
-        TinkerMessage(role="user", content=system_prompt),
-        TinkerMessage(role="assistant", content=initial_message),
+    return system_prompt_with_tools + [
+        TinkerMessage(role="user", content=initial_message),
     ]
 
 
@@ -334,3 +344,15 @@ def build_agent_tool_env(
         failed_parse_reward=failed_parse_reward,
         max_trajectory_tokens=max_trajectory_tokens,
     )
+
+
+def _inject_tools_into_prompt(
+    renderer: Renderer, tools: list[ToolSpec], system_prompt: str
+) -> list[TinkerMessage]:
+    if not tools:
+        return system_prompt
+
+    prefix_messages = renderer.create_conversation_prefix_with_tools(
+        tools, system_prompt
+    )
+    return prefix_messages

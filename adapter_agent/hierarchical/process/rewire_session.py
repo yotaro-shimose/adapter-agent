@@ -1,9 +1,6 @@
 from dataclasses import dataclass
-from typing import Any
 
-import tinker
 from oai_utils.tinker import TinkerModel
-from tinker_cookbook.completers import StopCondition, TokenCompleter, TokensWithLogprobs
 from tinker_cookbook.rl.types import (
     Trajectory,
     Transition,
@@ -13,6 +10,7 @@ from tinker_cookbook.utils import logtree
 from adapter_agent.hierarchical.agent.rewirer import Rewirer
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.types import Task
+from adapter_agent.rl.completer import TinkerTokenCompleter
 from adapter_agent.rl.env import EnvState, LLMAsAJudge, build_coder_env
 
 
@@ -63,20 +61,6 @@ async def rewire_session(
     return ret
 
 
-# Max characters for log values in table cells before truncation
-LOG_VALUE_MAX_LEN = 100
-
-
-def _truncate_log_value(
-    value: Any, max_len: int = LOG_VALUE_MAX_LEN
-) -> tuple[str, bool]:
-    """Truncate a log value if it's too long. Returns (display_value, was_truncated)."""
-    str_value = str(value)
-    if len(str_value) > max_len:
-        return str_value[:max_len] + "...", True
-    return str_value, False
-
-
 @logtree.scope_header_decorator
 async def solve_verify_tinker(
     solver_model: TinkerModel,
@@ -118,38 +102,3 @@ async def solve_verify_tinker(
 
 def get_total_reward(trajectory: Trajectory) -> float:
     return sum([t.reward for t in trajectory.transitions])
-
-
-@dataclass
-class TinkerTokenCompleter(TokenCompleter):
-    """
-    The most standard TokenCompleter, which uses a tinker.SamplingClient to sample actions.
-    """
-
-    sampling_client: tinker.SamplingClient
-    max_tokens: int | None
-    temperature: float = 1.0
-
-    async def __call__(
-        self, model_input: tinker.ModelInput, stop: StopCondition
-    ) -> TokensWithLogprobs:
-        """Sample an action from the policy given an observation."""
-        # Sample from the model
-        sample_result = await self.sampling_client.sample_async(
-            prompt=model_input,
-            num_samples=1,
-            sampling_params=tinker.SamplingParams(
-                stop=stop,
-                max_tokens=self.max_tokens,
-                temperature=self.temperature,
-            ),
-        )
-
-        # Extract tokens and logprobs from the first (and only) sample
-        sampled_tokens = sample_result.sequences[0].tokens
-        sampled_logprobs = sample_result.sequences[0].logprobs
-        assert sampled_logprobs is not None
-
-        return TokensWithLogprobs(
-            tokens=sampled_tokens, maybe_logprobs=sampled_logprobs
-        )
