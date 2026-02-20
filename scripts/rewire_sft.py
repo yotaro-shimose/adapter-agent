@@ -143,6 +143,9 @@ def setup_logging(cfg: RLConfig) -> MLLogger:
     logging.getLogger("adapter_agent.hierarchical.agent.simplified_solver").setLevel(
         logging.DEBUG
     )
+    logging.getLogger("adapter_agent.hierarchical.agent.rewirer").setLevel(
+        logging.DEBUG
+    )
     return ml_logger
 
 
@@ -222,9 +225,9 @@ async def main():
             kl_penalty_coef=0.0,
         ),
         rollout_params=RolloutParams(
-            num_groups_per_batch=8,
+            num_groups_per_batch=1,
             num_rollout_workers=1,
-            rollouts_per_question=8,
+            rollouts_per_question=1,
             per_group_concurrency=1,
             temperature=0.7,
         ),
@@ -242,6 +245,11 @@ async def main():
     )
 
     # ml_logger = setup_logging(cfg)
+    logging.basicConfig(level=logging.INFO)
+    setup_base_loglevel()
+    logging.getLogger("adapter_agent.hierarchical.agent.rewirer").setLevel(
+        logging.DEBUG
+    )
 
     # Tinker Clients
     service_client, training_client = await setup_tinker_clients(
