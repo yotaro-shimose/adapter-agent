@@ -1,4 +1,3 @@
-import weave  # noqa: F401
 import asyncio
 import csv
 import logging
@@ -12,10 +11,12 @@ import litellm
 import tinker
 import tinker_cookbook.checkpoint_utils
 import torch
+import weave  # noqa: F401
 from oai_utils.async_utils import gather_with_semaphore
-from oai_utils.tinker import LogprobLitellmModel, setup_tinkermodel
+from oai_utils.tinker import TinkerModel, setup_tinkermodel
 from tinker import SamplingClient, TrainingClient
 from tinker.types.loss_fn_type import LossFnType
+from tinker_cookbook.renderers.base import Renderer
 from tinker_cookbook.rl.types import Trajectory, TrajectoryGroup
 from tinker_cookbook.utils import ml_log
 from tinker_cookbook.utils.ml_log import Logger as MLLogger
@@ -38,6 +39,7 @@ from adapter_agent.rl.config import (
     RLConfig,
     RolloutParams,
 )
+from adapter_agent.rl.shared_sampling_client import SharedSamplingClient
 from adapter_agent.rl.trajectory import prepare_minibatch_simplified
 from adapter_agent.util.logger_util import setup_base_loglevel
 
@@ -58,20 +60,6 @@ class OpenAITracingFilter(logging.Filter):
 
 
 # logging.getLogger("openai.agents").addFilter(OpenAITracingFilter())
-
-
-class SharedSamplingClient:
-    def __init__(self, client: SamplingClient):
-        self._client = client
-        self._lock = asyncio.Lock()
-
-    async def get_client(self) -> SamplingClient:
-        async with self._lock:
-            return self._client
-
-    async def update_client(self, new_client: SamplingClient) -> None:
-        async with self._lock:
-            self._client = new_client
 
 
 def _remove_mask(datum: tinker.Datum) -> tinker.Datum:
@@ -95,6 +83,7 @@ class ResultRecord:
 
 @dataclass
 class RLState:
+    renderer: Renderer
     queue_questions: asyncio.Queue[QA]
     queue_trajectories: asyncio.Queue[TrajectoryGroup]
     sampling_client_manager: SharedSamplingClient
@@ -106,15 +95,16 @@ class RLState:
     training_client: TrainingClient
     step_counter: int = 0
 
-    def get_latest_model(self) -> LogprobLitellmModel:
-        current_model = LogprobLitellmModel(
+    def get_latest_model(self) -> TinkerModel:
+        current_model = TinkerModel(
             model=self.litellm_model_name,
             sampling_client=self.sampling_client_manager._client,
+            renderer=self.renderer,
         )
         return current_model
 
-    def get_latest_solver(self) -> SimplifiedSolver[LogprobLitellmModel]:
-        return SimplifiedSolver[LogprobLitellmModel](
+    def get_latest_solver(self) -> SimplifiedSolver[TinkerModel]:
+        return SimplifiedSolver[TinkerModel](
             model=self.get_latest_model(),
             rust_doc_analyzer=self.rust_doc_analyzer,
         )
@@ -480,7 +470,7 @@ async def main():
     logger.info(
         f"Setting up model {cfg.model_loading_settings.model_name} from {cfg.model_loading_settings.resume_sampler_path}..."
     )
-    model, tokenizer, _renderer = setup_tinkermodel(
+    model, tokenizer, renderer = setup_tinkermodel(
         service_client,
         cfg.model_loading_settings.model_name,
         cfg.model_loading_settings.resume_sampler_path,
@@ -528,6 +518,7 @@ async def main():
 
     # Shared results list for CSV export
     rl_state = RLState(
+        renderer=renderer,
         queue_questions=asyncio.Queue(),
         queue_trajectories=asyncio.Queue(),
         sampling_client_manager=sampling_client_manager,

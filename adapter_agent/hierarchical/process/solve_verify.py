@@ -22,6 +22,13 @@ class SolveVerifyResult:
     cause: str | None = None
     turns: int = 0
 
+    def is_success(self) -> bool:
+        return (
+            self.qa is not None
+            and self.verification_result is not None
+            and self.verification_result.success
+        )
+
 
 async def solve_verify(
     solver: Solver,

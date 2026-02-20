@@ -1,13 +1,18 @@
-from agents import AgentsException
 import logging
 from dataclasses import dataclass
 
-from agents import ModelSettings, RunContextWrapper, StopAtTools, function_tool
+from agents import (
+    AgentsException,
+    ModelSettings,
+    RunContextWrapper,
+    StopAtTools,
+    function_tool,
+)
 from coder_mcp.runtime.runtime import Runtime
 from coder_mcp.types import CoderToolName
 from oai_utils import RunResultWrapper
 from oai_utils.agent import AgentRunFailure, AgentsSDKModel, AgentWrapper
-from oai_utils.tinker.model_with_logprob import raw_responses_to_trajectory
+from oai_utils.tinker.agent_sdk_model import raw_responses_to_trajectory
 from pydantic import BaseModel
 from tinker_cookbook.rl.types import Trajectory
 

@@ -4,16 +4,15 @@ from dataclasses import dataclass
 from agents import (
     AgentsException,
     ModelSettings,
-    StopAtTools,
     RunContextWrapper,
+    StopAtTools,
     function_tool,
 )
-
 from coder_mcp.runtime.runtime import Runtime
 from coder_mcp.runtime.rust_env import RustCodingEnvironment
 from oai_utils import RunResultWrapper
 from oai_utils.agent import AgentRunFailure, AgentsSDKModel, AgentWrapper
-from oai_utils.tinker.model_with_logprob import raw_responses_to_trajectory
+from oai_utils.tinker.agent_sdk_model import raw_responses_to_trajectory
 
 from adapter_agent.hierarchical.agent.solver import (
     CONTEXT,
@@ -23,11 +22,11 @@ from adapter_agent.hierarchical.agent.solver import (
     SolverResult,
     report_success,
 )
+from adapter_agent.hierarchical.types import Task
 from adapter_agent.library.rust_doc_tools import (
     search_docs,
     search_symbol,
 )
-from adapter_agent.hierarchical.types import Task
 
 logger = logging.getLogger(__name__)
 
@@ -247,19 +246,7 @@ You should not use release build for faster debugging.
             logger.error(f"SimplifiedSolver error: {e}")
             raise
 
-    async def try_solve_without_search(
-        self,
-        task: Task,
-        runtime: Runtime,
-        library_name: str,
-        tree_structure: str = "",
-        max_turns: int = 5,
-        collect_trajectory: bool = True,
-    ) -> SolverResult:
-        """
-        Simplified solver. Only edits src/main.rs and runs cargo run.
-        The agent receives the current main.rs content upfront.
-        """
+    def get_agent_without_tool(self, library_name: str, max_turns: int) -> AgentWrapper:
         PROMPT = f"""
 <Role>
 You are an expert Rust software engineer.
@@ -306,6 +293,22 @@ You should not use release build for faster debugging.
             ),
             reset_tool_choice=False,
         )
+        return agent
+
+    async def try_solve_without_search(
+        self,
+        task: Task,
+        runtime: Runtime,
+        library_name: str,
+        tree_structure: str = "",
+        max_turns: int = 5,
+        collect_trajectory: bool = True,
+    ) -> SolverResult:
+        """
+        Simplified solver. Only edits src/main.rs and runs cargo run.
+        The agent receives the current main.rs content upfront.
+        """
+        agent = self.get_agent_without_tool(library_name, max_turns)
 
         context = SimplifiedSolverContext(
             rust_doc_analyzer=self.rust_doc_analyzer,

@@ -1,5 +1,5 @@
-import os
 import logging
+import os
 
 
 class TruncatingLogFilter(logging.Filter):
@@ -44,6 +44,17 @@ class TruncatingLogFilter(logging.Filter):
         return True
 
 
+# Filter out specific openai.agents warning
+class OpenAITracingFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if (
+            record.name == "openai.agents"
+            and "Tracing client error 400" in record.getMessage()
+        ):
+            return False
+        return True
+
+
 def setup_base_loglevel():
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("pylatexenc").setLevel(logging.WARNING)
@@ -58,3 +69,5 @@ def setup_base_loglevel():
     # Avoid adding multiple filters if called multiple times
     if not any(isinstance(f, TruncatingLogFilter) for f in agent_logger.filters):
         agent_logger.addFilter(TruncatingLogFilter())
+    if not any(isinstance(f, OpenAITracingFilter) for f in agent_logger.filters):
+        agent_logger.addFilter(OpenAITracingFilter())
