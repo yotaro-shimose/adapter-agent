@@ -65,7 +65,7 @@ async def _str_replace_tool_impl(
     old_str: str,
     new_str: str,
 ) -> str:
-    output = await wrapper.context.runtime.str_replace(old_str, new_str)
+    output, success = await wrapper.context.runtime.str_replace(old_str, new_str)
     wrapper.context.remaining_turns -= 1
     return f"{output}\n(Remaining turns: {wrapper.context.remaining_turns})"
 

@@ -13,9 +13,15 @@ class OptimizerParams(BaseModel):
     adam_params: tinker.AdamParams
     loss_fn: LossFnType
     advantage_regularizer: AdvantageRegularizer = "output_token"
-    num_steps: int = 1
-    kl_penalty_coef: float = 0.0
-    kl_discount_factor: float = 0.0
+    num_steps: int
+    kl_penalty_coef: float
+    kl_discount_factor: float
+
+
+class SFTOptimizerParams(BaseModel):
+    adam_params: tinker.AdamParams
+    sft_batch_size: int
+    num_epochs: int
 
 
 class RolloutParams(BaseModel):
@@ -61,6 +67,9 @@ class RLConfig(BaseModel):
             learning_rate=1e-4, beta1=0.9, beta2=0.95, eps=1e-8
         ),
         loss_fn="ppo",
+        num_steps=1,
+        kl_penalty_coef=0.0,
+        kl_discount_factor=0.0,
     )
     rollout_params: RolloutParams = RolloutParams(
         num_groups_per_batch=2,
@@ -75,4 +84,12 @@ class RLConfig(BaseModel):
         image_name="coder-mcp-numrs2:latest",
         dataset_path="generated_qas.json",
     )
+    model_loading_settings: ModelLoadingSettings
+
+
+class SFTConfig(BaseModel):
+    experiment_setting: ExperimentSettings
+    optimizer_params: SFTOptimizerParams
+    rollout_params: RolloutParams
+    env_params: EnvParams
     model_loading_settings: ModelLoadingSettings

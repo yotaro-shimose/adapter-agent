@@ -1,31 +1,32 @@
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import AsyncGenerator, Self, cast
+from itertools import chain
+from typing import AsyncGenerator, Self
 
 from coder_mcp.runtime import RustCodingEnvironment
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from tinker_cookbook.completers import StopCondition
 from tinker_cookbook.renderers import Renderer
 from tinker_cookbook.renderers.base import Message, ToolSpec
 from tinker_cookbook.renderers.base import Message as TinkerMessage
-from tinker_cookbook.rl.message_env import EnvFromMessageEnv
 from tinker_cookbook.rl.types import Action, Env, Observation, StepResult
 from tinker_cookbook.tool_use import tool
 from tinker_cookbook.tool_use.agent_tool_message_env import (
     AgentToolMessageEnv,
     RewardFn,
 )
+from tinker_cookbook.tool_use.tools import FunctionTool
 from tinker_cookbook.tool_use.types import Tool, ToolResult
 
 from adapter_agent.hierarchical.agent.solver import (
     CONTEXT,
     EFFICIENCY_GUIDELINES,
-    report_success,
 )
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.qra import QA
+from adapter_agent.rl.env.prefillable_env import PrefillableMessageEnv
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +57,7 @@ class CoderEnvTool:
         """
         Find and replace an exact string in src/main.rs. The file target is always src/main.rs. Returns error if string not found or multiple matches. Shows context snippet after edit.
         """
-        output = await self.rust_env.str_replace(old_str, new_str)
+        output, success = await self.rust_env.str_replace(old_str, new_str)
         self.remaining_turns -= 1
         return ToolResult(
             messages=[
@@ -65,7 +66,36 @@ class CoderEnvTool:
         )
 
     @tool
-    async def report_success(self, question: str, answer: str) -> ToolResult:
+    async def str_replace_and_run(self, old_str: str, new_str: str) -> ToolResult:
+        """
+        Find and replace an exact string in src/main.rs. The file target is always src/main.rs. Returns error if string not found or multiple matches. Shows context snippet after edit.
+        """
+        replace_ret, replace_success = await self.rust_env.str_replace(old_str, new_str)
+        if not replace_success:
+            return ToolResult(
+                messages=[
+                    TinkerMessage(
+                        role="tool", content=self.with_remaining_turns(replace_ret)
+                    )
+                ]
+            )
+
+        run_ret, run_success = await self.rust_env.run_cargo()
+        self.remaining_turns -= 1
+        combined_output = f"""\
+<TextReplacementPerformed>
+{replace_ret}
+</TextReplacementPerformed>
+<CargoRunResult>
+{run_ret}
+</CargoRunResult>
+"""
+
+        ret_str = self.with_remaining_turns(combined_output)
+        return ToolResult(messages=[TinkerMessage(role="tool", content=ret_str)])
+
+    @tool
+    async def report_success(self, answer: str) -> ToolResult:
         """
         Report success to the verifier.
         """
@@ -79,14 +109,21 @@ class CoderEnvTool:
 
 
 @dataclass
-class EnvState:
+class EnvStateBase:
     task: Task
-    code: str
+    code_history: list[
+        str
+    ]  # The history of code for every turn (we add new entry even if no changes are made)
     max_turns: int
     remaining_turns: int  # If no action is taken, the turn is 0
     image_name: str
     library_name: str
-    messages: list[TinkerMessage] | None
+
+
+@dataclass
+class InitEnvState(EnvStateBase):
+    messages: None
+    prethink: None
 
     @classmethod
     def numrs2(
@@ -98,40 +135,52 @@ class EnvState:
     ) -> Self:
         return cls(
             task=task,
-            code=CARGO_INIT_MAIN_RS,
+            code_history=[CARGO_INIT_MAIN_RS],
             max_turns=max_turns,
             remaining_turns=max_turns,
             image_name=image_name,
             library_name=library_name,
             messages=None,
+            prethink=None,
         )
 
 
 @dataclass
+class ResumedEnvState(EnvStateBase):
+    messages: list[TinkerMessage]
+    prethink: str | None
+
+
+type EnvState = InitEnvState | ResumedEnvState
+
+
+@dataclass
 class RustCoderEnv(Env):
-    initial_state: EnvState
+    initial_state: EnvStateBase
     rust_env: RustCodingEnvironment
-    internal: EnvFromMessageEnv
+    internal: PrefillableMessageEnv
+    code_history: list[str]
 
     async def initial_observation(self) -> tuple[Observation, StopCondition]:
         return await self.internal.initial_observation()
 
     async def step(self, action: Action) -> StepResult:
-        return await self.internal.step(action)
-
-    async def get_state(self) -> EnvState:
-        message_env: AgentToolMessageEnv = cast(
-            AgentToolMessageEnv, self.internal.message_env
-        )
+        result = await self.internal.step(action)
         code = await self.rust_env.view_file("src/main.rs")
-        return EnvState(
+        self.code_history.append(code)
+        return result
+
+    async def get_state(self) -> ResumedEnvState:
+        message_env = self.internal.message_env
+        return ResumedEnvState(
             task=self.initial_state.task,
-            code=code,
+            code_history=self.code_history,
             max_turns=self.initial_state.max_turns,
             remaining_turns=message_env._turn_count,
             image_name=self.initial_state.image_name,
             library_name=self.initial_state.library_name,
             messages=message_env.history,
+            prethink=None,
         )
 
     @classmethod
@@ -148,21 +197,30 @@ class RustCoderEnv(Env):
         )
         exclude = ["target", ".git"]
         tree_structure = await rust_env.tree(".", exclude=exclude, truncate=20)
-        tools = [tool_set.run, tool_set.str_replace, tool_set.report_success]
+        await rust_env.set_content("src/main.rs", env_state.code_history[-1])
+
+        tools: list[Tool] = [
+            # tool_set.run,
+            # tool_set.str_replace,
+            tool_set.str_replace_and_run,
+            tool_set.report_success,
+        ]
         internal = build_agent_tool_env(
             renderer=renderer,
             tools=tools,
             initial_messages=_get_initial_messages(
                 env_state=env_state,
                 tree_structure=tree_structure,
-                tools=tools,
+                tools=[t.to_spec() for t in tools],
                 renderer=renderer,
             ),
             reward_fn=LLMAsAJudge(
+                task=env_state.task,
                 rust_env=rust_env,
                 verifier=verifier,
                 tree_structure=tree_structure,
             ),
+            prethink=env_state.prethink,
             max_trajectory_tokens=max_trajectory_tokens,
             max_turns=env_state.remaining_turns,
             turn_count=env_state.max_turns - env_state.remaining_turns,
@@ -172,6 +230,7 @@ class RustCoderEnv(Env):
             initial_state=env_state,
             rust_env=rust_env,
             internal=internal,
+            code_history=env_state.code_history,
         )
 
 
@@ -224,13 +283,12 @@ You can only edit src/main.rs. The current content of src/main.rs is provided be
 You must not read documents or source codes of the library.
 You have turn limit of {env_state.max_turns}.
 If you hit the turn limit without reporting success, it will be considered as a failure.
-Note your solution has to be fully self-contained including both source code and explanation so that we can verify the solution later.
+Note your solution has to be fully self-contained including both full source code and a detailed explanation so that we can verify the solution later.
 Verification will solely based on your final solution and your source code in the coding environment will be discarded in verification.
-You should not use release build for faster debugging.
 </Guidelines>
 """
     system_prompt_with_tools = _inject_tools_into_prompt(
-        renderer, [tool.to_spec() for tool in tools], system_prompt
+        renderer, [tool for tool in tools], system_prompt
     )
     initial_message = f"""
 <Task>
@@ -251,11 +309,16 @@ You should not use release build for faster debugging.
     ]
 
 
+class ReportSuccessArgument(BaseModel):
+    answer: str
+
+
 @dataclass
 class LLMAsAJudge:
     rust_env: RustCodingEnvironment
     verifier: Verifier
     tree_structure: str
+    task: Task
 
     async def __call__(
         self, history: list[TinkerMessage]
@@ -265,28 +328,35 @@ class LLMAsAJudge:
             return 0.0, {}
         if len(history) == 0:
             return 0.0, {}
-        final_message = history[-1]
-        if "tool_calls" not in final_message:
-            return 0.0, {}
-        final_tool_calls = final_message["tool_calls"]
-        if len(final_tool_calls) == 0:
-            return 0.0, {}
-        report_success_function_call = None
-        for tool_call in final_tool_calls:
-            if report_success.name == tool_call.function.name:
-                report_success_function_call = tool_call
-                break
+        report_success_calls = list(
+            chain.from_iterable(
+                [
+                    [
+                        tool_call
+                        for tool_call in message["tool_calls"]
+                        if tool_call.function.name == "report_success"
+                    ]
+                    for message in history
+                    if "tool_calls" in message
+                ]
+            )
+        )
 
-        if report_success_function_call is None:
+        if len(report_success_calls) == 0:
             return 0.0, {}
+        report_success_call = report_success_calls[-1]
 
         try:
-            report_success_args = QA.model_validate_json(
-                report_success_function_call.function.arguments
+            report_success_args = ReportSuccessArgument.model_validate_json(
+                report_success_call.function.arguments
             )
+
             content = await self.rust_env.view_file("src/main.rs")
             verification_result = await self.verifier.verify(
-                qa=report_success_args,
+                qa=QA(
+                    question=self.task.instruction,
+                    answer=report_success_args.answer,
+                ),
                 tree_structure=self.tree_structure,
                 execution_output=execution_output,
                 main_rs_content=content,
@@ -307,15 +377,16 @@ class LLMAsAJudge:
 
 def build_agent_tool_env(
     renderer: Renderer,
-    tools: list[Tool],
+    tools: list[Tool | FunctionTool],
     initial_messages: list[Message],
     reward_fn: RewardFn,
     *,
+    prethink: str | None,
     max_turns: int = 5,
     failed_parse_reward: float = -0.1,
     max_trajectory_tokens: int | None = None,
     turn_count: int = 0,
-) -> EnvFromMessageEnv:
+) -> PrefillableMessageEnv:
     """Convenience method to build an EnvFromMessageEnv for tool-using agents.
 
     Args:
@@ -338,11 +409,12 @@ def build_agent_tool_env(
         reward_fn=reward_fn,
         _turn_count=turn_count,
     )
-    return EnvFromMessageEnv(
+    return PrefillableMessageEnv(
         renderer=renderer,
         message_env=msg_env,
         failed_parse_reward=failed_parse_reward,
         max_trajectory_tokens=max_trajectory_tokens,
+        prethink=prethink,
     )
 
 
@@ -350,8 +422,7 @@ def _inject_tools_into_prompt(
     renderer: Renderer, tools: list[ToolSpec], system_prompt: str
 ) -> list[TinkerMessage]:
     if not tools:
-        return system_prompt
-
+        return [TinkerMessage(role="system", content=system_prompt)]
     prefix_messages = renderer.create_conversation_prefix_with_tools(
         tools, system_prompt
     )
