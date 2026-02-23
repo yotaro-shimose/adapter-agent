@@ -1,11 +1,4 @@
-from tinker_cookbook.renderers.base import ThinkingPart
-from tinker_cookbook.renderers.base import TextPart
-from pydantic import Field
-from pydantic import BaseModel
-from adapter_agent.hierarchical.process.rewire_session import RewireSessionResult
-from adapter_agent.rl.config import SFTOptimizerParams
 import asyncio
-import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime
@@ -17,14 +10,18 @@ import tinker_cookbook.checkpoint_utils
 import weave  # noqa: F401
 from oai_utils.async_utils import gather_with_semaphore
 from oai_utils.tinker import TinkerModel, setup_tinkermodel
+from pydantic import BaseModel, Field
 from tinker import TrainingClient
 from tinker_cookbook.renderers.base import (
     Message as TinkerMessage,
+)
+from tinker_cookbook.renderers.base import (
     Renderer,
-    TrainOnWhat,
     Role,
-    Content,
+    TextPart,
+    ThinkingPart,
     ToolCall,
+    TrainOnWhat,
     UnparsedToolCall,
 )
 from tinker_cookbook.supervised.data import conversation_to_datum
@@ -35,6 +32,7 @@ from adapter_agent.hierarchical.agent.rewirer import Rewirer
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.gh import Library
 from adapter_agent.hierarchical.process.rewire_session import (
+    RewireSessionResult,
     rewire_session,
 )
 from adapter_agent.hierarchical.state import SFTDataset
@@ -48,6 +46,7 @@ from adapter_agent.rl.config import (
     ModelLoadingSettings,
     RolloutParams,
     SFTConfig,
+    SFTOptimizerParams,
 )
 from adapter_agent.rl.shared_sampling_client import SharedSamplingClient
 from adapter_agent.util.logger_util import setup_base_loglevel
