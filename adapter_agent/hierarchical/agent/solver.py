@@ -16,6 +16,7 @@ from oai_utils.tinker.agent_sdk_model import raw_responses_to_trajectory
 from pydantic import BaseModel
 from tinker_cookbook.rl.types import Trajectory
 
+from adapter_agent.data import QA
 from adapter_agent.hierarchical.agent.base import BaseAgent
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
@@ -24,7 +25,6 @@ from adapter_agent.library.rust_doc_tools import (
     search_docs,
     search_symbol,
 )
-from adapter_agent.qra import QA
 
 
 class SolverContext(WithRustDocAnalyzer):

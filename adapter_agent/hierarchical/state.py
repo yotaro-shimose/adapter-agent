@@ -1,4 +1,3 @@
-import random
 import asyncio
 import logging
 from dataclasses import dataclass
@@ -7,11 +6,10 @@ from typing import Any, Optional, Self
 
 import polars as pl
 from pydantic import BaseModel, PrivateAttr
-
-from adapter_agent.hierarchical.types import Task
-from adapter_agent.qra import QA
 from tinker_cookbook.rl.types import Trajectory
 
+from adapter_agent.data import QA, QASFTDataset
+from adapter_agent.hierarchical.types import Task
 
 logger = logging.getLogger(__name__)
 
@@ -84,26 +82,9 @@ class TaskPool(BaseModel):
         return cls(tasks=tasks)
 
 
-class SFTDataset(BaseModel):
-    items: list[QA] = []
-
-    def save(self, path: Path) -> None:
-        with path.open("w") as f:
-            f.write(self.model_dump_json(indent=2))
-
-    async def register(self, item: QA) -> None:
-        logger.info(f"Details: Registering QA: {item.question}")
-        self.items.append(item)
-
-    def shuffled(self) -> list[QA]:
-        items = [item.model_copy(deep=True) for item in self.items]
-        random.shuffle(items)
-        return items
-
-
 @dataclass
 class SFTPool:
-    dataset: SFTDataset
+    dataset: QASFTDataset
     queue: asyncio.Queue[QA]
 
     async def register(self, item: QA) -> None:
@@ -117,12 +98,12 @@ class SFTPool:
         return batch
 
     @classmethod
-    def from_sft_dataset(cls, dataset: SFTDataset) -> Self:
+    def from_sft_dataset(cls, dataset: QASFTDataset) -> Self:
         return cls(dataset=dataset, queue=asyncio.Queue())
 
     @classmethod
     def new(cls) -> Self:
-        return cls(dataset=SFTDataset(), queue=asyncio.Queue())
+        return cls(dataset=QASFTDataset(), queue=asyncio.Queue())
 
 
 @dataclass

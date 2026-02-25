@@ -1,21 +1,16 @@
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from itertools import chain
 from typing import AsyncGenerator, Self
 
 from coder_mcp.runtime import RustCodingEnvironment
-from pydantic import BaseModel, ValidationError
 from tinker_cookbook.completers import StopCondition
 from tinker_cookbook.renderers import Renderer
 from tinker_cookbook.renderers.base import Message, ToolSpec
 from tinker_cookbook.renderers.base import Message as TinkerMessage
 from tinker_cookbook.rl.types import Action, Env, Observation, StepResult
-from tinker_cookbook.tool_use import tool
-from tinker_cookbook.tool_use.agent_tool_message_env import (
-    AgentToolMessageEnv,
-    RewardFn,
-)
+from tinker_cookbook.tool_use import AgentToolMessageEnv, tool
+from tinker_cookbook.tool_use.agent_tool_message_env import RewardFn
 from tinker_cookbook.tool_use.tools import FunctionTool
 from tinker_cookbook.tool_use.types import Tool, ToolResult
 
@@ -25,8 +20,8 @@ from adapter_agent.hierarchical.agent.solver import (
 )
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.types import Task
-from adapter_agent.qra import QA
 from adapter_agent.rl.env.prefillable_env import PrefillableMessageEnv
+from adapter_agent.rl.env.reward import LLMAsAJudge
 
 logger = logging.getLogger(__name__)
 
@@ -268,11 +263,9 @@ Your task is to solve user provided problem.
 {CONTEXT.format(library_name=env_state.library_name)}
 
 <HowTo>
-You have a simplified coding environment with only two tools:
-- `str_replace`: Edit src/main.rs by finding and replacing an exact string. The target file is always src/main.rs.
-- `run`: Run `cargo run` to compile and execute the code.
+You have a simplified coding environment with one tool:
+- `str_replace_and_run`: Edit src/main.rs by finding and replacing an exact string. The target file is always src/main.rs. The code is automatically compiled and run, returning the combined stdout/stderr output and exit code.
 You DO NOT have access to library documents or source codes. You are expected to solve the problem based on your knowledge / recall.
-Once you have created a solution, you must run the code and confirm it works (to the best of your ability).
 You must end with a call to `report_success` to create your final answer to the question.
 </HowTo>
 
@@ -307,72 +300,6 @@ Verification will solely based on your final solution and your source code in th
     return system_prompt_with_tools + [
         TinkerMessage(role="user", content=initial_message),
     ]
-
-
-class ReportSuccessArgument(BaseModel):
-    answer: str
-
-
-@dataclass
-class LLMAsAJudge:
-    rust_env: RustCodingEnvironment
-    verifier: Verifier
-    tree_structure: str
-    task: Task
-
-    async def __call__(
-        self, history: list[TinkerMessage]
-    ) -> tuple[float, dict[str, float]]:
-        execution_output, success = await self.rust_env.run_cargo()
-        if not success:
-            return 0.0, {}
-        if len(history) == 0:
-            return 0.0, {}
-        report_success_calls = list(
-            chain.from_iterable(
-                [
-                    [
-                        tool_call
-                        for tool_call in message["tool_calls"]
-                        if tool_call.function.name == "report_success"
-                    ]
-                    for message in history
-                    if "tool_calls" in message
-                ]
-            )
-        )
-
-        if len(report_success_calls) == 0:
-            return 0.0, {}
-        report_success_call = report_success_calls[-1]
-
-        try:
-            report_success_args = ReportSuccessArgument.model_validate_json(
-                report_success_call.function.arguments
-            )
-
-            content = await self.rust_env.view_file("src/main.rs")
-            verification_result = await self.verifier.verify(
-                qa=QA(
-                    question=self.task.instruction,
-                    answer=report_success_args.answer,
-                ),
-                tree_structure=self.tree_structure,
-                execution_output=execution_output,
-                main_rs_content=content,
-            )
-            if verification_result.success:
-                return 1.0, {}
-            else:
-                return 0.0, {}
-
-        except ValidationError as e:
-            logger.debug(f"Failed to parse report_success arguments: {e}")
-            return 0.0, {}
-
-    @classmethod
-    def is_successful_reward(cls, reward: float) -> bool:
-        return reward > 0.0
 
 
 def build_agent_tool_env(

@@ -2,11 +2,11 @@ import logging
 
 from oai_utils.async_utils import gather_with_semaphore
 
+from adapter_agent.data import QA
 from adapter_agent.hierarchical.agent.solver import Solver
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.process.solve_verify import solve_verify
 from adapter_agent.hierarchical.types import Task
-from adapter_agent.qra import QA
 
 logger = logging.getLogger(__name__)
 

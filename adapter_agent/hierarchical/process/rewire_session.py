@@ -29,6 +29,9 @@ from adapter_agent.rl.env.env import (
 logger = logging.getLogger(__name__)
 
 
+type FloatMetrics = dict[str, float]
+
+
 def _log_trajectory_debug(transcript: str) -> None:
     """Helper function to log the trajectory using rich if debugging is enabled."""
     from rich.console import Console
@@ -46,17 +49,39 @@ def _log_trajectory_debug(transcript: str) -> None:
 
 
 @dataclass
+class Rewired:
+    messages: list[TinkerMessage]
+    n_rewire: int
+
+
+@dataclass
 class RewireSessionResult:
-    messages: list[TinkerMessage] | None
-    error: str | None
+    task: Task
+    rewired: Rewired | None
+    error_message: str | None
+    metrics: FloatMetrics
 
     @classmethod
-    def from_env_state(cls, env_state: ResumedEnvState) -> Self:
-        return cls(messages=env_state.messages, error=None)
+    def error(cls, task: Task, error_message: str) -> Self:
+        return cls(task=task, rewired=None, error_message=error_message, metrics={})
 
     @classmethod
-    def from_error(cls, error: str) -> Self:
-        return cls(messages=None, error=error)
+    def success(
+        cls,
+        task: Task,
+        messages: list[TinkerMessage],
+        num_rewire: int,
+        metrics: FloatMetrics,
+    ) -> Self:
+        return cls(
+            task=task,
+            rewired=Rewired(messages=messages, n_rewire=num_rewire),
+            error_message=None,
+            metrics=metrics,
+        )
+
+    def is_successful(self) -> bool:
+        return self.error_message is None
 
 
 @dataclass
@@ -64,6 +89,7 @@ class SolveVerifyTinkerResult:
     trajectory: Trajectory
     env_state: ResumedEnvState
     reward: float
+    metrics: FloatMetrics
 
     def is_success(self) -> bool:
         return LLMAsAJudge.is_successful_reward(self.reward)
@@ -89,30 +115,42 @@ async def rewire_session(
         verifier=verifier,
         env_state=state,
     )
-    if not ret.is_success():
-        # Rewire
-        for _ in range(max_rewire):
-            try:
-                branching_state = await rewirer.rewire(ret.env_state)
-            except AgentRunFailure as e:
-                logger.error(f"Failed to rewire: {e}")
-                return RewireSessionResult.from_error(str(e))
-            ret = await solve_verify_tinker(
-                solver_model=solver_model,
-                verifier=verifier,
-                env_state=branching_state,
+    log_trajectory_if_debug(ret)
+    init_metrics = metrics_with_prefix(ret.metrics, "first")
+
+    if ret.is_success():
+        return RewireSessionResult.success(
+            task=task,
+            messages=ret.env_state.messages,
+            num_rewire=0,
+            metrics=init_metrics,
+        )
+    # Rewire
+    for i in range(max_rewire):
+        try:
+            branching_state = await rewirer.rewire(ret.env_state)
+        except AgentRunFailure as e:
+            logger.error(f"Failed to rewire: {e}")
+            return RewireSessionResult.error(task=task, error_message=str(e))
+        ret = await solve_verify_tinker(
+            solver_model=solver_model,
+            verifier=verifier,
+            env_state=branching_state,
+        )
+
+        if ret.is_success():
+            log_trajectory_if_debug(ret)
+            return RewireSessionResult.success(
+                task=task,
+                messages=ret.env_state.messages,
+                num_rewire=i + 1,
+                metrics=init_metrics
+                | metrics_with_prefix(ret.metrics, f"rewire{i + 1}"),
             )
 
-            if ret.is_success():
-                return RewireSessionResult.from_env_state(ret.env_state)
-
-    if logger.isEnabledFor(logging.DEBUG):
-        transcript = format_trajectory_transcript(
-            ret.env_state.messages, use_thinking=True
-        )
-        _log_trajectory_debug(transcript)
-
-    return RewireSessionResult.from_error("Failed to solve after max_rewire")
+    return RewireSessionResult.error(
+        task=task, error_message="Failed to solve after max_rewire"
+    )
 
 
 @logtree.scope_header_decorator
@@ -146,13 +184,30 @@ async def solve_verify_tinker(
             if step_result.episode_done:
                 break
         env_state = await env.get_state()
+        metrics = step_result.metrics
         trajectory = Trajectory(transitions=transitions, final_ob=ob)
         return SolveVerifyTinkerResult(
             trajectory=trajectory,
             env_state=env_state,
             reward=get_total_reward(trajectory),
+            metrics=metrics,
         )
 
 
 def get_total_reward(trajectory: Trajectory) -> float:
     return sum([t.reward for t in trajectory.transitions])
+
+
+def metrics_with_prefix(
+    metrics: FloatMetrics, prefix: str, sep: str = "_"
+) -> FloatMetrics:
+    return {f"{prefix}{sep}{k}": v for k, v in metrics.items()}
+
+
+def log_trajectory_if_debug(ret: SolveVerifyTinkerResult) -> None:
+    if ret.is_success():
+        if logger.isEnabledFor(logging.DEBUG):
+            transcript = format_trajectory_transcript(
+                ret.env_state.messages, use_thinking=True
+            )
+            _log_trajectory_debug(transcript)

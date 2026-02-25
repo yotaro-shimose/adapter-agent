@@ -7,19 +7,20 @@ import chz
 import tinker
 import tinker.types as ttypes
 from oai_utils.litellm import litellm_concurrent_limit
-from oai_utils.tinker import LogprobLitellmModel, setup_tinkermodel
+from oai_utils.tinker import TinkerModel, setup_tinkermodel
 from pydantic import BaseModel, Field
 from tinker_cookbook import checkpoint_utils
 from tinker_cookbook.tokenizer_utils import Tokenizer
 from tinker_cookbook.utils import ml_log
 from tinker_cookbook.utils.trace import scope
 
+from adapter_agent.data import QA
+
 # Imports from hierarchical agent
 from adapter_agent.hierarchical.agent.h_agent import Agents
 from adapter_agent.hierarchical.process.runner import process_task
 from adapter_agent.hierarchical.state import RLPool, SFTPool, TaskPool
 from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
-from adapter_agent.qra import QA
 from adapter_agent.util.logger_util import setup_base_loglevel
 
 logger = logging.getLogger(__name__)
@@ -195,10 +196,10 @@ def qa2sample(qa: QA, tokenizer: Tokenizer) -> ttypes.Datum:
 def update_agents_sampling_client(
     agents: Agents, sampling_client: tinker.SamplingClient
 ):
-    assert isinstance(agents.solver.model, LogprobLitellmModel)
-    assert isinstance(agents.verifier.model, LogprobLitellmModel)
-    assert isinstance(agents.analyzer.model, LogprobLitellmModel)
-    assert isinstance(agents.decomposer.model, LogprobLitellmModel)
+    assert isinstance(agents.solver.model, TinkerModel)
+    assert isinstance(agents.verifier.model, TinkerModel)
+    assert isinstance(agents.analyzer.model, TinkerModel)
+    assert isinstance(agents.decomposer.model, TinkerModel)
     agents.solver.model.update_sampling_client(sampling_client)
     agents.verifier.model.update_sampling_client(sampling_client)
     agents.analyzer.model.update_sampling_client(sampling_client)

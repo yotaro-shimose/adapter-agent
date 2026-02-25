@@ -1,4 +1,3 @@
-from hindsight_generator import HindsightOutput
 import datetime
 from pathlib import Path
 from typing import Self
@@ -14,7 +13,7 @@ from transformers import (
 from trl import SFTTrainer
 from trl.trainer.sft_config import SFTConfig
 
-from adapter_agent.qra import QRADataset, QRA
+from adapter_agent.data import QRA, QRADataset
 
 
 class AdapterSFTConfig(BaseModel):

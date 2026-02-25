@@ -218,7 +218,7 @@ You must:
 - Causality rule: The agent at turn `N` cannot see the future! Your `reasoning` for turn `N` must NOT mention or react to errors, tool results, or events that happen in turn `N` or later in the transcript.
 - The student agent does not have search tools. So `student should have searched for X` is not an executable plan, therefore not a valid reasoning.
     - If you think the student does not have enough knowledge, you use search tools and provide the knowledge to the student agent. It is often helpful to provide the symbol's signature and a short description of its purpose.
-- The feedback should be detailed enough to help the student agent correct its course. Including several examples when applicable is recommended.
+- The feedback should be detailed enough to help the student agent correct its course. Including detailed and concrete examples when applicable is recommended.
 </Guidelines>\
 """
         tools = [
@@ -289,8 +289,9 @@ You must generate the continuous, first-person internal monologue the agent woul
 - Do NOT sound like external feedback or a reviewer ("The student should have...").
 - Do NOT mention anything that happens this turn or later. The agent cannot see the future.
 - Focus strictly on the thought process that logically concludes with taking the action suggested by the reviewer.
-- The reasoning should start from `Okay, let's see.`
 - The reasoning should be detailed and often include examples of what the agent should do but in first person.
+- The reasoning should be written as if he recalled the knowledge from his memory without reading documentation.
+- The reasoning should start from `Okay, let's see.`
 </Guidelines>\
 """
         agent = AgentWrapper[RewireOutput].create(

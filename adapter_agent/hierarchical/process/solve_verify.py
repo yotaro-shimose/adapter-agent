@@ -4,10 +4,10 @@ from dataclasses import dataclass
 from coder_mcp.runtime.rust_env import RustCodingEnvironment
 from tinker_cookbook.rl.types import Trajectory
 
+from adapter_agent.data import QA
 from adapter_agent.hierarchical.agent.solver import Solver
 from adapter_agent.hierarchical.agent.verifier import VerificationResult, Verifier
 from adapter_agent.hierarchical.types import Task
-from adapter_agent.qra import QA
 
 logger = logging.getLogger(__name__)
 

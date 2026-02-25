@@ -5,9 +5,9 @@ from agents import ModelSettings, RunContextWrapper, StopAtTools, function_tool
 from oai_utils.agent import AgentRunFailure, AgentsSDKModel, AgentWrapper
 from pydantic import BaseModel
 
+from adapter_agent.data import QA
 from adapter_agent.hierarchical.agent.base import BaseAgent
 from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
-from adapter_agent.qra import QA
 
 logger = logging.getLogger(__name__)
 

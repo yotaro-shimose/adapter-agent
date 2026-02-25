@@ -1,22 +1,21 @@
-from adapter_agent.util.logger_util import setup_base_loglevel
-from adapter_agent.hierarchical.agent.simplified_solver import SimplifiedSolver
-from oai_utils import gather_with_semaphore
-from datetime import datetime
-from pydantic import Field
-from pydantic import BaseModel
 import asyncio
 import logging
+from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
+from oai_utils import gather_with_semaphore
+from pydantic import BaseModel, Field
 
+from adapter_agent.data import QA
 from adapter_agent.hierarchical.agent.augmentor import Augmentor
+from adapter_agent.hierarchical.agent.simplified_solver import SimplifiedSolver
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.process.solve_verify import solve_verify
-from adapter_agent.hierarchical.state import SFTDataset
+from adapter_agent.hierarchical.state import QASFTDataset
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.model_helper import get_gemini
-from adapter_agent.qra import QA
+from adapter_agent.util.logger_util import setup_base_loglevel
 from h_tinker import setup_rust_doc_analyzer
 
 logger = logging.getLogger(__name__)
@@ -153,7 +152,7 @@ async def main():
         max_concurrent=4,
     )
     config.experiment_dir.mkdir(parents=True, exist_ok=True)
-    sft_dataset = SFTDataset(items=[qa for qa_list in verified_qas for qa in qa_list])
+    sft_dataset = QASFTDataset(items=[qa for qa_list in verified_qas for qa in qa_list])
     sft_dataset.save(config.experiment_dir / "sft_dataset.json")
     logger.info(f"Saved dataset to {config.experiment_dir.absolute()}")
 

@@ -3,9 +3,9 @@ from dataclasses import dataclass
 
 from oai_utils.agent import AgentRunFailure, AgentsSDKModel, AgentWrapper
 
+from adapter_agent.data import QA
 from adapter_agent.hierarchical.agent.base import BaseAgent
 from adapter_agent.hierarchical.types import Task, TaskInstructionList
-from adapter_agent.qra import QA
 
 logger = logging.getLogger(__name__)
 

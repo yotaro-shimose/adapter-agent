@@ -3,7 +3,7 @@ from tinker_cookbook.completers import StopCondition
 from tinker_cookbook.renderers import Renderer
 from tinker_cookbook.renderers.base import TextPart, ThinkingPart
 from tinker_cookbook.rl import types
-from tinker_cookbook.tool_use.agent_tool_message_env import AgentToolMessageEnv
+from tinker_cookbook.tool_use import AgentToolMessageEnv
 
 
 class PrefillableMessageEnv(types.Env):

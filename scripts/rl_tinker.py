@@ -22,15 +22,15 @@ from tinker_cookbook.utils import ml_log
 from tinker_cookbook.utils.ml_log import Logger as MLLogger
 from tinker_cookbook.utils.trace import scope
 
+from adapter_agent.data import QA
 from adapter_agent.hierarchical.agent.simplified_solver import SimplifiedSolver
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.gh import Library
 from adapter_agent.hierarchical.process.solve_verify import solve_verify
-from adapter_agent.hierarchical.state import SFTDataset
+from adapter_agent.hierarchical.state import QASFTDataset
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
 from adapter_agent.model_helper import get_gemini
-from adapter_agent.qra import QA
 from adapter_agent.rl.config import (
     EnvParams,
     ExperimentSettings,
@@ -336,7 +336,7 @@ async def train_worker(
 
         nonuniform_traj_groups = remove_uniform_traj_groups(batch_trajectory_groups)
 
-        if len(nonuniform_traj_groups) >= cfg.rollout_params.num_groups_per_batch:
+        if len(nonuniform_traj_groups) >= cfg.optimizer_params.num_groups_per_batch:
             step_counter += 1
             logger.info(
                 f"[Train Worker {worker_id}] Training Batch {step_counter} with {len(nonuniform_traj_groups)} groups..."
@@ -413,7 +413,7 @@ def setup_logging(cfg: RLConfig) -> MLLogger:
 def load_qas(cfg: RLConfig) -> list[QA]:
     # Load questions
     logger.info("Loading questions from generated_qas.json...")
-    qas_data_raw = SFTDataset.model_validate_json(
+    qas_data_raw = QASFTDataset.model_validate_json(
         cfg.env_params.dataset_path.read_text()
     )
     # Parse into QA objects
@@ -440,9 +440,10 @@ async def main():
             advantage_regularizer="output_token",
             num_steps=1,
             kl_penalty_coef=0.0,
+            kl_discount_factor=0.0,
+            num_groups_per_batch=8,
         ),
         rollout_params=RolloutParams(
-            num_groups_per_batch=8,
             num_rollout_workers=1,
             rollouts_per_question=8,
             per_group_concurrency=1,

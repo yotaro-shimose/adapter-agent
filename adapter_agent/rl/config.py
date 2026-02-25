@@ -1,12 +1,13 @@
 from datetime import datetime
 from pathlib import Path
+from typing import Self
 
 import tinker
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+from tinker.types.loss_fn_type import LossFnType
 
 from adapter_agent.hierarchical.gh import Library
 from adapter_agent.rl.advantage import AdvantageRegularizer
-from tinker.types.loss_fn_type import LossFnType
 
 
 class OptimizerParams(BaseModel):
@@ -16,16 +17,16 @@ class OptimizerParams(BaseModel):
     num_steps: int
     kl_penalty_coef: float
     kl_discount_factor: float
+    num_groups_per_batch: int = 2
 
 
 class SFTOptimizerParams(BaseModel):
     adam_params: tinker.AdamParams
-    sft_batch_size: int
+    batch_size: int
     num_epochs: int
 
 
 class RolloutParams(BaseModel):
-    num_groups_per_batch: int = 2
     num_rollout_workers: int = 1
     rollouts_per_question: int = 4
     per_group_concurrency: int = 4
@@ -41,16 +42,19 @@ class EnvParams(BaseModel):
 
 
 class ExperimentSettings(BaseModel):
-    experiment_name: str = Field(
-        default_factory=lambda: (
-            f"Adapter_Agent_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        )
-    )
-    wandb_project: str | None = "Adapter Agent"
+    experiment_name: str
+    wandb_project: str | None
     ttl_seconds: int = 604800  # 7 days
 
     def log_root(self) -> Path:
         return Path("logs") / "Adapter_Agent" / self.experiment_name
+
+    @classmethod
+    def with_prefix(cls, prefix: str) -> Self:
+        return cls(
+            experiment_name=f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            wandb_project=prefix,
+        )
 
 
 class ModelLoadingSettings(BaseModel):
@@ -61,7 +65,7 @@ class ModelLoadingSettings(BaseModel):
 
 
 class RLConfig(BaseModel):
-    experiment_setting: ExperimentSettings = ExperimentSettings()
+    experiment_setting: ExperimentSettings
     optimizer_params: OptimizerParams = OptimizerParams(
         adam_params=tinker.AdamParams(
             learning_rate=1e-4, beta1=0.9, beta2=0.95, eps=1e-8
