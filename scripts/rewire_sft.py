@@ -95,7 +95,8 @@ async def rollout_worker(
                     verifier=verifier,
                     rewirer=rewirer,
                     task=task,
-                    max_rewire=3,
+                    max_turns=5,
+                    max_rewire=2,
                 )
                 for _ in range(rollout_params.rollouts_per_question)
             ],
@@ -149,7 +150,7 @@ class TrainingDataManager:
                     messages=ret.rewired.messages,
                     task=ret.task,
                 )
-                for ret in self.trajectories
+                for ret in self.all_trajectories
                 if ret.rewired is not None
             ]
         )
@@ -410,11 +411,11 @@ async def main():
                 eps=1e-12,
             ),
             num_epochs=1,
-            batch_size=32,
+            batch_size=64,
         ),
         rollout_params=RolloutParams(
-            num_rollout_workers=64,
-            rollouts_per_question=2,
+            num_rollout_workers=1,
+            rollouts_per_question=1,
             per_group_concurrency=2,
             temperature=0.7,
         ),

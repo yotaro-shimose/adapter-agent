@@ -6,6 +6,7 @@ import tinker
 from pydantic import BaseModel
 from tinker.types.loss_fn_type import LossFnType
 
+from adapter_agent.data import QASFTDataset, TinkerMessagesDataset
 from adapter_agent.hierarchical.gh import Library
 from adapter_agent.rl.advantage import AdvantageRegularizer
 
@@ -27,9 +28,9 @@ class SFTOptimizerParams(BaseModel):
 
 
 class RolloutParams(BaseModel):
-    num_rollout_workers: int = 1
-    rollouts_per_question: int = 4
-    per_group_concurrency: int = 4
+    num_rollout_workers: int
+    rollouts_per_question: int
+    per_group_concurrency: int
     temperature: float = 0.7
 
 
@@ -39,6 +40,16 @@ class EnvParams(BaseModel):
     library: Library
     image_name: str
     dataset_path: Path
+
+    @classmethod
+    def numrs2(cls, max_turns: int, r_min: float, dataset_path: Path) -> Self:
+        return cls(
+            max_turns=max_turns,
+            r_min=r_min,
+            library=Library(name="numrs2", local_path=Path("repositories/numrs")),
+            image_name="coder-mcp-numrs2:latest",
+            dataset_path=dataset_path,
+        )
 
 
 class ExperimentSettings(BaseModel):
@@ -97,3 +108,28 @@ class SFTConfig(BaseModel):
     rollout_params: RolloutParams
     env_params: EnvParams
     model_loading_settings: ModelLoadingSettings
+
+
+class QADataConfig(BaseModel):
+    data_path: Path = Path("generated_qas.json")
+    train_ratio: float = 0.9
+    test_ratio: float = 0.1
+
+    def train_test_split(self, seed: int) -> tuple[QASFTDataset, QASFTDataset]:
+        ds = QASFTDataset.load(self.data_path)
+        train, test = ds.train_test_split(self.train_ratio, seed=seed)
+        return train, test
+
+
+class TrajectorySFTDataConfig(BaseModel):
+    data_path: Path
+    train_ratio: float = 0.9
+    test_ratio: float = 0.1
+
+    def train_test_split(
+        self, seed: int = 42
+    ) -> tuple[TinkerMessagesDataset, TinkerMessagesDataset]:
+        ds = TinkerMessagesDataset.load(self.data_path)
+        uniqued = ds.id_unique()
+        train, test = uniqued.train_test_split(self.train_ratio, seed=seed)
+        return train, test

@@ -1,7 +1,9 @@
 import logging
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Self
 
+import numpy as np
 from oai_utils.agent import AgentRunFailure
 from oai_utils.tinker import TinkerModel
 from tinker_cookbook.renderers.base import Message as TinkerMessage
@@ -60,10 +62,27 @@ class RewireSessionResult:
     rewired: Rewired | None
     error_message: str | None
     metrics: FloatMetrics
+    execution_success: bool
 
     @classmethod
     def error(cls, task: Task, error_message: str) -> Self:
-        return cls(task=task, rewired=None, error_message=error_message, metrics={})
+        return cls(
+            task=task,
+            rewired=None,
+            error_message=error_message,
+            metrics={},
+            execution_success=True,
+        )
+
+    @classmethod
+    def enviroment_error(cls, task: Task, error_message: str) -> Self:
+        return cls(
+            task=task,
+            rewired=None,
+            error_message=error_message,
+            metrics={},
+            execution_success=False,
+        )
 
     @classmethod
     def success(
@@ -78,6 +97,7 @@ class RewireSessionResult:
             rewired=Rewired(messages=messages, n_rewire=num_rewire),
             error_message=None,
             metrics=metrics,
+            execution_success=True,
         )
 
     def is_successful(self) -> bool:
@@ -103,18 +123,22 @@ async def rewire_session(
     verifier: Verifier,
     rewirer: Rewirer,
     task: Task,
-    max_turns: int = 5,
-    max_rewire: int = 1,
+    max_turns: int,
+    max_rewire: int,
 ) -> RewireSessionResult:
     state = InitEnvState.numrs2(
         task=task,
         max_turns=max_turns,
     )
-    ret = await solve_verify_tinker(
-        solver_model=solver_model,
-        verifier=verifier,
-        env_state=state,
-    )
+    try:
+        ret = await solve_verify_tinker(
+            solver_model=solver_model,
+            verifier=verifier,
+            env_state=state,
+        )
+    except EnvironmentError as e:
+        logger.error(f"Failed to solve: {e}")
+        return RewireSessionResult.enviroment_error(task=task, error_message=str(e))
     log_trajectory_if_debug(ret)
     init_metrics = metrics_with_prefix(ret.metrics, "first")
 
@@ -132,11 +156,15 @@ async def rewire_session(
         except AgentRunFailure as e:
             logger.error(f"Failed to rewire: {e}")
             return RewireSessionResult.error(task=task, error_message=str(e))
-        ret = await solve_verify_tinker(
-            solver_model=solver_model,
-            verifier=verifier,
-            env_state=branching_state,
-        )
+        try:
+            ret = await solve_verify_tinker(
+                solver_model=solver_model,
+                verifier=verifier,
+                env_state=branching_state,
+            )
+        except EnvironmentError as e:
+            logger.error(f"Failed to solve: {e}")
+            return RewireSessionResult.enviroment_error(task=task, error_message=str(e))
 
         if ret.is_success():
             log_trajectory_if_debug(ret)
@@ -211,3 +239,14 @@ def log_trajectory_if_debug(ret: SolveVerifyTinkerResult) -> None:
                 ret.env_state.messages, use_thinking=True
             )
             _log_trajectory_debug(transcript)
+
+
+def traj_metrics(trajectories: list[SolveVerifyTinkerResult]) -> FloatMetrics:
+    raw_metrics = defaultdict(list)
+    metrics = {}
+    for ret in trajectories:
+        for key, value in ret.metrics.items():
+            raw_metrics[key].append(value)
+    for key, value in raw_metrics.items():
+        metrics[key] = np.mean(value).item()
+    return metrics

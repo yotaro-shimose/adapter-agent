@@ -149,6 +149,10 @@ class ResumedEnvState(EnvStateBase):
 type EnvState = InitEnvState | ResumedEnvState
 
 
+class EnvironmentError(Exception):
+    pass
+
+
 @dataclass
 class RustCoderEnv(Env):
     initial_state: EnvStateBase
@@ -157,13 +161,19 @@ class RustCoderEnv(Env):
     code_history: list[str]
 
     async def initial_observation(self) -> tuple[Observation, StopCondition]:
-        return await self.internal.initial_observation()
+        try:
+            return await self.internal.initial_observation()
+        except Exception as e:
+            raise EnvironmentError(f"Failed to get initial observation: {e}")
 
     async def step(self, action: Action) -> StepResult:
-        result = await self.internal.step(action)
-        code = await self.rust_env.view_file("src/main.rs")
-        self.code_history.append(code)
-        return result
+        try:
+            result = await self.internal.step(action)
+            code = await self.rust_env.view_file("src/main.rs")
+            self.code_history.append(code)
+            return result
+        except Exception as e:
+            raise EnvironmentError(f"Failed to step: {e}")
 
     async def get_state(self) -> ResumedEnvState:
         message_env = self.internal.message_env
