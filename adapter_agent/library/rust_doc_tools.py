@@ -102,6 +102,33 @@ def search_symbol(
 
 
 @function_tool
+def search(
+    wrapper: RunContextWrapper[WithRustDocAnalyzer], query: str, limit: int = 10
+) -> List[SearchResult]:
+    """
+    Search the Rust documentation for both symbols and concepts.
+
+    This function searches BOTH the name of the item and its explanation text (docstrings).
+    It is the recommended tool to find functionality based on descriptions, concepts,
+    keywords, or the names of types/functions. Matches in the item name are prioritized
+    over matches in the description.
+
+    Args:
+        wrapper: The execution context containing the RustDocAnalyzer instance.
+        query: The string to search for within the documentation text or symbol name. Case-insensitive.
+        limit: The maximum number of results to return. Defaults to 10.
+
+    Returns:
+        List[SearchResult]: A list of matching items, including their name, kind, relevance score, and a text snippet.
+
+    Example Usage:
+        # To find functions or structs related to sorting either by name or description
+        results = search(context, "sort")
+    """
+    return wrapper.context.rust_doc_analyzer.search(query, limit)
+
+
+@function_tool
 def get_crate_overview(wrapper: RunContextWrapper[WithRustDocAnalyzer]) -> str:
     """
     Get a comprehensive textual overview of the crate configuration and structure.

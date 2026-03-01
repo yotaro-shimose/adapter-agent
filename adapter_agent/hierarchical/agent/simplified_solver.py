@@ -14,18 +14,17 @@ from oai_utils import RunResultWrapper
 from oai_utils.agent import AgentRunFailure, AgentsSDKModel, AgentWrapper
 from oai_utils.tinker.agent_sdk_model import raw_responses_to_trajectory
 
+from adapter_agent.data import QA, QRA
 from adapter_agent.hierarchical.agent.solver import (
     CONTEXT,
     EFFICIENCY_GUIDELINES,
     Solver,
-    SolverContext,
     SolverResult,
-    report_success,
 )
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.library.rust_doc_tools import (
-    search_docs,
-    search_symbol,
+    WithRustDocAnalyzer,
+    search,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,17 +36,12 @@ fn main() {
 """
 
 
-class SimplifiedSolverContext(SolverContext):
+class SimplifiedSolverContext(WithRustDocAnalyzer):
+    question: str
     runtime: RustCodingEnvironment
     remaining_turns: int
-
-
-async def _run_tool_impl(
-    wrapper: RunContextWrapper[SimplifiedSolverContext],
-) -> str:
-    output = await wrapper.context.runtime.run_cargo()
-    wrapper.context.remaining_turns -= 1
-    return f"{output}\n(Remaining turns: {wrapper.context.remaining_turns})"
+    qa: QA | None = None
+    qra: QRA | None = None
 
 
 @function_tool
@@ -57,17 +51,11 @@ async def run_tool(
     """
     Run `cargo run` in the workspace. Returns the combined stdout/stderr output and exit code.
     """
-    return await _run_tool_impl(wrapper)
-
-
-async def _str_replace_tool_impl(
-    wrapper: RunContextWrapper[SimplifiedSolverContext],
-    old_str: str,
-    new_str: str,
-) -> str:
-    output, success = await wrapper.context.runtime.str_replace(old_str, new_str)
+    output = await wrapper.context.runtime.run_cargo()
     wrapper.context.remaining_turns -= 1
-    return f"{output}\n(Remaining turns: {wrapper.context.remaining_turns})"
+    return (
+        f"{output}\n<RemainingTurns>{wrapper.context.remaining_turns}</RemainingTurns>"
+    )
 
 
 @function_tool
@@ -79,7 +67,69 @@ async def str_replace_tool(
     """
     Find and replace an exact string in src/main.rs. The file target is always src/main.rs. Returns error if string not found or multiple matches. Shows context snippet after edit.
     """
-    return await _str_replace_tool_impl(wrapper, old_str, new_str)
+    output, success = await wrapper.context.runtime.str_replace(old_str, new_str)
+    wrapper.context.remaining_turns -= 1
+    return (
+        f"{output}\n<RemainingTurns>{wrapper.context.remaining_turns}</RemainingTurns>"
+    )
+
+
+@function_tool
+async def replace_and_run(
+    wrapper: RunContextWrapper[SimplifiedSolverContext],
+    old_str: str,
+    new_str: str,
+) -> str:
+    """
+    Find and replace an exact string in src/main.rs. The file target is always src/main.rs. Returns error if string not found or multiple matches.
+    If replacement is successful, runs `cargo run` and returns the output.
+    """
+    if wrapper.context.runtime is None:
+        return "Runtime not initialized."
+
+    replace_ret, replace_success = await wrapper.context.runtime.str_replace(
+        old_str, new_str
+    )
+    if not replace_success:
+        return replace_ret
+    wrapper.context.remaining_turns -= 1
+
+    run_ret, run_success = await wrapper.context.runtime.run_cargo()
+    combined_output = f"""\\
+<TextReplacementPerformed>
+{replace_ret}
+</TextReplacementPerformed>
+<CargoRunResult>
+{run_ret}
+</CargoRunResult>
+
+<RemainingTurns>
+{wrapper.context.remaining_turns}
+</RemainingTurns>
+"""
+    return combined_output
+
+
+@function_tool
+def internalize_solution(
+    wrapper: RunContextWrapper[SimplifiedSolverContext],
+    reasoning: str,
+    answer: str,
+) -> None:
+    """
+    Create a training data to internalize what you have learned.
+    Since it is internalizing process, the reasoning should not contain any of your observations during the task solving process.
+
+    Args:
+        reasoning: The reasoning process as if you are recalling the knowledge from your memory. This must start from "Okay, let's see." followed by briefly explaining the user's request.
+            Then you start recalling the knowledge.
+        answer: The final answer to the question (including both code and explanation). This answer must be self-contained.
+    """
+    wrapper.context.qa = QRA(
+        question=wrapper.context.question,
+        reasoning=reasoning,
+        answer=answer,
+    )
 
 
 @dataclass(kw_only=True)
@@ -89,7 +139,7 @@ class SimplifiedSolver[T: AgentsSDKModel](Solver[T]):
     async def try_solve(
         self,
         task: Task,
-        runtime: Runtime,
+        runtime: RustCodingEnvironment,
         library_name: str,
         tree_structure: str = "",
         max_turns: int = 10,
@@ -101,32 +151,31 @@ class SimplifiedSolver[T: AgentsSDKModel](Solver[T]):
         PROMPT = f"""
 <Role>
 You are an expert Rust software engineer.
-Your task is to answer user provided question with verified solution.
+Your goal is to create a solution and reasoning process to achieve the solution.
+You first create a solution using simple playground and then you generate a training data to internalize what you have learned.
 </Role>
 
 {CONTEXT.format(library_name=library_name)}
 
 <HowTo>
 You have a simplified coding environment with the following tools:
-- `str_replace`: Edit src/main.rs by finding and replacing an exact string. The target file is always src/main.rs.
-- `run`: Run `cargo run` to compile and execute the code.
-- `search_docs`: Use this to find functionality keywords, concepts, or how-to guides in the documentation.
-- `search_symbol`: Use this to find specific types, functions, or traits by name.
+- `{replace_and_run.name}`: Edit src/main.rs by finding and replacing an exact string. The target file is always src/main.rs. If replacement is successful, runs `cargo run` and returns the output.
+- `{search.name}`: Use this to search BOTH symbol names and documentation for functionality, concepts, or how-to guides.
 
 You can access library documents via search tools.
-Once you have created a solution, you must run the code and confirm it works (to the best of your ability).
-You must end with a call to `report_success` to create your final answer to the question.
+Once you confirmed that the solution works, you must end with a call to `{internalize_solution.name}` to create your final answer to the question.
 </HowTo>
 
 {EFFICIENCY_GUIDELINES}
 
 <Guidelines>
-You can edit src/main.rs using str_replace tool. The current content of src/main.rs is provided below.
 You have turn limit of {max_turns}.
 If you hit the turn limit without reporting success, it will be considered as a failure.
 Note your solution has to be fully self-contained including both source code and explanation so that we can verify the solution later.
-Verification will solely based on your final solution and your source code in the coding environment will be discarded in verification.
-You should not use release build for faster debugging.
+Typically you need to write the exact same code you used in the playground in the answer with ```rust ... ```.
+Your reasoning process should be written as if you are recalling the knowledge from your memory.
+- You must not mention about search tools like `I will search the documentation for X`.
+- You should instead say `I recall that X is implemented as Y`.
 </Guidelines>
 """
 
@@ -135,14 +184,14 @@ You should not use release build for faster debugging.
             instructions=PROMPT,
             model=self.model,
             tools=[
-                report_success,
-                run_tool,
-                str_replace_tool,
-                search_docs,
-                search_symbol,
+                internalize_solution,
+                replace_and_run,
+                search,
             ],
             mcp_servers=[],
-            tool_use_behavior=StopAtTools(stop_at_tool_names=[report_success.name]),
+            tool_use_behavior=StopAtTools(
+                stop_at_tool_names=[internalize_solution.name]
+            ),
             model_settings=ModelSettings(
                 parallel_tool_calls=True, tool_choice="required"
             ),
@@ -152,6 +201,7 @@ You should not use release build for faster debugging.
         context = SimplifiedSolverContext(
             rust_doc_analyzer=self.rust_doc_analyzer,
             runtime=runtime,
+            question=task.instruction,
             remaining_turns=max_turns,
         )
 
@@ -282,12 +332,14 @@ You should not use release build for faster debugging.
             instructions=PROMPT,
             model=self.model,
             tools=[
-                report_success,
+                internalize_solution,
                 run_tool,
                 str_replace_tool,
             ],
             mcp_servers=[],
-            tool_use_behavior=StopAtTools(stop_at_tool_names=[report_success.name]),
+            tool_use_behavior=StopAtTools(
+                stop_at_tool_names=[internalize_solution.name]
+            ),
             model_settings=ModelSettings(
                 parallel_tool_calls=True, tool_choice="required"
             ),
@@ -314,6 +366,7 @@ You should not use release build for faster debugging.
             rust_doc_analyzer=self.rust_doc_analyzer,
             runtime=runtime,
             remaining_turns=max_turns,
+            question=task.instruction,
         )
 
         try:

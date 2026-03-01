@@ -40,15 +40,19 @@ class EnvParams(BaseModel):
     library: Library
     image_name: str
     dataset_path: Path
+    single_turn: bool
 
     @classmethod
-    def numrs2(cls, max_turns: int, r_min: float, dataset_path: Path) -> Self:
+    def numrs2(
+        cls, max_turns: int, r_min: float, dataset_path: Path, single_turn: bool
+    ) -> Self:
         return cls(
             max_turns=max_turns,
             r_min=r_min,
             library=Library(name="numrs2", local_path=Path("repositories/numrs")),
             image_name="coder-mcp-numrs2:latest",
             dataset_path=dataset_path,
+            single_turn=single_turn,
         )
 
 
@@ -77,28 +81,9 @@ class ModelLoadingSettings(BaseModel):
 
 class RLConfig(BaseModel):
     experiment_setting: ExperimentSettings
-    optimizer_params: OptimizerParams = OptimizerParams(
-        adam_params=tinker.AdamParams(
-            learning_rate=1e-4, beta1=0.9, beta2=0.95, eps=1e-8
-        ),
-        loss_fn="ppo",
-        num_steps=1,
-        kl_penalty_coef=0.0,
-        kl_discount_factor=0.0,
-    )
-    rollout_params: RolloutParams = RolloutParams(
-        num_groups_per_batch=2,
-        num_rollout_workers=1,
-        rollouts_per_question=4,
-        per_group_concurrency=1,
-    )
-    env_params: EnvParams = EnvParams(
-        max_turns=5,
-        r_min=0.5,
-        library=Library(name="numrs2", local_path=Path("repositories/numrs")),
-        image_name="coder-mcp-numrs2:latest",
-        dataset_path="generated_qas.json",
-    )
+    optimizer_params: OptimizerParams
+    rollout_params: RolloutParams
+    env_params: EnvParams
     model_loading_settings: ModelLoadingSettings
 
 
@@ -111,9 +96,9 @@ class SFTConfig(BaseModel):
 
 
 class QADataConfig(BaseModel):
-    data_path: Path = Path("generated_qas.json")
-    train_ratio: float = 0.9
-    test_ratio: float = 0.1
+    data_path: Path
+    train_ratio: float
+    test_ratio: float
 
     def train_test_split(self, seed: int) -> tuple[QASFTDataset, QASFTDataset]:
         ds = QASFTDataset.load(self.data_path)
@@ -123,8 +108,8 @@ class QADataConfig(BaseModel):
 
 class TrajectorySFTDataConfig(BaseModel):
     data_path: Path
-    train_ratio: float = 0.9
-    test_ratio: float = 0.1
+    train_ratio: float
+    test_ratio: float
 
     def train_test_split(
         self, seed: int = 42

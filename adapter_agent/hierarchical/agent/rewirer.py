@@ -2,6 +2,7 @@ import logging
 from dataclasses import dataclass
 
 from agents import ModelSettings, RunContextWrapper, StopAtTools, function_tool
+from coder_mcp.runtime.rust_env import RustCodingEnvironment
 from oai_utils.agent import AgentRunFailure, AgentsSDKModel, AgentWrapper
 from pydantic import BaseModel
 from tinker_cookbook.renderers.base import Message as TinkerMessage
@@ -14,7 +15,9 @@ from adapter_agent.library.rust_doc_tools import (
     search_docs,
     search_symbol,
 )
-from adapter_agent.rl.env.env import ResumedEnvState
+from adapter_agent.rl.env.single_turn import SingleTurnEnvState
+from adapter_agent.rl.env.standard import ResumedEnvState
+from adapter_agent.util.parsing import extract_rust_code
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +104,7 @@ def format_trajectory_transcript(
             transcript_lines.append("=== Tool Result ===")
             transcript_lines.append(content)
             transcript_lines.append("")
-        elif role == "user":
+        elif role in {"user", "system"}:
             content = get_text_content(msg)
             transcript_lines.append("=== User / System ===")
             transcript_lines.append(content)
@@ -328,3 +331,244 @@ Generate the first-person reasoning that logically leads to the reviewer's sugge
                     break
                 assistant_turn_count += 1
         return cut_index
+
+
+class SingleTurnFeedbackResult(BaseModel):
+    reasoning: str
+
+
+class SingleTurnFeedbackContext(WithRustDocAnalyzer):
+    result: SingleTurnFeedbackResult | None = None
+    runtime: RustCodingEnvironment | None = None
+
+
+@function_tool
+async def replace_and_run(
+    wrapper: RunContextWrapper[SingleTurnFeedbackContext],
+    old_str: str,
+    new_str: str,
+) -> str:
+    """
+    Find and replace an exact string in src/main.rs. The file target is always src/main.rs. Returns error if string not found or multiple matches.
+    If replacement is successful, runs `cargo run` and returns the output.
+    """
+    if wrapper.context.runtime is None:
+        return "Runtime not initialized."
+
+    replace_ret, replace_success = await wrapper.context.runtime.str_replace(
+        old_str, new_str
+    )
+    if not replace_success:
+        return replace_ret
+
+    run_ret, run_success = await wrapper.context.runtime.run_cargo()
+    combined_output = f"""\\
+<TextReplacementPerformed>
+{replace_ret}
+</TextReplacementPerformed>
+<CargoRunResult>
+{run_ret}
+</CargoRunResult>
+"""
+    return combined_output
+
+
+@function_tool
+def feedback(
+    wrapper: RunContextWrapper[SingleTurnFeedbackContext],
+    reasoning: str,
+) -> None:
+    """
+    Report the new reasoning for the single turn.
+    Args:
+        reasoning: The description about what the student agent should have done instead.
+    """
+    wrapper.context.result = SingleTurnFeedbackResult(
+        reasoning=reasoning,
+    )
+
+
+@dataclass(kw_only=True)
+class SingleTurnRewirer[T: AgentsSDKModel](BaseAgent[T]):
+    rust_doc_analyzer: RustDocAnalyzer
+
+    async def rewire(self, state: SingleTurnEnvState) -> SingleTurnEnvState:
+        """
+        Reads a trajectory of another AI agent interactions with environment and detects a wrong action to rewrite.
+        Returns the new state with new reasoning content.
+        """
+        if state.messages is None:
+            raise ValueError("State messages is None")
+        original_transcript = format_trajectory_transcript(state.messages)
+
+        async with RustCodingEnvironment(image_name=state.image_name) as rust_env:
+            # Seed the student's code so replace_and_run has something to replace
+            assistant_content = ""
+            for msg in reversed(state.messages):
+                if msg.get("role") == "assistant":
+                    assistant_content = get_text_content(msg)
+                    break
+
+            code = extract_rust_code(assistant_content)
+            if code:
+                await rust_env.set_content("src/main.rs", code)
+
+            rewire_result = await self.get_feedback(state, rust_env)
+
+        new_reasoning = await self.get_new_reasoning(state, rewire_result)
+
+        new_env_state = state.__class__(
+            task=state.task,
+            image_name=state.image_name,
+            library_name=state.library_name,
+            prethink=new_reasoning,
+            messages=[],
+        )
+
+        if logger.isEnabledFor(logging.DEBUG):
+            _log_rewire_result_debug(
+                original_transcript=original_transcript,
+                rewire_result=FeedbackResult(
+                    turn_to_replace=1, reasoning=rewire_result.reasoning
+                ),
+                rewired_transcript=format_trajectory_transcript(
+                    [TinkerMessage(role="assistant", content=new_reasoning)]
+                ),
+            )
+
+        return new_env_state
+
+    async def get_feedback(
+        self, state: "SingleTurnEnvState", runtime: RustCodingEnvironment
+    ) -> SingleTurnFeedbackResult:
+        PROMPT = """\
+<Role>
+You are a Rust coding teacher.
+Your task is to review a student's interactions with a coding environment in a single-turn setup.
+You should identify what the student did wrong or sub-optimally, and provide what the student should have done instead.
+</Role>
+
+<Context>
+You will be provided with:
+1. The Crate Overview, giving you context about the library the agent is using.
+2. The Transcript of the student's interaction trajectory.
+</Context>
+
+<HowTo>
+You have access to the following search tools to understand the library documentation:
+- `search_docs`: Use this to find functionality keywords, concepts guides in the documentation.
+- `search_symbol`: Use this to find specific types, functions, or traits by name.
+
+You also have access to a tool to test your solutions:
+- `replace_and_run`: Replace `old_str` with `new_str` in `src/main.rs`. Executed immediately after replace to give compiler/run feedback.
+
+You must:
+1. Carefully read through the trajectory. Use search tools if you need more information about the crate to judge the agent's actions.
+2. Determine what the agent should have done to solve the task correctly.
+3. Verify your reasoning by editing and running the code.
+4. Report your findings using the `feedback` tool, providing the new `reasoning` that will be used to guide the agent in a new attempt.
+</HowTo>
+
+<Guidelines>
+- The reasoning must NOT mention or react to errors or tool results from the transcript. The agent cannot see the future!
+- The student agent does not have search tools. So `student should have searched for X` is not an executable plan.
+    - Provide the exact knowledge the student would need. It is often helpful to provide the symbol's signature and a short description of its purpose.
+- The feedback should be detailed enough to help the student agent correct its course. Including detailed and concrete examples when applicable is recommended.
+</Guidelines>\
+"""
+        tools = [
+            feedback,
+            replace_and_run,
+            search_docs,
+            search_symbol,
+        ]
+
+        agent = AgentWrapper.create(
+            name="Reviewer",
+            instructions=PROMPT,
+            model=self.model,
+            mcp_servers=[],
+            tools=tools,
+            model_settings=ModelSettings(
+                tool_choice="required", parallel_tool_calls=True
+            ),
+            tool_use_behavior=StopAtTools(stop_at_tool_names=[feedback.name]),
+            reset_tool_choice=False,
+        )
+
+        context = SingleTurnFeedbackContext(
+            rust_doc_analyzer=self.rust_doc_analyzer,
+            runtime=runtime,
+        )
+        crate_overview = self.rust_doc_analyzer.get_overview()
+        transcript = (
+            format_trajectory_transcript(state.messages) if state.messages else ""
+        )
+
+        input_prompt = f"""\
+<Crate Overview>
+{crate_overview}
+</Crate Overview>
+<Transcript>
+{transcript}
+</Transcript>
+
+"""
+
+        try:
+            await agent.run(input_prompt, max_turns=10, context=context)
+            if context.result is None:
+                raise ValueError("Rewirer finished without generating new state")
+            feedback_result = context.result
+        except AgentRunFailure as e:
+            logger.error(f"Rewirer process failed: {e}")
+            raise
+        logger.debug(f"Feedback result: {feedback_result}")
+        return feedback_result
+
+    async def get_new_reasoning(
+        self, state: "SingleTurnEnvState", feedback: SingleTurnFeedbackResult
+    ) -> str:
+        instructions = """\
+<Role>
+You are an expert at simulating an AI coding agent's inner monologue.
+Your task is to take a reviewer's feedback about what an agent *should* have done, and translate it into the agent's own first-person reasoning process.
+</Role>
+
+<HowTo>
+You will be provided with:
+1. The Task the agent needs to solve.
+2. The Reviewer's Feedback describing what the agent should do to solve it.
+
+You must generate the continuous, first-person internal monologue the agent would have right before writing the code. This reasoning should naturally bridge the agent's goal to the desired action, as if the agent realized the correct path on its own.
+</HowTo>
+
+<Guidelines>
+- Write purely in the first-person ("I need to...", "Let me check...", "Ah, I see...").
+- Do NOT sound like external feedback or a reviewer ("The student should have...").
+- Focus strictly on the thought process that logically concludes with writing the correct code.
+- The reasoning should be detailed and often include examples of what the agent should do but in first person.
+- The reasoning should be written as if he recalled the knowledge from his memory without reading documentation.
+- The reasoning should start from `Okay, let's see.`
+</Guidelines>\
+"""
+        agent = AgentWrapper[RewireOutput].create(
+            name="Brancher",
+            instructions=instructions,
+            model=self.model,
+            output_type=RewireOutput,
+        )
+
+        input_prompt = f"""\
+<Task>
+{state.task.instruction}
+</Task>
+
+<Reviewer Feedback>
+{feedback.reasoning}
+</Reviewer Feedback>
+
+Generate the first-person reasoning that logically leads to the reviewer's suggested action as a JSON object with the key "continuous_reasoning".
+"""
+        ret = await agent.run(input_prompt)
+        return ret.final_output().continuous_reasoning

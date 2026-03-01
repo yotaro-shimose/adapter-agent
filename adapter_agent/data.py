@@ -22,9 +22,7 @@ class QA(BaseModel):
     answer: str
 
 
-class QRA(BaseModel):
-    question: str
-    answer: str
+class QRA(QA):
     reasoning: str
 
 

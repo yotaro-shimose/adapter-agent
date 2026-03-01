@@ -124,3 +124,71 @@ class LLMAsAJudge:
     @classmethod
     def is_successful_reward(cls, reward: float) -> bool:
         return reward > 0.0
+
+
+@dataclass
+class LLMAsAJudgeSingleTurn:
+    rust_env: RustCodingEnvironment
+    verifier: Verifier
+    tree_structure: str
+    task: Task
+
+    async def __call__(
+        self, history: list[TinkerMessage]
+    ) -> tuple[float, dict[str, float]]:
+        if len(history) == 0:
+            raise ValueError("History for LLMAsAJudge cannot be empty")
+        execution_output, success = await self.rust_env.run_cargo()
+        if not success:
+            return 0.0, dict(
+                code_did_not_compile=1.0,
+                verifier_failed=0.0,
+                verifier_error=0.0,
+            )
+
+        content = await self.rust_env.view_file("src/main.rs")
+        assistant_messages = [m for m in history if m["role"] == "assistant"]
+        if len(assistant_messages) == 0:
+            raise ValueError("No assistant messages in history")
+        last_assistant_message = assistant_messages[-1]
+        if isinstance(last_assistant_message["content"], str):
+            answer = last_assistant_message["content"]
+        else:
+            answer = "\n".join(
+                part["text"]
+                for part in last_assistant_message["content"]
+                if part["type"] == "text"
+            )
+        try:
+            verification_result = await self.verifier.verify(
+                qa=QA(
+                    question=self.task.instruction,
+                    answer=answer,
+                ),
+                tree_structure=self.tree_structure,
+                execution_output=execution_output,
+                main_rs_content=content,
+            )
+        except Exception as e:
+            logger.debug(f"Failed to verify: {e}")
+            return 0.0, dict(
+                code_did_not_compile=0.0,
+                verifier_failed=0.0,
+                verifier_error=1.0,
+            )
+        if verification_result.success:
+            return 1.0, dict(
+                code_did_not_compile=0.0,
+                verifier_failed=0.0,
+                verifier_error=0.0,
+            )
+        else:
+            return 0.0, dict(
+                code_did_not_compile=0.0,
+                verifier_failed=1.0,
+                verifier_error=0.0,
+            )
+
+    @classmethod
+    def is_successful_reward(cls, reward: float) -> bool:
+        return reward > 0.0

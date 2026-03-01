@@ -1,10 +1,9 @@
-from typing import Self
-import logging
 import json
+import logging
 import re
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Self, Union
 
 from pydantic import BaseModel, Field
 
@@ -381,6 +380,76 @@ class RustDocAnalyzer:
                 snippet = item.docs.strip().split("\n")[0][:100]
                 if len(snippet) < len(item.docs):
                     snippet += "..."
+
+            signature = self._render_signature(item)
+
+            matches.append(
+                SearchResult(
+                    name=fullname,
+                    kind=kind,
+                    score=score,
+                    snippet=snippet,
+                    signature=signature,
+                )
+            )
+
+        matches.sort(key=lambda x: x.score, reverse=True)
+        return matches[:limit]
+
+    def search(self, query: str, limit: int = 10) -> List[SearchResult]:
+        """Search both documentation and symbol names for the given query."""
+        query_lower = query.lower()
+        matches = []
+
+        for item_id, item in self.data.index.items():
+            in_name = False
+            in_docs = False
+            name_lower = ""
+            docs_lower = ""
+
+            if item.name:
+                name_lower = item.name.lower()
+                in_name = query_lower in name_lower
+
+            if item.docs:
+                docs_lower = item.docs.lower()
+                in_docs = query_lower in docs_lower
+
+            if not (in_name or in_docs):
+                continue
+
+            fullname = self.resolve_full_name(item_id)
+            kind = "unknown"
+            if item.inner:
+                kind = next(iter(item.inner))
+
+            score = 0
+            if in_name:
+                if name_lower == query_lower:
+                    score += 10000
+                elif name_lower.startswith(query_lower):
+                    score += 5000
+                else:
+                    score += 1000
+
+            if in_docs:
+                score += docs_lower.count(query_lower)
+
+            snippet = ""
+            if item.docs:
+                if in_docs:
+                    idx = docs_lower.find(query_lower)
+                    start = max(0, idx - 40)
+                    end = min(len(item.docs), idx + 100)
+                else:
+                    start = 0
+                    end = len(item.docs)
+
+                snippet = item.docs[start:end].replace("\n", " ")
+                if start > 0:
+                    snippet = "..." + snippet
+                if end < len(item.docs):
+                    snippet = snippet + "..."
 
             signature = self._render_signature(item)
 

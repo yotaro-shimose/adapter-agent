@@ -173,7 +173,7 @@ async def main():
         experiment_settings=ExperimentSettings.with_prefix("SFT_Tinker"),
         model_loading_settings=ModelLoadingSettings(
             model_name="Qwen/Qwen3-8B",
-            resume_trainer_path="tinker://c0e75630-04da-509e-9b57-83271bd47ff2:train:0/weights/000030",
+            resume_trainer_path=None,
             resume_sampler_path=None,
             lora_rank=32,
         ),
@@ -181,7 +181,7 @@ async def main():
             adam_params=ttypes.AdamParams(
                 learning_rate=1e-4,
             ),
-            num_epochs=30,
+            num_epochs=60,
             batch_size=280,  # Could be bigger than training set as a whole
         ),
         # data_config=QADataConfig(
@@ -189,8 +189,11 @@ async def main():
         # ),
         data_config=TrajectorySFTDataConfig(
             data_path=Path(
-                "logs/Adapter_Agent/Adapter Agent_20260225_054614/sft_trajectories.json"
-            )
+                # "logs/Adapter_Agent/Adapter Agent_20260225_054614/sft_trajectories.json",
+                "logs/Adapter_Agent/Adapter Agent_20260301_070513/sft_trajectories.json",
+            ),
+            train_ratio=0.9,
+            test_ratio=0.1,
         ),
         save_every_epoch=15,
     )

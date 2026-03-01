@@ -20,7 +20,7 @@ from adapter_agent.hierarchical.agent.rewirer import (
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.rl.completer import TinkerTokenCompleter
-from adapter_agent.rl.env.env import (
+from adapter_agent.rl.env.standard import (
     EnvState,
     InitEnvState,
     LLMAsAJudge,
@@ -139,7 +139,7 @@ async def rewire_session(
     except EnvironmentError as e:
         logger.error(f"Failed to solve: {e}")
         return RewireSessionResult.enviroment_error(task=task, error_message=str(e))
-    log_trajectory_if_debug(ret)
+    log_trajectory_if_debug(ret.env_state.messages)
     init_metrics = metrics_with_prefix(ret.metrics, "first")
 
     if ret.is_success():
@@ -167,7 +167,7 @@ async def rewire_session(
             return RewireSessionResult.enviroment_error(task=task, error_message=str(e))
 
         if ret.is_success():
-            log_trajectory_if_debug(ret)
+            log_trajectory_if_debug(ret.env_state.messages)
             return RewireSessionResult.success(
                 task=task,
                 messages=ret.env_state.messages,
@@ -232,20 +232,17 @@ def metrics_with_prefix(
     return {f"{prefix}{sep}{k}": v for k, v in metrics.items()}
 
 
-def log_trajectory_if_debug(ret: SolveVerifyTinkerResult) -> None:
-    if ret.is_success():
-        if logger.isEnabledFor(logging.DEBUG):
-            transcript = format_trajectory_transcript(
-                ret.env_state.messages, use_thinking=True
-            )
-            _log_trajectory_debug(transcript)
+def log_trajectory_if_debug(messages: list[TinkerMessage]) -> None:
+    if logger.isEnabledFor(logging.DEBUG):
+        transcript = format_trajectory_transcript(messages, use_thinking=True)
+        _log_trajectory_debug(transcript)
 
 
-def traj_metrics(trajectories: list[SolveVerifyTinkerResult]) -> FloatMetrics:
+def mean_metrics(trajectories: list[FloatMetrics]) -> FloatMetrics:
     raw_metrics = defaultdict(list)
     metrics = {}
     for ret in trajectories:
-        for key, value in ret.metrics.items():
+        for key, value in metrics.items():
             raw_metrics[key].append(value)
     for key, value in raw_metrics.items():
         metrics[key] = np.mean(value).item()

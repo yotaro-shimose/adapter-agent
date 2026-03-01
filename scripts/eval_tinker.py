@@ -4,14 +4,18 @@ from pathlib import Path
 
 import tinker
 from oai_utils import gather_with_semaphore
-from oai_utils.tinker import setup_tinkermodel
+from oai_utils.tinker import TinkerModel, setup_tinkermodel
 
 from adapter_agent.data import TinkerMessagesDataset, TinkerMessageTrajectory
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.process.rewire_session import (
+    mean_metrics,
     solve_verify_tinker,
-    traj_metrics,
 )
+from adapter_agent.hierarchical.process.rewire_session_single_turn import (
+    solve_verify_tinker_single_turn,
+)
+from adapter_agent.hierarchical.types import Task
 from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
 from adapter_agent.model_helper import get_gemini
 from adapter_agent.rl.config import (
@@ -19,7 +23,8 @@ from adapter_agent.rl.config import (
     ModelLoadingSettings,
     TrajectorySFTDataConfig,
 )
-from adapter_agent.rl.env.env import InitEnvState
+from adapter_agent.rl.env.single_turn import SingleTurnEnvState
+from adapter_agent.rl.env.standard import InitEnvState
 from adapter_agent.util.logger_util import setup_base_loglevel
 
 logger = logging.getLogger(__name__)
@@ -56,6 +61,21 @@ def setup_agents(
     return model, verifier
 
 
+async def solve_verify_variable(
+    model: TinkerModel,
+    verifier: Verifier,
+    task: Task,
+    single_turn: bool,
+):
+    if single_turn:
+        env_state = SingleTurnEnvState.numrs2(task=task)
+        result = await solve_verify_tinker_single_turn(model, env_state, verifier)
+    else:
+        env_state = InitEnvState.numrs2(task=task, max_turns=3)
+        result = await solve_verify_tinker(model, env_state, verifier)
+    return result
+
+
 async def main():
     setup_logging()
     num_max_train_sample = 32
@@ -73,13 +93,17 @@ async def main():
         # resume_sampler_path="tinker://16ad7900-7611-561d-bc26-6dc5b7b78ceb:train:0/sampler_weights/000015",  # 1 step 15 epoch lr 1e-3
         # resume_sampler_path="tinker://d20cd30d-1222-524b-a401-f50fbb7873af:train:0/sampler_weights/000015",  # 1 step 15 epoch lr 1e-4
         # resume_sampler_path="tinker://c0e75630-04da-509e-9b57-83271bd47ff2:train:0/sampler_weights/000030",  # 3 steps 30 epochs
-        resume_sampler_path="tinker://14d462dc-5657-56d7-885e-a31aa1bf8630:train:0/sampler_weights/000030",  # 3 steps 60 epochs (30 + 30)
+        # resume_sampler_path="tinker://14d462dc-5657-56d7-885e-a31aa1bf8630:train:0/sampler_weights/000030",  # 3 steps 60 epochs (30 + 30)
+        # resume_sampler_path="tinker://a5118e9a-c25f-5826-ac4f-46e93d1c5f76:train:0/sampler_weights/000030",
+        # resume_sampler_path="tinker://718ad4f9-5026-55ce-a015-a22943f28a17:train:0/sampler_weights/000060",
+        resume_sampler_path="tinker://718ad4f9-5026-55ce-a015-a22943f28a17:train:0/sampler_weights/000045",
         lora_rank=32,
     )
     env_params = EnvParams.numrs2(
         max_turns=3,
         r_min=0.5,
         dataset_path=Path("data/sft/gen_20260218_182450/sft_dataset.json"),
+        single_turn=True,
     )
     rust_doc_analyzer = RustDocAnalyzer.from_libdir(env_params.library.local_path)
     model, verifier = setup_agents(
@@ -88,7 +112,9 @@ async def main():
     data_config = TrajectorySFTDataConfig(
         data_path=Path(
             "logs/Adapter_Agent/Adapter Agent_20260225_054614/sft_trajectories.json"
-        )
+        ),
+        train_ratio=0.9,
+        test_ratio=0.1,
     )
     train, test = data_config.train_test_split()
     logger.info(f"Train size: {len(train.items[:num_max_train_sample])}")
@@ -96,16 +122,17 @@ async def main():
 
     results = await gather_with_semaphore(
         [
-            solve_verify_tinker(
-                solver_model=model,
+            solve_verify_variable(
+                model=model,
                 verifier=verifier,
-                env_state=InitEnvState.numrs2(task=item.task, max_turns=5),
+                task=item.task,
+                single_turn=True,
             )
             for item in train.items[:num_max_train_sample]
         ],
         max_concurrent=32,
     )
-    train_metrics = traj_metrics(results)
+    train_metrics = mean_metrics([r.metrics for r in results])
     train_success_ratio = sum(1 for r in results if r.is_success()) / len(results)
     train_metrics["success_ratio"] = train_success_ratio
     logger.info(f"Train metrics: {train_metrics}")
@@ -122,16 +149,17 @@ async def main():
 
     test_results = await gather_with_semaphore(
         [
-            solve_verify_tinker(
-                solver_model=model,
+            solve_verify_variable(
+                model=model,
                 verifier=verifier,
-                env_state=InitEnvState.numrs2(task=item.task, max_turns=5),
+                task=item.task,
+                single_turn=True,
             )
             for item in test.items
         ],
         max_concurrent=32,
     )
-    test_metrics = traj_metrics(test_results)
+    test_metrics = mean_metrics([r.metrics for r in test_results])
     test_success_ratio = sum(1 for r in test_results if r.is_success()) / len(
         test_results
     )

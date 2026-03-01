@@ -20,6 +20,7 @@ from adapter_agent.hierarchical.agent.solver import (
 )
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.types import Task
+from adapter_agent.rl.env.injection import _inject_tools_into_prompt
 from adapter_agent.rl.env.prefillable_env import PrefillableMessageEnv
 from adapter_agent.rl.env.reward import LLMAsAJudge
 
@@ -353,14 +354,3 @@ def build_agent_tool_env(
         max_trajectory_tokens=max_trajectory_tokens,
         prethink=prethink,
     )
-
-
-def _inject_tools_into_prompt(
-    renderer: Renderer, tools: list[ToolSpec], system_prompt: str
-) -> list[TinkerMessage]:
-    if not tools:
-        return [TinkerMessage(role="system", content=system_prompt)]
-    prefix_messages = renderer.create_conversation_prefix_with_tools(
-        tools, system_prompt
-    )
-    return prefix_messages

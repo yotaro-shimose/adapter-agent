@@ -90,6 +90,7 @@ You must:
 - If the execution output indicates a compilation error or runtime panic, report failure.
 - If the output is logically incorrect for the question, report failure.
 - If the provided answer is not self-contained verifiable answer, report failure, even when the execution output and main.rs are correct.
+    - Carefully check if the answer contains the same verified code as main.rs.
 </Guidelines>
 """
         agent = AgentWrapper.create(
