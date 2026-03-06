@@ -8,6 +8,7 @@ from adapter_agent.data import QA
 from adapter_agent.hierarchical.agent.solver import Solver
 from adapter_agent.hierarchical.agent.verifier import VerificationResult, Verifier
 from adapter_agent.hierarchical.types import Task
+from adapter_agent.util.parsing import extract_rust_code
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +90,18 @@ async def solve_verify(
             logger.info("Solver produced a QA. Running code and verifying...")
 
             # Pre-run execution and fetching content for the Verifier
+            extracted_code = extract_rust_code(qa.answer)
+            if extracted_code is None:
+                return SolveVerifyResult(
+                    qa=qa,
+                    verification_result=None,
+                    trajectory=trajectory,
+                    reasoning=None,
+                    is_max_turns_exceeded=False,
+                    cause="code_extraction_failed",
+                    turns=turns,
+                )
+            await rust_env.set_content("src/main.rs", extracted_code)
             execution_output, success = await rust_env.run_cargo()
             if not success:
                 return SolveVerifyResult(

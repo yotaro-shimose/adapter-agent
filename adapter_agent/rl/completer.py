@@ -1,7 +1,13 @@
 from dataclasses import dataclass
 
 import tinker
-from tinker_cookbook.completers import StopCondition, TokenCompleter, TokensWithLogprobs
+from tinker_cookbook import renderers
+from tinker_cookbook.completers import (
+    MessageCompleter,
+    StopCondition,
+    TokenCompleter,
+    TokensWithLogprobs,
+)
 
 
 @dataclass
@@ -37,3 +43,46 @@ class TinkerTokenCompleter(TokenCompleter):
         return TokensWithLogprobs(
             tokens=sampled_tokens, maybe_logprobs=sampled_logprobs
         )
+
+
+class TinkerMessageCompleter(MessageCompleter):
+    """A custom completer that uses the actual model to generate responses and retains tools."""
+
+    def __init__(
+        self,
+        sampling_client: tinker.SamplingClient,
+        renderer: renderers.Renderer,
+        max_tokens: int | None,
+        stop_condition: StopCondition | None = None,
+        temperature: float = 1.0,
+    ):
+        self.sampling_client = sampling_client
+        self.renderer = renderer
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        if stop_condition is None:
+            self.stop_condition = self.renderer.get_stop_sequences()
+        else:
+            self.stop_condition = stop_condition
+
+    async def __call__(self, messages: list[renderers.Message]) -> renderers.Message:
+        # Render the conversation for the model
+        model_input = self.renderer.build_generation_prompt(messages)
+
+        # Sample from the model
+        response = await self.sampling_client.sample_async(
+            model_input,
+            num_samples=1,
+            sampling_params=tinker.SamplingParams(
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                stop=self.stop_condition,
+            ),
+        )
+
+        # Decode the response
+        parsed_message, _success = self.renderer.parse_response(
+            response.sequences[0].tokens
+        )
+
+        return parsed_message

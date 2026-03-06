@@ -1,9 +1,10 @@
 import asyncio
 import logging
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Self
 
 import litellm
 import numpy as np
@@ -15,20 +16,16 @@ from oai_utils.tinker import TinkerModel, setup_tinkermodel
 from tinker import TrainingClient
 from tinker_cookbook.renderers import TrainOnWhat
 from tinker_cookbook.renderers.base import Message as TinkerMessage
-from tinker_cookbook.renderers.base import (
-    Renderer,
-)
+from tinker_cookbook.renderers.base import Renderer
 from tinker_cookbook.supervised.data import conversation_to_datum
 from tinker_cookbook.utils import ml_log
 from tinker_cookbook.utils.ml_log import Logger as MLLogger
 
 from adapter_agent.data import QA, TinkerMessagesDataset, TinkerMessageTrajectory
-from adapter_agent.hierarchical.agent.rewirer import Rewirer, SingleTurnRewirer
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.gh import Library
 from adapter_agent.hierarchical.process.rewire_session import (
     RewireSessionResult,
-    rewire_session,
 )
 from adapter_agent.hierarchical.process.rewire_session_single_turn import (
     rewire_session_single_turn,
@@ -41,9 +38,9 @@ from adapter_agent.rl.config import (
     EnvParams,
     ExperimentSettings,
     ModelLoadingSettings,
+    RewireSFTConfig,
+    RewireSFTOptimizerParams,
     RolloutParams,
-    SFTConfig,
-    SFTOptimizerParams,
 )
 from adapter_agent.rl.shared_sampling_client import SharedSamplingClient
 from adapter_agent.util.logger_util import setup_base_loglevel
@@ -76,9 +73,7 @@ async def rollout_worker(
     worker_id: int,
     rewire_state: RewireSFTState,
     verifier: Verifier,
-    rewirer: Rewirer | SingleTurnRewirer,
     rollout_params: RolloutParams,
-    env_params: EnvParams,
 ):
     logger.info(f"Rollout Worker {worker_id} started.")
     while True:
@@ -92,31 +87,16 @@ async def rollout_worker(
         # Create new model and solver for this run
         model = rewire_state.get_latest_model()
         task = Task.from_instruction(question_text)
-        if env_params.single_turn:
-            assert isinstance(rewirer, SingleTurnRewirer)
-            coros = [
-                rewire_session_single_turn(
-                    solver_model=model,
-                    verifier=verifier,
-                    rewirer=rewirer,
-                    task=task,
-                    max_rewire=2,
-                )
-                for _ in range(rollout_params.rollouts_per_question)
-            ]
-        else:
-            assert isinstance(rewirer, Rewirer)
-            coros = [
-                rewire_session(
-                    solver_model=model,
-                    verifier=verifier,
-                    rewirer=rewirer,
-                    task=task,
-                    max_turns=env_params.max_turns,
-                    max_rewire=2,
-                )
-                for _ in range(rollout_params.rollouts_per_question)
-            ]
+        coros = [
+            rewire_session_single_turn(
+                solver_model=model,
+                verifier=verifier,
+                rewirer_model=model,
+                task=task,
+                max_rewire=2,
+            )
+            for _ in range(rollout_params.rollouts_per_question)
+        ]
 
         results = await gather_with_semaphore(
             coros,
@@ -135,19 +115,32 @@ async def rollout_worker(
 
 @dataclass
 class TrainingDataManager:
+    batch: deque[RewireSessionResult]  # queue of successful trajectories
+    remaining_to_update: int
+    update_freq: int
     trajectories: list[RewireSessionResult] = field(default_factory=list)
     all_trajectories: list[RewireSessionResult] = field(default_factory=list)
+
+    @classmethod
+    def create(cls, max_size: int, update_freq: int) -> Self:
+        return cls(
+            batch=deque(maxlen=max_size),
+            remaining_to_update=update_freq,
+            update_freq=update_freq,
+        )
 
     def update(self, trajectories: list[RewireSessionResult]):
         self.trajectories.extend(trajectories)
         self.all_trajectories.extend(trajectories)
-
-    def reset_temporal(self):
-        self.trajectories = []
+        successful = [ret for ret in trajectories if ret.rewired is not None]
+        self.batch.extend(successful)
+        self.remaining_to_update -= len(successful)
 
     def successful_trajectories(self) -> list[list[TinkerMessage]]:
         successful_messages = [
-            ret.rewired.messages for ret in self.trajectories if ret.rewired is not None
+            ret.rewired.messages
+            for ret in list(self.trajectories)
+            if ret.rewired is not None
         ]
         return successful_messages
 
@@ -163,9 +156,6 @@ class TrainingDataManager:
         if len(self.all_successful_trajectories()) > 0:
             self.as_sft_dataset().save(log_file_path)
 
-    def temporal_success_ratio(self) -> float:
-        return len(self.successful_trajectories()) / len(self.trajectories)
-
     def as_sft_dataset(self) -> TinkerMessagesDataset:
         return TinkerMessagesDataset(
             items=[
@@ -180,7 +170,8 @@ class TrainingDataManager:
 
     def get_current_metrics(self) -> dict[str, float]:
         metrics = {
-            "success_ratio": self.temporal_success_ratio(),
+            "success_ratio": len(self.successful_trajectories())
+            / len(self.trajectories),
             "num_unfiltered_samples": len(self.trajectories),
             "rewire_count": np.mean(
                 [
@@ -205,26 +196,35 @@ class TrainingDataManager:
             metrics[key] = np.mean(value).item()
         return metrics
 
+    def reset_trajectory(self):
+        self.trajectories.clear()
+
+    def maybe_get_batch(self) -> list[list[TinkerMessage]] | None:
+        if self.remaining_to_update <= 0:
+            self.remaining_to_update = self.update_freq
+            return self.successful_trajectories()
+        return None
+
 
 async def train_worker(
     training_client: TrainingClient,
     rewire_state: RewireSFTState,
-    cfg: SFTConfig,
-    kl_reference_client: tinker.SamplingClient | None,
+    cfg: RewireSFTConfig,
     ml_logger: MLLogger,
 ):
     logger.info("Trainer Worker started.")
     log_file_path = cfg.experiment_setting.log_root() / "sft_trajectories.json"
-    data_manager = TrainingDataManager()
+    data_manager = TrainingDataManager.create(
+        cfg.optimizer_params.batch_size,
+        cfg.optimizer_params.update_freq,
+    )
 
     while True:
         results = await rewire_state.queue_rollouts.get()
         data_manager.update(results)
-        successful_trajectories = data_manager.successful_trajectories()
         data_manager.save_all_successful_trajectories(log_file_path)
-
         rewire_state.queue_rollouts.task_done()
-        if len(successful_trajectories) >= cfg.optimizer_params.batch_size:
+        if successful_trajectories := data_manager.maybe_get_batch():
             metrics = {}
 
             sft_samples = [
@@ -263,12 +263,6 @@ async def train_worker(
                 await optim_future.result_async()
 
                 metrics = fwd_bwd_result.metrics
-                # if step == 0 and kl_reference_client is not None:
-                #     kl_div = await compute_kl_divergence(
-                #         sft_samples, fwd_bwd_result, kl_reference_client
-                #     )
-                #     metrics["train/kl_div"] = kl_div
-
                 logger.info(f"SFT Step {step + 1} Completed. Metrics: {metrics}")
 
                 # Move to next iteration
@@ -276,15 +270,15 @@ async def train_worker(
                     fwd_bwd_future = next_fwd_bwd_future
                     optim_future = next_optim_future
             ml_logger.log_metrics(metrics | data_manager.get_current_metrics())
-            data_manager.reset_temporal()
 
-            # new_client = (
-            #     await training_client.save_weights_and_get_sampling_client_async()
-            # )
-            # await rewire_state.sampling_client_manager.update_client(new_client)
+            new_client = (
+                await training_client.save_weights_and_get_sampling_client_async()
+            )
+            await rewire_state.sampling_client_manager.update_client(new_client)
             logger.info(
                 f"[Train Worker]   -> Latest sampling client updated. New ID: {id(rewire_state.sampling_client_manager.get_client())}"
             )
+            data_manager.reset_trajectory()
 
 
 class _SuppressExtensionWarning(logging.Filter):
@@ -292,7 +286,7 @@ class _SuppressExtensionWarning(logging.Filter):
         return "train_on_what=ALL_ASSISTANT_MESSAGES" not in record.getMessage()
 
 
-def setup_logging(cfg: SFTConfig) -> MLLogger:
+def setup_logging(cfg: RewireSFTConfig) -> MLLogger:
     # Setup logging
     log_root = cfg.experiment_setting.log_root()
     log_root.mkdir(parents=True, exist_ok=True)
@@ -309,11 +303,12 @@ def setup_logging(cfg: SFTConfig) -> MLLogger:
     )
 
     logging.getLogger("adapter_agent.hierarchical.agent.rewirer").setLevel(
-        # logging.DEBUG
-        logging.INFO
+        logging.DEBUG
+        # logging.INFO
     )
     logging.getLogger("adapter_agent.hierarchical.process.rewire_session").setLevel(
         logging.DEBUG
+        # logging.INFO
     )
     logging.getLogger(
         "adapter_agent.hierarchical.process.rewire_session_single_turn"
@@ -322,7 +317,7 @@ def setup_logging(cfg: SFTConfig) -> MLLogger:
     return ml_logger
 
 
-def load_qas(cfg: SFTConfig) -> list[QA]:
+def load_qas(cfg: RewireSFTConfig) -> list[QA]:
     # Load questions
     logger.info(f"Loading questions from {cfg.env_params.dataset_path}...")
     qas_data_raw = QASFTDataset.model_validate_json(
@@ -339,7 +334,6 @@ def setup_agents(
     service_client: tinker.ServiceClient,
     model_loading_settings: ModelLoadingSettings,
     rust_doc_analyzer: RustDocAnalyzer,
-    single_turn: bool = False,
 ):
     logger.info(
         f"Setting up model {model_loading_settings.model_name} from {model_loading_settings.resume_sampler_path}..."
@@ -354,15 +348,7 @@ def setup_agents(
     verifier_model = get_gemini()
     verifier = Verifier(model=verifier_model, rust_doc_analyzer=rust_doc_analyzer)
 
-    # Rewirer
-    rewirer_model = get_gemini()
-    if single_turn:
-        rewirer = SingleTurnRewirer(
-            model=rewirer_model, rust_doc_analyzer=rust_doc_analyzer
-        )
-    else:
-        rewirer = Rewirer(model=rewirer_model, rust_doc_analyzer=rust_doc_analyzer)
-    return model, verifier, rewirer
+    return model, verifier
 
 
 async def setup_tinker_clients(
@@ -389,12 +375,12 @@ async def setup_tinker_clients(
 
 
 async def main():
-    cfg = SFTConfig(
+    cfg = RewireSFTConfig(
         experiment_setting=ExperimentSettings(
             wandb_project="Adapter Agent SFT",
             experiment_name=f"Adapter Agent_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         ),
-        optimizer_params=SFTOptimizerParams(
+        optimizer_params=RewireSFTOptimizerParams(
             adam_params=tinker.AdamParams(
                 learning_rate=1e-4,
                 beta1=0.9,
@@ -402,7 +388,8 @@ async def main():
                 eps=1e-12,
             ),
             num_epochs=1,
-            batch_size=64,
+            batch_size=512,
+            update_freq=8,  # TODO: Increase this
         ),
         rollout_params=RolloutParams(
             num_rollout_workers=32,
@@ -416,11 +403,11 @@ async def main():
             library=Library(name="numrs2", local_path=Path("repositories/numrs")),
             image_name="coder-mcp-numrs2:latest",
             dataset_path=Path("data/sft/gen_20260218_182450/sft_dataset.json"),
-            single_turn=True,
         ),
         model_loading_settings=ModelLoadingSettings(
-            model_name="Qwen/Qwen3-8B",
+            # model_name="Qwen/Qwen3-8B",
             # model_name="Qwen/Qwen3-4B-Instruct-2507",
+            model_name="Qwen/Qwen3-8B",
             lora_rank=32,
         ),
     )
@@ -435,20 +422,13 @@ async def main():
 
     # Setup agents
     rust_doc_analyzer = RustDocAnalyzer.from_libdir(cfg.env_params.library.local_path)
-    model, verifier, rewirer = setup_agents(
+    model, verifier = setup_agents(
         service_client,
         cfg.model_loading_settings,
         rust_doc_analyzer,
-        single_turn=cfg.env_params.single_turn,
     )
     # Dataset
     qas_data = load_qas(cfg)
-
-    logger.info("Initializing KL reference client for monitoring...")
-    kl_reference_client = service_client.create_sampling_client(
-        base_model=cfg.model_loading_settings.model_name,
-        model_path=cfg.model_loading_settings.resume_sampler_path,
-    )
 
     sampling_client_manager = SharedSamplingClient(model.sampling_client)
     # Shared results list for CSV export
@@ -471,7 +451,6 @@ async def main():
             training_client=training_client,
             rewire_state=rewire_state,
             cfg=cfg,
-            kl_reference_client=kl_reference_client,
             ml_logger=ml_logger,
         )
     )
@@ -481,9 +460,7 @@ async def main():
                 worker_id=i,
                 rewire_state=rewire_state,
                 verifier=verifier,
-                rewirer=rewirer,
                 rollout_params=cfg.rollout_params,
-                env_params=cfg.env_params,
             )
         )
         for i in range(cfg.rollout_params.num_rollout_workers)

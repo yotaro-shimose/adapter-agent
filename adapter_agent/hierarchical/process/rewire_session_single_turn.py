@@ -1,17 +1,14 @@
 import logging
 from dataclasses import dataclass
+from typing import cast
 
+from agents.extensions.models.litellm_model import LitellmModel
 from oai_utils.tinker import TinkerModel
-from tinker_cookbook.renderers import TextPart, ThinkingPart
-from tinker_cookbook.renderers.base import Message as TinkerMessage
 from tinker_cookbook.rl.types import (
     Trajectory,
     Transition,
 )
 
-from adapter_agent.data import QRA
-from adapter_agent.hierarchical.agent.rewirer import SingleTurnRewirer
-from adapter_agent.hierarchical.agent.simplified_solver import SimplifiedSolver
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.process.rewire_session import (
     FloatMetrics,
@@ -20,16 +17,19 @@ from adapter_agent.hierarchical.process.rewire_session import (
     log_trajectory_if_debug,
     metrics_with_prefix,
 )
-from adapter_agent.hierarchical.process.solve_verify import solve_verify
 from adapter_agent.hierarchical.types import Task
-from adapter_agent.rl.completer import TinkerTokenCompleter
+from adapter_agent.rl.completer import TinkerMessageCompleter, TinkerTokenCompleter
 from adapter_agent.rl.env.reward import LLMAsAJudge
+from adapter_agent.rl.env.simplified_solver import (
+    SimplifiedSolverEnv,
+    SimplifiedSolverEnvState,
+    build_simplified_solver_env,
+)
 from adapter_agent.rl.env.single_turn import (
     SingleTurnEnvState,
     build_single_turn_env,
-    get_single_turn_initial_messages,
 )
-from adapter_agent.rl.env.standard import EnvironmentError
+from adapter_agent.rl.litellm_completer import LitellmMessageCompleter
 
 logger = logging.getLogger(__name__)
 
@@ -48,13 +48,11 @@ class SolveVerifyTinkerSingleTurnResult:
 async def rewire_session_single_turn(
     solver_model: TinkerModel,
     verifier: Verifier,
-    rewirer: SingleTurnRewirer,
+    rewirer_model: LitellmModel | TinkerModel,
     task: Task,
     max_rewire: int,
 ) -> RewireSessionResult:
-    state = SingleTurnEnvState.numrs2(
-        task=task,
-    )
+    state = SingleTurnEnvState.numrs2(task=task)
     try:
         ret = await solve_verify_tinker_single_turn(
             solver_model=solver_model,
@@ -76,57 +74,84 @@ async def rewire_session_single_turn(
             metrics=init_metrics,
         )
     # Rewire
+    return await run_rewiring_loop(
+        solver_model=solver_model,
+        verifier=verifier,
+        rewirer_model=rewirer_model,
+        task=task,
+        max_rewire=max_rewire,
+        init_metrics={},
+        # init_metrics=init_metrics,
+    )
+
+
+async def run_rewiring_loop(
+    solver_model: TinkerModel,
+    verifier: Verifier,
+    rewirer_model: LitellmModel | TinkerModel,
+    task: Task,
+    max_rewire: int,
+    init_metrics: dict,
+) -> RewireSessionResult:
     for i in range(max_rewire):
-        solver = SimplifiedSolver(
-            model=verifier.model, rust_doc_analyzer=verifier.rust_doc_analyzer
-        )
-        ret = await solve_verify(
-            solver=solver,
+        ss_state = SimplifiedSolverEnvState.numrs2(task=task)
+        async with build_simplified_solver_env(
+            env_state=ss_state,
+            renderer=solver_model.renderer,
             verifier=verifier,
-            task=task,
-            image_name=state.image_name,
-            library_name=state.library_name,
-            collect_trajectory=False,
-            use_search=True,
+            rust_doc_analyzer=verifier.rust_doc_analyzer,
             max_turns=10,
-        )
-        if ret.is_success() and ret.qa is not None:
-            message = get_single_turn_initial_messages(state)
-            if isinstance(ret.qa, QRA):
-                new_message = TinkerMessage(
-                    role="assistant",
-                    content=[
-                        ThinkingPart(
-                            type="thinking",
-                            thinking=ret.qa.reasoning,
-                        ),
-                        TextPart(
-                            type="text",
-                            text=ret.qa.answer,
-                        ),
-                    ],
+        ) as env:
+            msg_env = cast(SimplifiedSolverEnv, env.message_env)
+            if isinstance(rewirer_model, LitellmModel):
+                completer = LitellmMessageCompleter(
+                    model=rewirer_model.model,
+                    renderer=solver_model.renderer,
+                    tools=list(msg_env.tools.values()),
                 )
             else:
-                new_message = TinkerMessage(role="assistant", content=ret.qa.answer)
+                completer = TinkerMessageCompleter(
+                    rewirer_model.sampling_client,
+                    renderer=rewirer_model.renderer,
+                    max_tokens=None,  # type: ignore
+                )
 
-            whole_traj = message + [new_message]
-            log_trajectory_if_debug(whole_traj)
-            metrics = dict(
-                no_text_content=0.0,
-                no_code_found=0.0,
-                code_did_not_compile=0.0,
-                verifier_failed=0.0,
-                verifier_error=0.0,
-            )
-            logger.info(f"Successfully solved after {i + 1} rewirings")
-            return RewireSessionResult.success(
-                task=task,
-                messages=whole_traj,
-                num_rewire=i + 1,
-                metrics=init_metrics | metrics_with_prefix(metrics, f"rewire{i + 1}"),
-            )
-        else:
-            logger.info(f"Failed to solve after {i + 1} rewirings: {ret.cause}")
+            ob = await msg_env.initial_observation()
+            while True:
+                ac_message = await completer(ob)
+                step_result = await msg_env.step(ac_message)
+                ob = step_result.next_messages
+                if step_result.episode_done:
+                    break
+
+            if LLMAsAJudge.is_successful_reward(step_result.reward):
+                # Retrieve the final valid Rust code from the environment history
+                # Assuming the last assistant message before reward contains the code
+                last_assistant_msg = next(
+                    (m for m in reversed(ob) if m["role"] == "assistant"), None
+                )
+                if last_assistant_msg:
+                    whole_traj = ob
+
+                    log_trajectory_if_debug(whole_traj)
+                    metrics = dict(
+                        no_text_content=0.0,
+                        no_code_found=0.0,
+                        code_did_not_compile=0.0,
+                        verifier_failed=0.0,
+                        verifier_error=0.0,
+                    )
+                    logger.info(f"Successfully solved after {i + 1} rewirings")
+                    return RewireSessionResult.success(
+                        task=task,
+                        messages=whole_traj,
+                        num_rewire=i + 1,
+                        metrics=init_metrics
+                        | metrics_with_prefix(metrics, f"rewire{i + 1}"),
+                    )
+            else:
+                log_trajectory_if_debug(ob)
+                logger.info(f"Failed to solve after {i + 1} rewirings")
     logger.info("Failed to solve after max_rewire")
     return RewireSessionResult.error(
         task=task, error_message="Failed to solve after max_rewire"

@@ -103,7 +103,6 @@ async def main():
         max_turns=3,
         r_min=0.5,
         dataset_path=Path("data/sft/gen_20260218_182450/sft_dataset.json"),
-        single_turn=True,
     )
     rust_doc_analyzer = RustDocAnalyzer.from_libdir(env_params.library.local_path)
     model, verifier = setup_agents(

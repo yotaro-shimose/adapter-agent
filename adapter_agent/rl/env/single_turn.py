@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Self
@@ -18,6 +19,8 @@ from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.rl.env.reward import LLMAsAJudgeSingleTurn
 from adapter_agent.util.parsing import extract_rust_code
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -73,6 +76,7 @@ class SingleTurnEnv(Env):
     async def step(self, action: types.Action) -> types.StepResult:
         """Parse tokens to a message, delegate to MessageEnv, and render response."""
         assistant_message, parse_success = self.renderer.parse_response(action)
+        logger.debug(f"Assistant message: {assistant_message}")
 
         if not parse_success:
             return types.StepResult(

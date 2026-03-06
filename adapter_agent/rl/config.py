@@ -27,6 +27,13 @@ class SFTOptimizerParams(BaseModel):
     num_epochs: int
 
 
+class RewireSFTOptimizerParams(BaseModel):
+    adam_params: tinker.AdamParams
+    batch_size: int
+    num_epochs: int
+    update_freq: int  # Updates every `update_freq` samples
+
+
 class RolloutParams(BaseModel):
     num_rollout_workers: int
     rollouts_per_question: int
@@ -40,19 +47,15 @@ class EnvParams(BaseModel):
     library: Library
     image_name: str
     dataset_path: Path
-    single_turn: bool
 
     @classmethod
-    def numrs2(
-        cls, max_turns: int, r_min: float, dataset_path: Path, single_turn: bool
-    ) -> Self:
+    def numrs2(cls, max_turns: int, r_min: float, dataset_path: Path) -> Self:
         return cls(
             max_turns=max_turns,
             r_min=r_min,
             library=Library(name="numrs2", local_path=Path("repositories/numrs")),
             image_name="coder-mcp-numrs2:latest",
             dataset_path=dataset_path,
-            single_turn=single_turn,
         )
 
 
@@ -118,3 +121,11 @@ class TrajectorySFTDataConfig(BaseModel):
         uniqued = ds.id_unique()
         train, test = uniqued.train_test_split(self.train_ratio, seed=seed)
         return train, test
+
+
+class RewireSFTConfig(BaseModel):
+    experiment_setting: ExperimentSettings
+    optimizer_params: RewireSFTOptimizerParams
+    rollout_params: RolloutParams
+    env_params: EnvParams
+    model_loading_settings: ModelLoadingSettings
