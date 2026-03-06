@@ -281,7 +281,7 @@ class RustDocAnalyzer:
             if full_name:
                 matches = self.pubapi_map.get(full_name)
                 if matches:
-                    return "\n".join(matches)
+                    return "\n".join(list(set(matches)))
 
         if not item.inner or "function" not in item.inner:
             return None
@@ -398,24 +398,29 @@ class RustDocAnalyzer:
 
     def search(self, query: str, limit: int = 10) -> List[SearchResult]:
         """Search both documentation and symbol names for the given query."""
-        query_lower = query.lower()
+        queries = query.lower().split()
+        if not queries:
+            return []
+
         matches = []
 
         for item_id, item in self.data.index.items():
-            in_name = False
-            in_docs = False
             name_lower = ""
             docs_lower = ""
 
             if item.name:
                 name_lower = item.name.lower()
-                in_name = query_lower in name_lower
 
             if item.docs:
                 docs_lower = item.docs.lower()
-                in_docs = query_lower in docs_lower
 
-            if not (in_name or in_docs):
+            match_all = True
+            for q in queries:
+                if q not in name_lower and q not in docs_lower:
+                    match_all = False
+                    break
+
+            if not match_all:
                 continue
 
             fullname = self.resolve_full_name(item_id)
@@ -424,23 +429,31 @@ class RustDocAnalyzer:
                 kind = next(iter(item.inner))
 
             score = 0
-            if in_name:
-                if name_lower == query_lower:
-                    score += 10000
-                elif name_lower.startswith(query_lower):
-                    score += 5000
-                else:
-                    score += 1000
+            in_name = any(q in name_lower for q in queries)
+            in_docs = any(q in docs_lower for q in queries)
 
-            if in_docs:
-                score += docs_lower.count(query_lower)
+            for q in queries:
+                if q in name_lower:
+                    if name_lower == q:
+                        score += 10000
+                    elif name_lower.startswith(q):
+                        score += 5000
+                    else:
+                        score += 1000
+                if q in docs_lower:
+                    score += docs_lower.count(q)
 
             snippet = ""
             if item.docs:
-                if in_docs:
-                    idx = docs_lower.find(query_lower)
-                    start = max(0, idx - 40)
-                    end = min(len(item.docs), idx + 100)
+                if in_docs and not in_name:
+                    first_q_idx = -1
+                    for q in queries:
+                        idx = docs_lower.find(q)
+                        if idx != -1 and (first_q_idx == -1 or idx < first_q_idx):
+                            first_q_idx = idx
+
+                    start = max(0, first_q_idx - 40)
+                    end = min(len(item.docs), first_q_idx + 100)
                 else:
                     start = 0
                     end = len(item.docs)

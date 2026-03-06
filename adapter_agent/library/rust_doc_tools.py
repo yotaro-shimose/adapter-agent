@@ -111,7 +111,7 @@ def search(
     This function searches BOTH the name of the item and its explanation text (docstrings).
     It is the recommended tool to find functionality based on descriptions, concepts,
     keywords, or the names of types/functions. Matches in the item name are prioritized
-    over matches in the description.
+    over matches in the description. Multiple words separated by spaces perform an AND search.
 
     Args:
         wrapper: The execution context containing the RustDocAnalyzer instance.
