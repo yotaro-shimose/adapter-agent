@@ -80,6 +80,7 @@ class Counted[T]:
 @dataclass
 class CountDownStore[T]:
     items: dict[str, Counted[T]]
+    init_count: int
 
     def get_batch(self, batch_size: int) -> list[T]:
         batch_size = min(batch_size, len(self.items))
@@ -93,9 +94,9 @@ class CountDownStore[T]:
                 self.items.pop(key)
         return items
 
-    def put(self, item: T, init_count: int):
+    def put(self, item: T):
         key = str(uuid.uuid4())
-        self.items[key] = Counted(item=item, count=init_count)
+        self.items[key] = Counted(item=item, count=self.init_count)
 
     def __len__(self) -> int:
         return len(self.items)
@@ -108,6 +109,7 @@ class HybridReplayBuffer:
     sft_store: CountDownStore[SFTSample]
     rl_store: CountDownStore[RLSample]
     renderer: Renderer
+    max_reuse: int
 
     async def get_batch(self) -> TinkerBatch | None:
         batch_type = self.choose_type()
@@ -181,11 +183,27 @@ class UniRLState:
     def is_finished(self) -> bool:
         return self.study_task_queue.is_done() and self.practice_task_queue.is_done()
 
-    def register_study_rollout(self, item: RewireSessionResult): ...
+    def register_study_rollout(self, item: RewireSessionResult):
+        if item.rewired:
+            self.buffer.sft_store.put(SFTSample(messages=item.rewired.messages))
 
-    def register_practice_group(
-        self, items: list[SolveVerifyTinkerSingleTurnResult]
-    ): ...
+    def uniform_reward(self, rewards: list[float]) -> bool:
+        return all(r == rewards[0] for r in rewards)
+
+    def register_practice_group(self, items: list[SolveVerifyTinkerSingleTurnResult]):
+        rewards = [item.reward for item in items]
+        if self.uniform_reward(rewards):
+            return
+        for item in items:
+            self.buffer.rl_store.put(
+                RLSample(
+                    group=TrajectoryGroup(
+                        trajectories_G=[item.trajectory for item in items],
+                        final_rewards_G=rewards,
+                        metrics_G=[item.metrics for item in items],
+                    )
+                )
+            )
 
     async def get_batch(self) -> TinkerBatch | None:
         return await self.buffer.get_batch()
