@@ -9,6 +9,7 @@ from oai_utils.tinker import TinkerModel, setup_tinkermodel
 from adapter_agent.data import TinkerMessagesDataset, TinkerMessageTrajectory
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.process.rewire_session import (
+    log_trajectory,
     mean_metrics,
     solve_verify_tinker,
 )
@@ -70,6 +71,14 @@ async def solve_verify_variable(
     if single_turn:
         env_state = SingleTurnEnvState.numrs2(task=task)
         result = await solve_verify_tinker_single_turn(model, env_state, verifier)
+        has_broadcast = any(
+            "broadcast" in message["content"][-1]["text"]
+            if isinstance(message["content"], list)
+            else "broadcast" in message["content"]
+            for message in result.env_state.messages
+        )
+        if has_broadcast:
+            log_trajectory(result.env_state.messages)
     else:
         env_state = InitEnvState.numrs2(task=task, max_turns=3)
         result = await solve_verify_tinker(model, env_state, verifier)
@@ -96,7 +105,9 @@ async def main():
         # resume_sampler_path="tinker://14d462dc-5657-56d7-885e-a31aa1bf8630:train:0/sampler_weights/000030",  # 3 steps 60 epochs (30 + 30)
         # resume_sampler_path="tinker://a5118e9a-c25f-5826-ac4f-46e93d1c5f76:train:0/sampler_weights/000030",
         # resume_sampler_path="tinker://718ad4f9-5026-55ce-a015-a22943f28a17:train:0/sampler_weights/000060",
-        resume_sampler_path="tinker://718ad4f9-5026-55ce-a015-a22943f28a17:train:0/sampler_weights/000045",
+        # resume_sampler_path="tinker://718ad4f9-5026-55ce-a015-a22943f28a17:train:0/sampler_weights/000045",
+        # resume_sampler_path="tinker://b2482f1f-e118-5e75-91eb-d0e812ba7e1e:train:0/sampler_weights/000045",
+        resume_sampler_path="tinker://b2482f1f-e118-5e75-91eb-d0e812ba7e1e:train:0/sampler_weights/000060",
         lora_rank=32,
     )
     env_params = EnvParams.numrs2(

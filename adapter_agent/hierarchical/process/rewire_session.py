@@ -234,8 +234,12 @@ def metrics_with_prefix(
 
 def log_trajectory_if_debug(messages: list[TinkerMessage]) -> None:
     if logger.isEnabledFor(logging.DEBUG):
-        transcript = format_trajectory_transcript(messages, use_thinking=True)
-        _log_trajectory_debug(transcript)
+        log_trajectory(messages)
+
+
+def log_trajectory(messages: list[TinkerMessage]) -> None:
+    transcript = format_trajectory_transcript(messages, use_thinking=True)
+    _log_trajectory_debug(transcript)
 
 
 def mean_metrics(trajectories: list[FloatMetrics]) -> FloatMetrics:

@@ -12,6 +12,7 @@ import tinker
 import tinker_cookbook.checkpoint_utils
 import weave  # noqa: F401
 from oai_utils.async_utils import gather_with_semaphore
+from oai_utils.litellm import litellm_concurrent_limit
 from oai_utils.tinker import TinkerModel, setup_tinkermodel
 from tinker import TrainingClient
 from tinker_cookbook.renderers import TrainOnWhat
@@ -225,59 +226,59 @@ async def train_worker(
         data_manager.save_all_successful_trajectories(log_file_path)
         rewire_state.queue_rollouts.task_done()
         if successful_trajectories := data_manager.maybe_get_batch():
-            metrics = {}
+            # TODO: implement SFT training
+            # metrics = {}
+            # sft_samples = [
+            #     conversation_to_datum(
+            #         messages,
+            #         rewire_state.renderer,
+            #         max_length=None,
+            #         train_on_what=TrainOnWhat.LAST_ASSISTANT_MESSAGE,
+            #     )
+            #     for messages in successful_trajectories
+            # ]
+            # fwd_bwd_future = await training_client.forward_backward_async(
+            #     data=sft_samples, loss_fn="cross_entropy"
+            # )
+            # optim_future = await training_client.optim_step_async(
+            #     cfg.optimizer_params.adam_params
+            # )
+            # for step in range(cfg.optimizer_params.num_epochs):
+            #     # Enqueue next step before consuming current results
+            #     if step + 1 < cfg.optimizer_params.num_epochs:
+            #         logger.info(
+            #             f"Starting SFT Step {step + 2}/{cfg.optimizer_params.num_epochs}"
+            #         )
+            #         next_fwd_bwd_future = await training_client.forward_backward_async(
+            #             data=sft_samples, loss_fn="cross_entropy"
+            #         )
+            #         next_optim_future = await training_client.optim_step_async(
+            #             cfg.optimizer_params.adam_params
+            #         )
+            #     else:
+            #         next_fwd_bwd_future = None
+            #         next_optim_future = None
 
-            sft_samples = [
-                conversation_to_datum(
-                    messages,
-                    rewire_state.renderer,
-                    max_length=None,
-                    train_on_what=TrainOnWhat.LAST_ASSISTANT_MESSAGE,
-                )
-                for messages in successful_trajectories
-            ]
-            fwd_bwd_future = await training_client.forward_backward_async(
-                data=sft_samples, loss_fn="cross_entropy"
-            )
-            optim_future = await training_client.optim_step_async(
-                cfg.optimizer_params.adam_params
-            )
-            for step in range(cfg.optimizer_params.num_epochs):
-                # Enqueue next step before consuming current results
-                if step + 1 < cfg.optimizer_params.num_epochs:
-                    logger.info(
-                        f"Starting SFT Step {step + 2}/{cfg.optimizer_params.num_epochs}"
-                    )
-                    next_fwd_bwd_future = await training_client.forward_backward_async(
-                        data=sft_samples, loss_fn="cross_entropy"
-                    )
-                    next_optim_future = await training_client.optim_step_async(
-                        cfg.optimizer_params.adam_params
-                    )
-                else:
-                    next_fwd_bwd_future = None
-                    next_optim_future = None
+            #     # Consume current results
+            #     fwd_bwd_result = await fwd_bwd_future.result_async()
+            #     await optim_future.result_async()
 
-                # Consume current results
-                fwd_bwd_result = await fwd_bwd_future.result_async()
-                await optim_future.result_async()
+            #     metrics = fwd_bwd_result.metrics
+            #     logger.info(f"SFT Step {step + 1} Completed. Metrics: {metrics}")
 
-                metrics = fwd_bwd_result.metrics
-                logger.info(f"SFT Step {step + 1} Completed. Metrics: {metrics}")
+            #     # Move to next iteration
+            #     if next_fwd_bwd_future is not None and next_optim_future is not None:
+            #         fwd_bwd_future = next_fwd_bwd_future
+            #         optim_future = next_optim_future
+            # ml_logger.log_metrics(metrics | data_manager.get_current_metrics())
 
-                # Move to next iteration
-                if next_fwd_bwd_future is not None and next_optim_future is not None:
-                    fwd_bwd_future = next_fwd_bwd_future
-                    optim_future = next_optim_future
-            ml_logger.log_metrics(metrics | data_manager.get_current_metrics())
-
-            new_client = (
-                await training_client.save_weights_and_get_sampling_client_async()
-            )
-            await rewire_state.sampling_client_manager.update_client(new_client)
-            logger.info(
-                f"[Train Worker]   -> Latest sampling client updated. New ID: {id(rewire_state.sampling_client_manager.get_client())}"
-            )
+            # new_client = (
+            #     await training_client.save_weights_and_get_sampling_client_async()
+            # )
+            # await rewire_state.sampling_client_manager.update_client(new_client)
+            # logger.info(
+            #     f"[Train Worker]   -> Latest sampling client updated. New ID: {id(rewire_state.sampling_client_manager.get_client())}"
+            # )
             data_manager.reset_trajectory()
 
 
@@ -303,16 +304,23 @@ def setup_logging(cfg: RewireSFTConfig) -> MLLogger:
     )
 
     logging.getLogger("adapter_agent.hierarchical.agent.rewirer").setLevel(
-        logging.DEBUG
-        # logging.INFO
+        # logging.DEBUG
+        logging.INFO
     )
     logging.getLogger("adapter_agent.hierarchical.process.rewire_session").setLevel(
-        logging.DEBUG
-        # logging.INFO
+        # logging.DEBUG
+        logging.INFO
+    )
+    logging.getLogger("adapter_agent.hierarchical.process.rewire").setLevel(
+        # logging.DEBUG
+        logging.INFO
     )
     logging.getLogger(
         "adapter_agent.hierarchical.process.rewire_session_single_turn"
-    ).setLevel(logging.DEBUG)
+    ).setLevel(
+        # logging.DEBUG
+        logging.INFO
+    )
 
     return ml_logger
 
@@ -389,11 +397,11 @@ async def main():
             ),
             num_epochs=1,
             batch_size=512,
-            update_freq=8,  # TODO: Increase this
+            update_freq=32,
         ),
         rollout_params=RolloutParams(
-            num_rollout_workers=32,
-            rollouts_per_question=2,
+            num_rollout_workers=128,
+            rollouts_per_question=1,
             per_group_concurrency=2,
             temperature=0.7,
         ),
@@ -402,7 +410,9 @@ async def main():
             r_min=0.5,
             library=Library(name="numrs2", local_path=Path("repositories/numrs")),
             image_name="coder-mcp-numrs2:latest",
-            dataset_path=Path("data/sft/gen_20260218_182450/sft_dataset.json"),
+            dataset_path=Path(
+                "logs/Adapter_Agent/Adapter Agent_20260307_010745/sft_trajectories.json"
+            ),
         ),
         model_loading_settings=ModelLoadingSettings(
             # model_name="Qwen/Qwen3-8B",
@@ -445,32 +455,32 @@ async def main():
     for qa in qas_data * 2:
         rewire_state.queue_questions.put_nowait(qa)
 
-    # Start Workers
-    train_worker_task = asyncio.create_task(
-        train_worker(
+    async with litellm_concurrent_limit(
+        cfg.rollout_params.per_group_concurrency
+        * cfg.rollout_params.num_rollout_workers
+        + 10
+    ):
+        # Start Workers
+        train_worker_task = train_worker(
             training_client=training_client,
             rewire_state=rewire_state,
             cfg=cfg,
             ml_logger=ml_logger,
         )
-    )
-    rollout_workers_tasks = [
-        asyncio.create_task(
+        rollout_workers_tasks = [
             rollout_worker(
                 worker_id=i,
                 rewire_state=rewire_state,
                 verifier=verifier,
                 rollout_params=cfg.rollout_params,
             )
-        )
-        for i in range(cfg.rollout_params.num_rollout_workers)
-    ]
+            for i in range(cfg.rollout_params.num_rollout_workers)
+        ]
 
-    # Wait for producers to finish, or trainer to crash
-    rollouts_task = asyncio.gather(*rollout_workers_tasks)
-    done, pending = await asyncio.wait(
-        {rollouts_task, train_worker_task}, return_when=asyncio.FIRST_COMPLETED
-    )
+        # Wait for producers to finish, or trainer to crash
+        rollouts_task = asyncio.gather(*rollout_workers_tasks)
+
+        await asyncio.gather(train_worker_task, rollouts_task)
 
     _ = await tinker_cookbook.checkpoint_utils.save_checkpoint_async(
         training_client=training_client,

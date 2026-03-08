@@ -190,6 +190,7 @@ async def main():
         data_config=TrajectorySFTDataConfig(
             data_path=Path(
                 # "logs/Adapter_Agent/Adapter Agent_20260225_054614/sft_trajectories.json",
+                # "logs/Adapter_Agent/Adapter Agent_20260301_070513/sft_trajectories.json",
                 "logs/Adapter_Agent/Adapter Agent_20260301_070513/sft_trajectories.json",
             ),
             train_ratio=0.9,
