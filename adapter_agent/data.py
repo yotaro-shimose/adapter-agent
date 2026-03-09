@@ -83,11 +83,11 @@ class SFTDataset[T: BaseModel](Savable):
         items = [item.model_copy(deep=True) for item in self.items]
         random.shuffle(items)
         return items
+
+
 class QASFTDataset(SFTDataset[QA]):
     async def register(self, item: QA) -> None:
         self.items.append(item)
-
-
 
 
 SerializableContentPart = TextPart | ThinkingPart
