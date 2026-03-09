@@ -5,7 +5,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, Self
+from typing import Literal, Mapping, Self, Sequence
 
 import tinker
 import tinker_cookbook.checkpoint_utils
@@ -27,7 +27,7 @@ from adapter_agent.data import QASFTDataset
 from adapter_agent.hierarchical.agent.analyzer import Analyzer
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.gh import Library
-from adapter_agent.hierarchical.process.rewire import run_rewiring_loop
+from adapter_agent.hierarchical.process.rewire import ss_solve
 from adapter_agent.hierarchical.process.rewire_session import (
     RewireSessionResult,
 )
@@ -39,6 +39,7 @@ from adapter_agent.hierarchical.types import Task
 from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
 from adapter_agent.model_helper import get_gemini
 from adapter_agent.rl.config import EnvParams, ExperimentSettings, ModelLoadingSettings
+from adapter_agent.rl.env.simplified_solver import conclusion_to_metrics
 from adapter_agent.rl.env.single_turn import SingleTurnEnvState
 from adapter_agent.rl.shared_sampling_client import SharedSamplingClient
 from adapter_agent.rl.trajectory import prepare_minibatch_simplified
@@ -199,7 +200,7 @@ class MetricManager:
             log_freq=log_freq,
         )
 
-    def mean_metrics(self, metrics: list[dict[str, float]]) -> dict[str, float]:
+    def mean_metrics(self, metrics: Sequence[Mapping[str, float]]) -> dict[str, float]:
         return {k: sum(d[k] for d in metrics) / len(metrics) for k in metrics[0]}
 
     def with_prefix(
@@ -245,11 +246,10 @@ class UniRLState:
         return self.study_task_queue.is_done() and self.practice_task_queue.is_done()
 
     def register_study_rollout(self, item: RewireSessionResult):
+        metrics = conclusion_to_metrics(item.conclusion)
+        self.metric_manager.register_study_metrics(metrics)
         if item.rewired:
-            self.buffer.sft_store.put(
-                SFTSample(task=item.task, messages=item.rewired.messages)
-            )
-            self.metric_manager.register_study_metrics(item.metrics)
+            self.buffer.sft_store.put(SFTSample(task=item.task, messages=item.rewired))
 
     def uniform_reward(self, rewards: list[float]) -> bool:
         return all(r == rewards[0] for r in rewards)
@@ -265,18 +265,19 @@ class UniRLState:
                     group=TrajectoryGroup(
                         trajectories_G=[item.trajectory for item in items],
                         final_rewards_G=rewards,
-                        metrics_G=[item.metrics for item in items],
+                        metrics_G=[],
                     ),
                 )
             )
-            self.metric_manager.register_practice_metrics(item.metrics)
+            self.metric_manager.register_practice_metrics(
+                conclusion_to_metrics(item.conclusion)
+            )
 
     async def get_batch(self) -> TinkerBatch | None:
         return await self.buffer.get_batch()
 
 
 class StudyRolloutParams(BaseModel):
-    max_rewire: int
     qwen_no_think: bool
 
 
@@ -300,12 +301,11 @@ async def study_rollout(
             logger.debug(
                 f"Study worker {worker_id} got a task. Remaining study tasks: {state.study_task_queue.qsize()}"
             )
-            ret = await run_rewiring_loop(
+            ret = await ss_solve(
                 solver_model=latest_model,
                 verifier=verifier,
                 rewirer_model=latest_model,
                 task=task,
-                max_rewire=study_rollout_params.max_rewire,
                 max_turns=env_params.max_turns,
                 qwen_no_think=study_rollout_params.qwen_no_think,
             )
@@ -318,14 +318,14 @@ async def study_rollout(
                 subtask = None
                 if len(ret.trials) > 0:
                     try:
-                        subtask = await analyzer.analyze_trajectory(ret.trials[0])
+                        subtask = await analyzer.analyze_trajectory(ret.trials)
                         await state.study_task_queue.put(item=subtask)
                     except Exception as e:
                         logger.debug(
                             f"Study worker {worker_id} failed to analyze trajectory: {e}"
                         )
                 logger.info(
-                    f"Study worker {worker_id} produced failed trajectory. Added retry task and subtask {subtask.instruction[:50] if subtask else None}"
+                    f"Study worker {worker_id} produced failed trajectory. Added retry task and subtask `{subtask.instruction[:100] if subtask else None}`"
                 )
 
 
@@ -362,14 +362,14 @@ async def practice_rollout(
                 logger.info(
                     f"Practice Worker generated {success_counts}/{len(rets)} successful samples, putting it to study queue."
                 )
-            elif success_counts < len(rets):
-                await state.practice_task_queue.put(task)
+            elif success_counts == len(rets):
                 logger.info(
                     f"Practice Worker generated {success_counts}/{len(rets)} successful samples, removing the task from the queue"
                 )
             else:
+                await state.practice_task_queue.put(task)
                 logger.info(
-                    f"Practice Worker generated {success_counts}/{len(rets)} successful samples, putting it to ."
+                    f"Practice Worker generated {success_counts}/{len(rets)} successful samples, putting it to practice queue again."
                 )
 
 
@@ -404,6 +404,9 @@ async def train_worker(
     tasks_to_practice: dict[str, Task] = dict()
     while not state.is_finished():
         batch = await state.get_batch()
+        logger.info(
+            f"Train worker step: {step}. Remaining practice tasks: {state.practice_task_queue.qsize()}"
+        )
         if batch is None:
             await asyncio.sleep(1)
             continue

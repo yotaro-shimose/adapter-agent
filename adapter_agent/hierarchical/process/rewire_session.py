@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Self
 
 import numpy as np
-from oai_utils.agent import AgentRunFailure
 from oai_utils.tinker import TinkerModel
 from tinker_cookbook.renderers.base import Message as TinkerMessage
 from tinker_cookbook.rl.types import (
@@ -14,15 +13,14 @@ from tinker_cookbook.rl.types import (
 from tinker_cookbook.utils import logtree
 
 from adapter_agent.hierarchical.agent.rewirer import (
-    Rewirer,
     format_trajectory_transcript,
 )
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.rl.completer import TinkerTokenCompleter
+from adapter_agent.rl.env.simplified_solver import SSConclusion
 from adapter_agent.rl.env.standard import (
     EnvState,
-    InitEnvState,
     LLMAsAJudge,
     ResumedEnvState,
     build_coder_env,
@@ -51,50 +49,34 @@ def _log_trajectory_debug(transcript: str) -> None:
 
 
 @dataclass
-class Rewired:
-    messages: list[TinkerMessage]
-    n_rewire: int
-
-
-@dataclass
 class RewireSessionResult:
     task: Task
-    rewired: Rewired | None
-    error_message: str | None
-    metrics: FloatMetrics
-    trials: list[list[TinkerMessage]]
+    rewired: list[TinkerMessage] | None
+    conclusion: SSConclusion
+    trials: list[TinkerMessage]
 
     @classmethod
     def error(
-        cls, task: Task, error_message: str, trials: list[list[TinkerMessage]]
+        cls, task: Task, conclusion: SSConclusion, trials: list[TinkerMessage]
     ) -> Self:
-        return cls(
-            task=task,
-            rewired=None,
-            error_message=error_message,
-            metrics={},
-            trials=trials,
-        )
+        return cls(task=task, rewired=None, trials=trials, conclusion=conclusion)
 
     @classmethod
     def success(
         cls,
         task: Task,
-        messages: list[TinkerMessage],
-        num_rewire: int,
-        metrics: FloatMetrics,
-        trials: list[list[TinkerMessage]],
+        trials: list[TinkerMessage],
+        rewired: list[TinkerMessage],
     ) -> Self:
         return cls(
             task=task,
-            rewired=Rewired(messages=messages, n_rewire=num_rewire),
-            error_message=None,
-            metrics=metrics,
             trials=trials,
+            conclusion="success",
+            rewired=rewired,
         )
 
     def is_successful(self) -> bool:
-        return self.error_message is None
+        return self.conclusion == "success"
 
 
 @dataclass
@@ -109,77 +91,6 @@ class SolveVerifyTinkerResult:
 
     def total_reward(self) -> float:
         return sum(transition.reward for transition in self.trajectory.transitions)
-
-
-async def rewire_session(
-    solver_model: TinkerModel,
-    verifier: Verifier,
-    rewirer: Rewirer,
-    task: Task,
-    max_turns: int,
-    max_rewire: int,
-) -> RewireSessionResult:
-    trials: list[list[TinkerMessage]] = []
-    state = InitEnvState.numrs2(
-        task=task,
-        max_turns=max_turns,
-    )
-    try:
-        ret = await solve_verify_tinker(
-            solver_model=solver_model,
-            verifier=verifier,
-            env_state=state,
-        )
-    except EnvironmentError as e:
-        logger.error(f"Failed to solve: {e}")
-        return RewireSessionResult.error(task=task, error_message=str(e), trials=trials)
-    log_trajectory_if_debug(ret.env_state.messages)
-    init_metrics = metrics_with_prefix(ret.metrics, "first")
-    trials.append(ret.env_state.messages)
-
-    if ret.is_success():
-        return RewireSessionResult.success(
-            task=task,
-            messages=ret.env_state.messages,
-            num_rewire=0,
-            metrics=init_metrics,
-            trials=trials,
-        )
-    # Rewire
-    for i in range(max_rewire):
-        try:
-            branching_state = await rewirer.rewire(ret.env_state)
-        except AgentRunFailure as e:
-            logger.error(f"Failed to rewire: {e}")
-            return RewireSessionResult.error(
-                task=task, error_message=str(e), trials=trials
-            )
-        try:
-            ret = await solve_verify_tinker(
-                solver_model=solver_model,
-                verifier=verifier,
-                env_state=branching_state,
-            )
-        except EnvironmentError as e:
-            logger.error(f"Failed to solve: {e}")
-            return RewireSessionResult.error(
-                task=task, error_message=str(e), trials=trials
-            )
-        trials.append(ret.env_state.messages)
-        if ret.is_success():
-            log_trajectory_if_debug(ret.env_state.messages)
-            return RewireSessionResult.success(
-                task=task,
-                messages=ret.env_state.messages,
-                num_rewire=i + 1,
-                metrics=init_metrics
-                | metrics_with_prefix(ret.metrics, f"rewire{i + 1}"),
-                trials=trials,
-            )
-
-    return RewireSessionResult.error(
-        task=task, error_message="Failed to solve after max_rewire", trials=trials
-    )
 
 
 @logtree.scope_header_decorator

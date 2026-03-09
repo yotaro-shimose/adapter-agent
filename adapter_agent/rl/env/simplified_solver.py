@@ -2,7 +2,7 @@ import asyncio
 import json
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, Self
+from typing import Any, Literal, Self, TypedDict, cast
 
 import tinker
 from coder_mcp.runtime import RustCodingEnvironment
@@ -141,6 +141,59 @@ class ReplaceAndRunTool(Tool):
         return ToolResult(messages=[msg])
 
 
+type SSConclusion = Literal[
+    "success",
+    "context_length_exceeded",
+    "no_code_found",
+    "no_text_content",
+    "code_did_not_compile",
+    "verification_failed",
+    "verification_error",
+    "environment_error",
+    "rewire_failed",
+    "max_turns_exceeded",
+    "not_finished",
+    "parse_failed",
+]
+
+
+class SSMetrics(TypedDict):
+    success: float
+    context_length_exceeded: float
+    no_code_found: float
+    no_text_content: float
+    code_did_not_compile: float
+    verification_failed: float
+    verification_error: float
+    environment_error: float
+    rewire_failed: float
+    max_turns_exceeded: float
+    not_finished: float
+    parse_failed: float
+
+
+def conclusion_to_metrics(conclusion: SSConclusion) -> dict[str, float]:
+    return cast(dict[str, float], SSMetrics(
+        success=1.0 if conclusion == "success" else 0.0,
+        context_length_exceeded=1.0 if conclusion == "context_length_exceeded" else 0.0,
+        no_code_found=1.0 if conclusion == "no_code_found" else 0.0,
+        no_text_content=1.0 if conclusion == "no_text_content" else 0.0,
+        code_did_not_compile=1.0 if conclusion == "code_did_not_compile" else 0.0,
+        verification_failed=1.0 if conclusion == "verification_failed" else 0.0,
+        verification_error=1.0 if conclusion == "verification_error" else 0.0,
+        environment_error=1.0 if conclusion == "environment_error" else 0.0,
+        rewire_failed=1.0 if conclusion == "rewire_failed" else 0.0,
+        max_turns_exceeded=1.0 if conclusion == "max_turns_exceeded" else 0.0,
+        not_finished=1.0 if conclusion == "not_finished" else 0.0,
+        parse_failed=1.0 if conclusion == "parse_failed" else 0.0,
+    ))
+
+
+@dataclass
+class SSStepResult(MessageStepResult):
+    conclusion: SSConclusion = field(default="not_finished")
+
+
 @dataclass
 class SimplifiedSolverEnv(MessageEnv):
     initial_state: SimplifiedSolverEnvState
@@ -167,7 +220,7 @@ class SimplifiedSolverEnv(MessageEnv):
             self.history = list(self.initial_messages)
         return self.history
 
-    async def step(self, message: TinkerMessage) -> MessageStepResult:
+    async def step(self, message: TinkerMessage) -> SSStepResult:
         self.history.append(message)
 
         tool_calls: list[ToolCall] = list(message.get("tool_calls", []))
@@ -180,17 +233,18 @@ class SimplifiedSolverEnv(MessageEnv):
                     self.history.append(msg)
 
             if self.state_ref["remaining_turns"] <= 0:
-                return MessageStepResult(
+                return SSStepResult(
                     reward=0.0,
                     episode_done=True,
                     next_messages=self.history,
-                    metrics={"max_turns": 1.0},
+                    conclusion="max_turns_exceeded",
                 )
 
-            return MessageStepResult(
+            return SSStepResult(
                 reward=0.0,
                 episode_done=False,
                 next_messages=self.history,
+                conclusion="not_finished",
             )
 
         else:
@@ -213,28 +267,28 @@ class SimplifiedSolverEnv(MessageEnv):
 
                 self.state_ref["remaining_turns"] -= 1
                 if self.state_ref["remaining_turns"] <= 0:
-                    return MessageStepResult(
+                    return SSStepResult(
                         reward=0.0,
                         episode_done=True,
                         next_messages=self.history,
-                        metrics={"no_code_found": 1.0, "max_turns": 1.0},
+                        conclusion="max_turns_exceeded",
                     )
-                return MessageStepResult(
+                return SSStepResult(
                     reward=0.0,
                     episode_done=False,
                     next_messages=self.history,
-                    metrics={"no_code_found": 1.0},
+                    conclusion="no_code_found",
                 )
 
             await self.rust_env.set_content("src/main.rs", code)
 
             reward, reward_metrics = await self.reward_fn(self.history)
 
-            return MessageStepResult(
+            return SSStepResult(
                 reward=reward,
                 episode_done=True,
                 next_messages=self.history,
-                metrics={"no_code_found": 0.0, **reward_metrics},
+                conclusion="success",
             )
 
     async def get_state(self) -> SimplifiedSolverEnvState:

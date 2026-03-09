@@ -18,6 +18,7 @@ from adapter_agent.hierarchical.agent.solver import CONTEXT
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.rl.env.reward import LLMAsAJudgeSingleTurn
+from adapter_agent.rl.env.simplified_solver import SSConclusion
 from adapter_agent.util.parsing import extract_rust_code
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,11 @@ class SingleTurnEnvState:
 
 
 @dataclass
+class SingleTurnStepResult(types.StepResult):
+    conclusion: SSConclusion = field(default="not_finished")
+
+
+@dataclass
 class SingleTurnEnv(Env):
     initial_state: SingleTurnEnvState
     rust_env: RustCodingEnvironment
@@ -73,18 +79,18 @@ class SingleTurnEnv(Env):
             self.renderer.get_stop_sequences(),
         )
 
-    async def step(self, action: types.Action) -> types.StepResult:
+    async def step(self, action: types.Action) -> SingleTurnStepResult:
         """Parse tokens to a message, delegate to MessageEnv, and render response."""
         assistant_message, parse_success = self.renderer.parse_response(action)
         logger.debug(f"Assistant message: {assistant_message}")
 
         if not parse_success:
-            return types.StepResult(
+            return SingleTurnStepResult(
                 reward=0.0,
                 episode_done=True,
                 next_observation=tinker.ModelInput.empty(),
                 next_stop_condition=self.renderer.get_stop_sequences(),
-                metrics={"parse_error": 1.0},
+                conclusion="parse_failed",
             )
 
         if self.prethink:
@@ -104,7 +110,7 @@ class SingleTurnEnv(Env):
         self.history.append(assistant_message)
         return await self.process_message(assistant_message)
 
-    async def process_message(self, message: TinkerMessage) -> types.StepResult:
+    async def process_message(self, message: TinkerMessage) -> SingleTurnStepResult:
         if isinstance(message["content"], str):
             text_content = message["content"]
         else:
@@ -116,36 +122,24 @@ class SingleTurnEnv(Env):
             error_message = "No text content in the message."
             new_message = TinkerMessage(role="user", content=error_message)
             self.history.append(new_message)
-            return types.StepResult(
+            return SingleTurnStepResult(
                 reward=0.0,
                 episode_done=True,
                 next_observation=self.renderer.build_generation_prompt(self.history),
                 next_stop_condition=self.renderer.get_stop_sequences(),
-                metrics=dict(
-                    no_text_content=1.0,
-                    no_code_found=0.0,
-                    code_did_not_compile=0.0,
-                    verifier_failed=0.0,
-                    verifier_error=0.0,
-                ),
+                conclusion="no_text_content",
             )
         code = extract_rust_code(text_content)
         if not code:
             error_message = "No code found in the message. Make sure you wrap the code in ```rust ... ```."
             new_message = TinkerMessage(role="user", content=error_message)
             self.history.append(new_message)
-            return types.StepResult(
+            return SingleTurnStepResult(
                 reward=0.0,
                 episode_done=True,
                 next_observation=self.renderer.build_generation_prompt(self.history),
                 next_stop_condition=self.renderer.get_stop_sequences(),
-                metrics=dict(
-                    no_text_content=0.0,
-                    no_code_found=1.0,
-                    code_did_not_compile=0.0,
-                    verifier_failed=0.0,
-                    verifier_error=0.0,
-                ),
+                conclusion="no_code_found",
             )
 
         await self.rust_env.set_content("src/main.rs", code)
@@ -153,30 +147,20 @@ class SingleTurnEnv(Env):
         new_message = TinkerMessage(role="user", content=output)
         self.history.append(new_message)
         if not success:
-            return types.StepResult(
+            return SingleTurnStepResult(
                 reward=0.0,
                 episode_done=True,
                 next_observation=self.renderer.build_generation_prompt(self.history),
                 next_stop_condition=self.renderer.get_stop_sequences(),
-                metrics=dict(
-                    no_text_content=0.0,
-                    no_code_found=0.0,
-                    code_did_not_compile=1.0,
-                    verifier_failed=0.0,
-                    verifier_error=0.0,
-                ),
+                conclusion="code_did_not_compile",
             )
         reward, reward_metrics = await self.reward_fn(self.history)
-        return types.StepResult(
+        return SingleTurnStepResult(
             reward=reward,
             episode_done=True,
             next_observation=self.renderer.build_generation_prompt(self.history),
             next_stop_condition=self.renderer.get_stop_sequences(),
-            metrics=dict(
-                no_text_content=0.0,
-                no_code_found=0.0,
-                **reward_metrics,
-            ),
+            conclusion="success",
         )
 
     async def get_state(self) -> SingleTurnEnvState:
@@ -189,7 +173,6 @@ class SingleTurnEnv(Env):
         env_state: SingleTurnEnvState,
         renderer: Renderer,
         verifier: Verifier,
-        max_trajectory_tokens: int = 32 * 1024,
     ) -> Self:
         exclude = ["target", ".git"]
         tree_structure = await rust_env.tree(".", exclude=exclude, truncate=20)
@@ -249,7 +232,6 @@ async def build_single_turn_env(
     env_state: SingleTurnEnvState,
     renderer: Renderer,
     verifier: Verifier,
-    max_trajectory_tokens: int = 32 * 1024,
 ) -> AsyncGenerator[SingleTurnEnv, None]:
     async with RustCodingEnvironment(image_name=env_state.image_name) as rust_env:
         yield await SingleTurnEnv.from_env_state(
@@ -257,5 +239,4 @@ async def build_single_turn_env(
             env_state=env_state,
             renderer=renderer,
             verifier=verifier,
-            max_trajectory_tokens=max_trajectory_tokens,
         )
