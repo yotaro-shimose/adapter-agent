@@ -1,10 +1,13 @@
 import logging
+import re
 from typing import cast
 
 from agents.extensions.models.litellm_model import LitellmModel
 from oai_utils.tinker import TinkerModel
 from tinker_cookbook.renderers.base import Message as TinkerMessage
+from tinker_cookbook.renderers.base import TextPart, ThinkingPart
 
+from adapter_agent.data import QA
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.process.rewire_session import (
     RewireSessionResult,
@@ -20,6 +23,7 @@ from adapter_agent.rl.env.simplified_solver import (
     build_simplified_solver_env,
 )
 from adapter_agent.rl.litellm_completer import LitellmMessageCompleter
+from adapter_agent.util.exception import MaximumContextExceeded
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +37,8 @@ async def _rewire_solution(
     i: int,
     init_metrics: dict,
     last_assistant_msg: TinkerMessage,
+    trials: list[list[TinkerMessage]],
 ) -> RewireSessionResult | None:
-    import re
 
     if isinstance(last_assistant_msg["content"], str):
         final_text = last_assistant_msg["content"]
@@ -93,9 +97,6 @@ Okay, let's see. [Your reasoning here...]
             max_tokens=None,  # type: ignore
         )
 
-    from tinker_cookbook.renderers.base import Message as TinkerMessage
-    from tinker_cookbook.renderers.base import TextPart, ThinkingPart
-
     internalizer_messages = [
         TinkerMessage(role="system", content=PROMPT2),
         TinkerMessage(
@@ -137,8 +138,6 @@ Okay, let's see. [Your reasoning here...]
     execution_output, _ = await msg_env.rust_env.run_cargo()
     main_rs_content = await msg_env.rust_env.view_file("src/main.rs")
 
-    from adapter_agent.data import QA
-
     qa = QA(question=task.instruction, answer=answer_str)
 
     verification_result = await verifier.verify(
@@ -177,6 +176,7 @@ Okay, let's see. [Your reasoning here...]
             messages=whole_traj,
             num_rewire=i + 1,
             metrics=init_metrics | metrics_with_prefix(metrics, f"rewire{i + 1}"),
+            trials=trials,
         )
     else:
         logger.debug(
@@ -191,16 +191,27 @@ async def run_rewiring_loop(
     rewirer_model: LitellmModel | TinkerModel,
     task: Task,
     max_rewire: int,
-    init_metrics: dict,
+    max_turns: int,
+    init_metrics: dict | None = None,
+    init_trials: list[list[TinkerMessage]] | None = None,
+    qwen_no_think: bool = False,
 ) -> RewireSessionResult:
+    if init_metrics is None:
+        init_metrics = {}
+    if init_trials is not None:
+        trials = init_trials
+    else:
+        trials: list[list[TinkerMessage]] = []
     for i in range(max_rewire):
-        ss_state = SimplifiedSolverEnvState.numrs2(task=task)
+        ss_state = SimplifiedSolverEnvState.numrs2(
+            task=task, qwen_no_think=qwen_no_think
+        )
         async with build_simplified_solver_env(
             env_state=ss_state,
             renderer=solver_model.renderer,
             verifier=verifier,
             rust_doc_analyzer=verifier.rust_doc_analyzer,
-            max_turns=10,
+            max_turns=max_turns,
         ) as env:
             msg_env = cast(SimplifiedSolverEnv, env.message_env)
             if isinstance(rewirer_model, LitellmModel):
@@ -218,13 +229,28 @@ async def run_rewiring_loop(
 
             ob = await msg_env.initial_observation()
             while True:
-                ac_message = await completer(ob)
+                try:
+                    ac_message = await completer(ob)
+                except MaximumContextExceeded:
+                    logger.debug(
+                        "Maximum context length exceeded during the rewiring loop"
+                    )
+                    step_result = None
+                    ob[-1] = TinkerMessage(
+                        role="tool",
+                        content="The result of your action resulted in context length overflow.",
+                    )
+                    break
+
                 step_result = await msg_env.step(ac_message)
                 ob = step_result.next_messages
                 if step_result.episode_done:
                     break
+            trials.append(ob)
 
-            if LLMAsAJudge.is_successful_reward(step_result.reward):
+            if step_result is not None and LLMAsAJudge.is_successful_reward(
+                step_result.reward
+            ):
                 # Retrieve the final valid Rust code from the environment history
                 # Assuming the last assistant message before reward contains the code
                 last_assistant_msg = next(
@@ -239,6 +265,7 @@ async def run_rewiring_loop(
                     i=i,
                     init_metrics=init_metrics,
                     last_assistant_msg=last_assistant_msg,
+                    trials=trials,
                 )
                 if result is not None:
                     return result
@@ -249,5 +276,7 @@ async def run_rewiring_loop(
                 logger.info(f"Failed to solve after {i + 1} rewirings")
     logger.info("Failed to solve after max_rewire")
     return RewireSessionResult.error(
-        task=task, error_message="Failed to solve after max_rewire"
+        task=task,
+        error_message="Failed to solve after max_rewire",
+        trials=trials,
     )

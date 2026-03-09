@@ -36,15 +36,19 @@ class SimplifiedSolverEnvState:
     library_name: str
     prethink: str | None
     messages: list[TinkerMessage]
+    qwen_no_think: bool = False
 
     @classmethod
-    def numrs2(cls, task: Task, prethink: str | None = None) -> Self:
+    def numrs2(
+        cls, task: Task, prethink: str | None = None, qwen_no_think: bool = False
+    ) -> Self:
         return cls(
             task=task,
             library_name="numrs2",
             image_name="coder-mcp-numrs2:latest",
             prethink=prethink,
             messages=[],
+            qwen_no_think=qwen_no_think,
         )
 
     def with_messages(self, messages: list[TinkerMessage]) -> Self:
@@ -267,10 +271,11 @@ Note you MUST submit your answer after running the code and verifying the output
 </HowTo>
 
 <Guidelines>
-Once again, you MUST verify your answer. You should make your best efforts to avoid hallucination and make sure your answer is correct.
-Note your solution has to be fully self-contained including both fully functioning source code and explanation.
-Your final answer must include exactly one ```rust\n<your_code_here>\n``` block. It's content will be pasted to main.rs and executed for verification.
-When using the `search` tool, it is highly recommended to use only one keyword such as "array" or "conv2d" otherwise the search tool does not return anything.
+Verification: Once again, you MUST verify your answer. You should make your best efforts to avoid hallucination and make sure your answer is correct.
+Self-contained: Note your solution has to be fully self-contained including both fully functioning source code and explanation.
+Code block inclusion: Your final answer must include exactly one ```rust\n<your_code_here>\n``` block. It's content will be pasted to main.rs and executed for verification.
+Simple Search Keyword: When using the `search` tool, it is highly recommended to use only one keyword such as "array" or "conv2d" otherwise the search tool does not return anything.
+Error Reflection: If replace_and_run fails, analyze the error carefully. WHen you find your understanding about the library is wrong, use search tool again.
 </Guidelines>"""
 
     initial_message = f"""<Task>
@@ -284,6 +289,8 @@ When using the `search` tool, it is highly recommended to use only one keyword s
 <Current src/main.rs>
 {CARGO_INIT_MAIN_RS}
 </Current src/main.rs>"""
+    if env_state.qwen_no_think:
+        initial_message = "/no_think " + initial_message
 
     system_prompt_with_tools = _inject_tools_into_prompt(renderer, tools, PROMPT)
     return system_prompt_with_tools + [

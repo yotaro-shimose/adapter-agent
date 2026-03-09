@@ -3,6 +3,7 @@ from dataclasses import dataclass
 
 from agents.extensions.models.litellm_model import LitellmModel
 from oai_utils.tinker import TinkerModel
+from tinker_cookbook.renderers.base import Message as TinkerMessage
 from tinker_cookbook.rl.types import (
     Trajectory,
     Transition,
@@ -47,6 +48,7 @@ async def rewire_session_single_turn(
     max_rewire: int,
 ) -> RewireSessionResult:
     state = SingleTurnEnvState.numrs2(task=task)
+    trials: list[list[TinkerMessage]] = []
     try:
         ret = await solve_verify_tinker_single_turn(
             solver_model=solver_model,
@@ -55,9 +57,10 @@ async def rewire_session_single_turn(
         )
     except EnvironmentError as e:
         logger.error(f"Failed to solve: {e}")
-        return RewireSessionResult.enviroment_error(task=task, error_message=str(e))
+        return RewireSessionResult.error(task=task, error_message=str(e), trials=trials)
     log_trajectory_if_debug(ret.env_state.messages)
     init_metrics = metrics_with_prefix(ret.metrics, "first")
+    trials.append(ret.env_state.messages)
 
     if ret.is_success():
         logger.info("Successfully solved in first attempt")
@@ -66,6 +69,7 @@ async def rewire_session_single_turn(
             messages=ret.env_state.messages,
             num_rewire=0,
             metrics=init_metrics,
+            trials=trials,
         )
     # Rewire
     return await run_rewiring_loop(
@@ -74,8 +78,9 @@ async def rewire_session_single_turn(
         rewirer_model=rewirer_model,
         task=task,
         max_rewire=max_rewire,
-        init_metrics={},
-        # init_metrics=init_metrics,
+        init_metrics=init_metrics,
+        init_trials=trials,
+        max_turns=5,
     )
 
 

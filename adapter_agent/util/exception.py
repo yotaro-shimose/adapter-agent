@@ -1,0 +1,2 @@
+class MaximumContextExceeded(Exception):
+    pass

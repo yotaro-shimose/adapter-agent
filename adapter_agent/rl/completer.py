@@ -9,6 +9,8 @@ from tinker_cookbook.completers import (
     TokensWithLogprobs,
 )
 
+from adapter_agent.util.exception import MaximumContextExceeded
+
 
 @dataclass
 class TinkerTokenCompleter(TokenCompleter):
@@ -70,16 +72,27 @@ class TinkerMessageCompleter(MessageCompleter):
         model_input = self.renderer.build_generation_prompt(messages)
 
         # Sample from the model
-        response = await self.sampling_client.sample_async(
-            model_input,
-            num_samples=1,
-            sampling_params=tinker.SamplingParams(
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-                stop=self.stop_condition,
-            ),
-        )
-
+        try:
+            response = await self.sampling_client.sample_async(
+                model_input,
+                num_samples=1,
+                sampling_params=tinker.SamplingParams(
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    stop=self.stop_condition,
+                ),
+            )
+        except tinker.APIStatusError as e:
+            if (
+                e.status_code == 400
+                and "Prompt length plus max_tokens exceeds the model's context window"
+                in e.message
+            ):
+                raise MaximumContextExceeded(e.message) from e
+            else:
+                raise
+        except Exception:
+            raise
         # Decode the response
         parsed_message, _success = self.renderer.parse_response(
             response.sequences[0].tokens

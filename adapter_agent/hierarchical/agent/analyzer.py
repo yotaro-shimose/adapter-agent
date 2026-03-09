@@ -1,42 +1,28 @@
 import logging
+import re
 from dataclasses import dataclass
 
-from coder_mcp.runtime.runtime import Runtime
 from oai_utils.agent import AgentsSDKModel, AgentWrapper
-from pydantic import BaseModel
+from tinker_cookbook.renderers.base import Message as TinkerMessage
 
 from adapter_agent.hierarchical.agent.base import BaseAgent
-from adapter_agent.hierarchical.types import Task, Trajectory
+from adapter_agent.hierarchical.agent.rewirer import format_trajectory_transcript
+from adapter_agent.hierarchical.types import Task
 
 logger = logging.getLogger(__name__)
 
 
-class TaskResponse(BaseModel):
-    instruction: str
-
-    def to_task(self) -> Task:
-        return Task.from_instruction(self.instruction)
-
-
 @dataclass(kw_only=True)
 class Analyzer[T: AgentsSDKModel](BaseAgent[T]):
-    async def analyze_trajectory(
-        self, trajectory: Trajectory, runtime: Runtime
-    ) -> Task:
+    async def analyze_trajectory(self, trajectory: list[TinkerMessage]) -> Task:
         """
         Trajectoryを分析してなぜSolverが失敗したのかを理解する。
         Solverが解けるであろうより小さな問題を生成する。
         """
-        logger.info("Details: Analyzing failure trajectory...")
-
-        PROMPT = f"""
+        PROMPT = """
 You are a Senior Engineer analyzing a Junior Engineer's failure.
 The Junior Engineer tried to solve a task but failed.
-You can see the current state of the workspace where the Junior Engineer finished execution.
 The workspace is a cargo-initialized project.
-
-Here is the execution log (Trajectory):
-{trajectory.as_str()}
 
 Your goal is to create a *simpler* sub-task that helps bridge the gap.
 The sub-task should be:
@@ -45,20 +31,29 @@ The sub-task should be:
 3. Related to the specific failure point.
 
 Return a new Task with a clear instruction.
+OUTPUT FORMAT:
+Provide your reasoning, and then output the subtask instruction inside a <subtask></subtask> xml block.
 """
         # Analyzer doesn't necessarily need runtime tools, but consistency helps.
         # We can run it without coder_mcp if it's just text processing, but let's give it just in case.
-        async with runtime.coder_mcp() as coder_mcp:
-            agent = AgentWrapper[TaskResponse].create(
-                name="Analyzer",
-                instructions=PROMPT,
-                model=self.model,
-                mcp_servers=[coder_mcp],
-                output_type=TaskResponse,
+        agent = AgentWrapper[str].create(
+            name="Analyzer",
+            instructions=PROMPT,
+            model=self.model,
+        )
+
+        result = await agent.run(f"""\
+Analyze the following trajectory and generate a sub-task.
+<Trajectory>
+{format_trajectory_transcript(trajectory)}
+</Trajectory>
+""")
+        response_text = result.final_output()
+        match = re.search(r"<subtask>(.*?)</subtask>", response_text, re.DOTALL)
+        if not match:
+            raise ValueError(
+                f"Could not find <subtask> block in Analyzer response: {response_text}"
             )
 
-            result = await agent.run(
-                "Analyze the trajectory and generate a sub-task.", max_turns=30
-            )
-            task = result.final_output().to_task()
-            return task
+        task = Task.from_instruction(match.group(1).strip())
+        return task

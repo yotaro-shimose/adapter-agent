@@ -410,9 +410,7 @@ async def main():
             r_min=0.5,
             library=Library(name="numrs2", local_path=Path("repositories/numrs")),
             image_name="coder-mcp-numrs2:latest",
-            dataset_path=Path(
-                "logs/Adapter_Agent/Adapter Agent_20260307_010745/sft_trajectories.json"
-            ),
+            dataset_path=Path("data/sft/gen_20260218_182450/sft_dataset.json"),
         ),
         model_loading_settings=ModelLoadingSettings(
             # model_name="Qwen/Qwen3-8B",
@@ -424,7 +422,8 @@ async def main():
 
     setup_base_loglevel()
     ml_logger = setup_logging(cfg)
-
+    # Dataset
+    qas_data = load_qas(cfg)
     # Tinker Clients
     service_client, training_client = await setup_tinker_clients(
         cfg.model_loading_settings
@@ -437,8 +436,6 @@ async def main():
         cfg.model_loading_settings,
         rust_doc_analyzer,
     )
-    # Dataset
-    qas_data = load_qas(cfg)
 
     sampling_client_manager = SharedSamplingClient(model.sampling_client)
     # Shared results list for CSV export

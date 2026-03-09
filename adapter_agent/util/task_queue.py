@@ -1,14 +1,25 @@
 import asyncio
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from dataclasses import dataclass
+from typing import AsyncIterator, Literal, Self
 
 
-class TaskQueue[T](asyncio.Queue[T]):
+@dataclass
+class TaskQueue[T]:
     """
     アイテム管理と終了検知機能を備えたカスタムQueue
     """
 
-    _unfinished_tasks: int
+    queue: asyncio.Queue[T]
+
+    @classmethod
+    def create(cls, order: Literal["FIFO", "LIFO"]) -> Self:
+        if order == "FIFO":
+            return cls(queue=asyncio.Queue[T]())
+        elif order == "LIFO":
+            return cls(queue=asyncio.LifoQueue[T]())
+        else:
+            raise ValueError("Invalid order")
 
     @asynccontextmanager
     async def get_item_manager(self) -> AsyncIterator[T]:
@@ -16,11 +27,11 @@ class TaskQueue[T](asyncio.Queue[T]):
         アイテムを取得し、スコープを抜ける際に自動で task_done() を呼び出す
         コンテキストマネージャ。
         """
-        item: T = await self.get()
+        item: T = await self.queue.get()
         try:
             yield item
         finally:
-            self.task_done()
+            self.queue.task_done()
 
     def is_done(self) -> bool:
         """
@@ -29,4 +40,11 @@ class TaskQueue[T](asyncio.Queue[T]):
         """
         # empty() は未処理のアイテムがないことを確認
         # _unfinished_tasks は処理中（get済みだがtask_done未完了）の数を確認
-        return self.empty() and self._unfinished_tasks == 0
+        unfinished_tasks: int = self.queue._unfinished_tasks  # type: ignore
+        return self.queue.empty() and unfinished_tasks == 0
+
+    async def put(self, item: T) -> None:
+        await self.queue.put(item)
+
+    def qsize(self) -> int:
+        return self.queue.qsize()
