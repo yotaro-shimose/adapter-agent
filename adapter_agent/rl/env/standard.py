@@ -23,6 +23,7 @@ from adapter_agent.hierarchical.types import Task
 from adapter_agent.rl.env.injection import _inject_tools_into_prompt
 from adapter_agent.rl.env.prefillable_env import PrefillableMessageEnv
 from adapter_agent.rl.env.reward import LLMAsAJudge
+from adapter_agent.util.exception import CodingEnvironmentError
 
 logger = logging.getLogger(__name__)
 
@@ -150,10 +151,6 @@ class ResumedEnvState(EnvStateBase):
 type EnvState = InitEnvState | ResumedEnvState
 
 
-class EnvironmentError(Exception):
-    pass
-
-
 @dataclass
 class RustCoderEnv(Env):
     initial_state: EnvStateBase
@@ -165,7 +162,7 @@ class RustCoderEnv(Env):
         try:
             return await self.internal.initial_observation()
         except Exception as e:
-            raise EnvironmentError(f"Failed to get initial observation: {e}")
+            raise CodingEnvironmentError(f"Failed to get initial observation: {e}")
 
     async def step(self, action: Action) -> StepResult:
         try:
@@ -174,7 +171,7 @@ class RustCoderEnv(Env):
             self.code_history.append(code)
             return result
         except Exception as e:
-            raise EnvironmentError(f"Failed to step: {e}")
+            raise CodingEnvironmentError(f"Failed to step: {e}")
 
     async def get_state(self) -> ResumedEnvState:
         message_env = self.internal.message_env

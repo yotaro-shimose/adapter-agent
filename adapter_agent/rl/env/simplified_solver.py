@@ -27,7 +27,7 @@ from adapter_agent.hierarchical.types import Task
 from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
 from adapter_agent.rl.env.injection import _inject_tools_into_prompt
 from adapter_agent.rl.env.reward import LLMAsAJudgeSingleTurn
-from adapter_agent.rl.env.standard import EnvironmentError
+from adapter_agent.util.exception import CodingEnvironmentError
 from adapter_agent.util.parsing import extract_rust_code
 
 
@@ -305,7 +305,7 @@ class SimplifiedSolverEnv(MessageEnv):
                     conclusion="success",
                 )
         except RustEnvError as e:
-            raise EnvironmentError(f"Environment error during step: {e}") from e
+            raise CodingEnvironmentError(f"Environment error during step: {e}") from e
 
     async def get_state(self) -> SimplifiedSolverEnvState:
         return self.initial_state.with_messages(self.history)

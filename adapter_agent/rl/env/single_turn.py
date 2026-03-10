@@ -20,7 +20,7 @@ from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.rl.env.reward import LLMAsAJudgeSingleTurn
 from adapter_agent.rl.env.simplified_solver import SSConclusion
-from adapter_agent.rl.env.standard import EnvironmentError
+from adapter_agent.util.exception import CodingEnvironmentError
 from adapter_agent.util.parsing import extract_rust_code
 
 logger = logging.getLogger(__name__)
@@ -148,7 +148,7 @@ class SingleTurnEnv(Env):
             await self.rust_env.set_content("src/main.rs", code)
             output, success = await self.rust_env.run_cargo()
         except RustEnvError as e:
-            raise EnvironmentError(
+            raise CodingEnvironmentError(
                 f"Environment error during single turn step: {e}"
             ) from e
 

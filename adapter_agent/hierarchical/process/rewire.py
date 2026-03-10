@@ -25,8 +25,7 @@ from adapter_agent.rl.env.simplified_solver import (
     SimplifiedSolverEnvState,
     build_simplified_solver_env,
 )
-from adapter_agent.rl.env.standard import EnvironmentError
-from adapter_agent.util.exception import MaximumContextExceeded
+from adapter_agent.util.exception import CodingEnvironmentError, MaximumContextExceeded
 
 logger = logging.getLogger(__name__)
 
@@ -233,7 +232,7 @@ async def ss_solve(
 
             try:
                 step_result = await msg_env.step(ac_message)
-            except EnvironmentError as e:
+            except CodingEnvironmentError as e:
                 logger.error(f"Environment error during step: {e}")
                 return RewireSessionResultError(
                     task=task,

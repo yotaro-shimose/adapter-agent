@@ -15,10 +15,8 @@ from oai_utils.async_utils import gather_with_semaphore
 from oai_utils.litellm import litellm_concurrent_limit
 from oai_utils.tinker import TinkerModel, setup_tinkermodel
 from tinker import TrainingClient
-from tinker_cookbook.renderers import TrainOnWhat
 from tinker_cookbook.renderers.base import Message as TinkerMessage
 from tinker_cookbook.renderers.base import Renderer
-from tinker_cookbook.supervised.data import conversation_to_datum
 from tinker_cookbook.utils import ml_log
 from tinker_cookbook.utils.ml_log import Logger as MLLogger
 
@@ -44,7 +42,7 @@ from adapter_agent.rl.config import (
     RolloutParams,
 )
 from adapter_agent.rl.shared_sampling_client import SharedSamplingClient
-from adapter_agent.util.logger_util import setup_base_loglevel
+from adapter_agent.util.logger_util import SuppressExtensionWarning, setup_base_loglevel
 
 litellm.add_function_to_prompt
 
@@ -282,11 +280,6 @@ async def train_worker(
             data_manager.reset_trajectory()
 
 
-class _SuppressExtensionWarning(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        return "train_on_what=ALL_ASSISTANT_MESSAGES" not in record.getMessage()
-
-
 def setup_logging(cfg: RewireSFTConfig) -> MLLogger:
     # Setup logging
     log_root = cfg.experiment_setting.log_root()
@@ -298,11 +291,7 @@ def setup_logging(cfg: RewireSFTConfig) -> MLLogger:
         config=cfg,
     )
     logging.basicConfig(level=logging.INFO)
-
-    logging.getLogger("tinker_cookbook.renderers.base").addFilter(
-        _SuppressExtensionWarning()
-    )
-
+    SuppressExtensionWarning.suppress_trainonwhat_warning()
     logging.getLogger("adapter_agent.hierarchical.agent.rewirer").setLevel(
         # logging.DEBUG
         logging.INFO

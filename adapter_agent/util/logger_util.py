@@ -71,3 +71,14 @@ def setup_base_loglevel():
         agent_logger.addFilter(TruncatingLogFilter())
     if not any(isinstance(f, OpenAITracingFilter) for f in agent_logger.filters):
         agent_logger.addFilter(OpenAITracingFilter())
+
+
+class SuppressExtensionWarning(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "train_on_what=ALL_ASSISTANT_MESSAGES" not in record.getMessage()
+
+    @classmethod
+    def suppress_trainonwhat_warning(cls):
+        logging.getLogger("tinker_cookbook.renderers.base").addFilter(
+            SuppressExtensionWarning()
+        )

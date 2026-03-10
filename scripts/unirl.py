@@ -11,6 +11,7 @@ import numpy as np
 import tinker
 import tinker_cookbook.checkpoint_utils
 import weave  # noqa: F401
+from dotenv import load_dotenv
 from oai_utils.litellm import litellm_concurrent_limit
 from oai_utils.tinker import TinkerModel, setup_tinkermodel
 from pydantic import BaseModel
@@ -47,6 +48,7 @@ from adapter_agent.rl.env.simplified_solver import conclusion_to_metrics
 from adapter_agent.rl.env.single_turn import SingleTurnEnvState
 from adapter_agent.rl.shared_sampling_client import SharedSamplingClient
 from adapter_agent.rl.trajectory import prepare_minibatch_simplified
+from adapter_agent.util.exception import CodingEnvironmentError
 from adapter_agent.util.logger_util import setup_base_loglevel
 from adapter_agent.util.task_queue import TaskQueue
 
@@ -130,7 +132,7 @@ class HybridReplayBuffer:
                     item.item.messages,
                     self.renderer,
                     max_length=None,
-                    train_on_what=TrainOnWhat.ALL_ASSISTANT_MESSAGES,
+                    train_on_what=TrainOnWhat.LAST_ASSISTANT_MESSAGE,
                 )
                 for item in items
             ]
@@ -278,9 +280,9 @@ class UniRLState:
                 self.buffer.sft_store.put(
                     SFTSample(task=item.task, messages=item.rewired)
                 )
-                self.buffer.sft_store.put(
-                    SFTSample(task=item.task, messages=item.trials)
-                )
+                # self.buffer.sft_store.put(
+                #     SFTSample(task=item.task, messages=item.trials)
+                # )
         task = counted_task.item
 
         num_success = sum(
@@ -472,7 +474,7 @@ async def practice_rollout(
             )
             latest_model = state.get_latest_model()
             env_state = SingleTurnEnvState.numrs2(task=task)
-            rets = await asyncio.gather(
+            results = await asyncio.gather(
                 *[
                     solve_verify_tinker_single_turn(
                         solver_model=latest_model,
@@ -480,8 +482,23 @@ async def practice_rollout(
                         verifier=verifier,
                     )
                     for _ in range(practice_rollout_params.rollouts_per_task)
-                ]
+                ],
+                return_exceptions=True,
             )
+            Exception
+            rets = []
+            for r in results:
+                if isinstance(r, CodingEnvironmentError):
+                    logger.warning(
+                        f"Practice worker {worker_id} encountered EnvironmentError: {r}. Excluding from results."
+                    )
+                elif isinstance(r, BaseException):
+                    raise r
+                else:
+                    rets.append(r)
+            if not rets:
+                # If all rollouts failed with EnvironmentError, discard the task
+                continue
             await state.register_practice_group(worker_id=worker_id, items=rets)
 
 
@@ -657,6 +674,7 @@ async def setup_tinker_clients(
 
 
 async def main():
+    load_dotenv()
     cfg = UniRLConfig(
         experiment_setting=ExperimentSettings(
             wandb_project="Adapter Agent UniRL",

@@ -4,12 +4,14 @@ from itertools import chain
 from typing import TypedDict
 
 from coder_mcp.runtime import RustCodingEnvironment
+from coder_mcp.runtime.rust_env import RustEnvError
 from pydantic import BaseModel, ValidationError
 from tinker_cookbook.renderers.base import Message as TinkerMessage
 
 from adapter_agent.data import QA
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.types import Task
+from adapter_agent.util.exception import CodingEnvironmentError
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +40,12 @@ class LLMAsAJudge:
     ) -> tuple[float, dict[str, float]]:
         if len(history) == 0:
             raise ValueError("History for LLMAsAJudge cannot be empty")
-        execution_output, success = await self.rust_env.run_cargo()
+        try:
+            execution_output, success = await self.rust_env.run_cargo()
+        except RustEnvError as e:
+            raise CodingEnvironmentError(
+                f"Environment error during run_cargo: {e}"
+            ) from e
         if not success:
             return 0.0, dict(
                 code_did_not_compile=1.0,
@@ -85,7 +92,12 @@ class LLMAsAJudge:
                 verifier_failed=0.0,
                 verifier_error=0.0,
             )
-        content = await self.rust_env.view_file("src/main.rs")
+        try:
+            content = await self.rust_env.view_file("src/main.rs")
+        except RustEnvError as e:
+            raise CodingEnvironmentError(
+                f"Environment error during view_file: {e}"
+            ) from e
         try:
             verification_result = await self.verifier.verify(
                 qa=QA(
@@ -138,7 +150,12 @@ class LLMAsAJudgeSingleTurn:
     ) -> tuple[float, dict[str, float]]:
         if len(history) == 0:
             raise ValueError("History for LLMAsAJudge cannot be empty")
-        execution_output, success = await self.rust_env.run_cargo()
+        try:
+            execution_output, success = await self.rust_env.run_cargo()
+        except RustEnvError as e:
+            raise CodingEnvironmentError(
+                f"Environment error during run_cargo: {e}"
+            ) from e
         if not success:
             return 0.0, dict(
                 code_did_not_compile=1.0,
@@ -146,7 +163,12 @@ class LLMAsAJudgeSingleTurn:
                 verifier_error=0.0,
             )
 
-        content = await self.rust_env.view_file("src/main.rs")
+        try:
+            content = await self.rust_env.view_file("src/main.rs")
+        except RustEnvError as e:
+            raise CodingEnvironmentError(
+                f"Environment error during view_file: {e}"
+            ) from e
         assistant_messages = [m for m in history if m["role"] == "assistant"]
         if len(assistant_messages) == 0:
             raise ValueError("No assistant messages in history")
