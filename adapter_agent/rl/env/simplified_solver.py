@@ -6,6 +6,7 @@ from typing import Any, Literal, Self, TypedDict, cast
 
 import tinker
 from coder_mcp.runtime import RustCodingEnvironment
+from coder_mcp.runtime.rust_env import RustEnvError
 from tinker_cookbook.completers import StopCondition
 from tinker_cookbook.renderers import Renderer
 from tinker_cookbook.renderers.base import Message as TinkerMessage
@@ -26,6 +27,7 @@ from adapter_agent.hierarchical.types import Task
 from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
 from adapter_agent.rl.env.injection import _inject_tools_into_prompt
 from adapter_agent.rl.env.reward import LLMAsAJudgeSingleTurn
+from adapter_agent.rl.env.standard import EnvironmentError
 from adapter_agent.util.parsing import extract_rust_code
 
 
@@ -59,6 +61,11 @@ class SimplifiedSolverEnvState:
             prethink=self.prethink,
             messages=messages,
         )
+
+
+@dataclass
+class SimplifiedSolverMutableState:
+    remaining_turns: int
 
 
 class SearchTool(Tool):
@@ -97,9 +104,13 @@ class SearchTool(Tool):
 
 
 class ReplaceAndRunTool(Tool):
-    def __init__(self, runtime: RustCodingEnvironment, state_ref: dict[str, Any]):
+    def __init__(
+        self,
+        runtime: RustCodingEnvironment,
+        mutable_state: SimplifiedSolverMutableState,
+    ):
         self.runtime = runtime
-        self.state_ref = state_ref
+        self.mutable_state = mutable_state
 
     @property
     def name(self) -> str:
@@ -128,9 +139,9 @@ class ReplaceAndRunTool(Tool):
         if not replace_success:
             content = replace_ret
         else:
-            self.state_ref["remaining_turns"] -= 1
+            self.mutable_state.remaining_turns -= 1
             run_ret, run_success = await self.runtime.run_cargo()
-            content = f"<TextReplacementPerformed>\n{replace_ret}\n</TextReplacementPerformed>\n<CargoRunResult>\n{run_ret}\n</CargoRunResult>\n<RemainingTurns>\n{self.state_ref['remaining_turns']}\n</RemainingTurns>"
+            content = f"<TextReplacementPerformed>\n{replace_ret}\n</TextReplacementPerformed>\n<CargoRunResult>\n{run_ret}\n</CargoRunResult>\n<RemainingTurns>\n{self.mutable_state.remaining_turns}\n</RemainingTurns>"
 
         assert input.call_id is not None
         msg = TinkerMessage(
@@ -173,20 +184,25 @@ class SSMetrics(TypedDict):
 
 
 def conclusion_to_metrics(conclusion: SSConclusion) -> dict[str, float]:
-    return cast(dict[str, float], SSMetrics(
-        success=1.0 if conclusion == "success" else 0.0,
-        context_length_exceeded=1.0 if conclusion == "context_length_exceeded" else 0.0,
-        no_code_found=1.0 if conclusion == "no_code_found" else 0.0,
-        no_text_content=1.0 if conclusion == "no_text_content" else 0.0,
-        code_did_not_compile=1.0 if conclusion == "code_did_not_compile" else 0.0,
-        verification_failed=1.0 if conclusion == "verification_failed" else 0.0,
-        verification_error=1.0 if conclusion == "verification_error" else 0.0,
-        environment_error=1.0 if conclusion == "environment_error" else 0.0,
-        rewire_failed=1.0 if conclusion == "rewire_failed" else 0.0,
-        max_turns_exceeded=1.0 if conclusion == "max_turns_exceeded" else 0.0,
-        not_finished=1.0 if conclusion == "not_finished" else 0.0,
-        parse_failed=1.0 if conclusion == "parse_failed" else 0.0,
-    ))
+    return cast(
+        dict[str, float],
+        SSMetrics(
+            success=1.0 if conclusion == "success" else 0.0,
+            context_length_exceeded=1.0
+            if conclusion == "context_length_exceeded"
+            else 0.0,
+            no_code_found=1.0 if conclusion == "no_code_found" else 0.0,
+            no_text_content=1.0 if conclusion == "no_text_content" else 0.0,
+            code_did_not_compile=1.0 if conclusion == "code_did_not_compile" else 0.0,
+            verification_failed=1.0 if conclusion == "verification_failed" else 0.0,
+            verification_error=1.0 if conclusion == "verification_error" else 0.0,
+            environment_error=1.0 if conclusion == "environment_error" else 0.0,
+            rewire_failed=1.0 if conclusion == "rewire_failed" else 0.0,
+            max_turns_exceeded=1.0 if conclusion == "max_turns_exceeded" else 0.0,
+            not_finished=1.0 if conclusion == "not_finished" else 0.0,
+            parse_failed=1.0 if conclusion == "parse_failed" else 0.0,
+        ),
+    )
 
 
 @dataclass
@@ -201,15 +217,12 @@ class SimplifiedSolverEnv(MessageEnv):
     rust_doc_analyzer: RustDocAnalyzer
     initial_messages: list[TinkerMessage]
     reward_fn: LLMAsAJudgeSingleTurn
+    mutable_state: SimplifiedSolverMutableState
     history: list[TinkerMessage] = field(default_factory=list)
-    state_ref: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
-        if "remaining_turns" not in self.state_ref:
-            self.state_ref["remaining_turns"] = 10
-
         search_tool = SearchTool(self.rust_doc_analyzer)
-        replace_tool = ReplaceAndRunTool(self.rust_env, self.state_ref)
+        replace_tool = ReplaceAndRunTool(self.rust_env, self.mutable_state)
         self.tools = {
             search_tool.name: search_tool,
             replace_tool.name: replace_tool,
@@ -221,75 +234,78 @@ class SimplifiedSolverEnv(MessageEnv):
         return self.history
 
     async def step(self, message: TinkerMessage) -> SSStepResult:
-        self.history.append(message)
+        try:
+            self.history.append(message)
+            self.mutable_state.remaining_turns -= 1
 
-        tool_calls: list[ToolCall] = list(message.get("tool_calls", []))
-        if tool_calls:
-            tool_results = await asyncio.gather(
-                *[handle_tool_call(self.tools, tc) for tc in tool_calls]  # type: ignore
-            )
-            for tool_result in tool_results:
-                for msg in tool_result.messages:
-                    self.history.append(msg)
-
-            if self.state_ref["remaining_turns"] <= 0:
-                return SSStepResult(
-                    reward=0.0,
-                    episode_done=True,
-                    next_messages=self.history,
-                    conclusion="max_turns_exceeded",
+            tool_calls: list[ToolCall] = list(message.get("tool_calls", []))
+            if tool_calls:
+                tool_results = await asyncio.gather(
+                    *[handle_tool_call(self.tools, tc) for tc in tool_calls]  # type: ignore
                 )
+                for tool_result in tool_results:
+                    for msg in tool_result.messages:
+                        self.history.append(msg)
 
-            return SSStepResult(
-                reward=0.0,
-                episode_done=False,
-                next_messages=self.history,
-                conclusion="not_finished",
-            )
-
-        else:
-            if isinstance(message["content"], str):
-                text_content = message["content"]
-            else:
-                text_content = "".join(
-                    part["text"]
-                    for part in message["content"]
-                    if part["type"] == "text"
-                )
-
-            code = extract_rust_code(text_content)
-            if not code:
-                new_message = TinkerMessage(
-                    role="user",
-                    content="No code found in the message. Make sure you wrap the final valid runnable code in ```rust ... ```.",
-                )
-                self.history.append(new_message)
-
-                self.state_ref["remaining_turns"] -= 1
-                if self.state_ref["remaining_turns"] <= 0:
+                if self.mutable_state.remaining_turns <= 0:
                     return SSStepResult(
                         reward=0.0,
                         episode_done=True,
                         next_messages=self.history,
                         conclusion="max_turns_exceeded",
                     )
+
                 return SSStepResult(
                     reward=0.0,
                     episode_done=False,
                     next_messages=self.history,
-                    conclusion="no_code_found",
+                    conclusion="not_finished",
                 )
 
-            await self.rust_env.set_content("src/main.rs", code)
+            else:
+                if isinstance(message["content"], str):
+                    text_content = message["content"]
+                else:
+                    text_content = "".join(
+                        part["text"]
+                        for part in message["content"]
+                        if part["type"] == "text"
+                    )
 
-            reward, reward_metrics = await self.reward_fn(self.history)
+                code = extract_rust_code(text_content)
+                if not code:
+                    new_message = TinkerMessage(
+                        role="user",
+                        content="No code found in the message. Make sure you wrap the final valid runnable code in ```rust ... ```.",
+                    )
+                    self.history.append(new_message)
 
-            return SSStepResult(
-                reward=reward,
-                episode_done=True,
-                next_messages=self.history,
-                conclusion="success",
-            )
+                    if self.mutable_state.remaining_turns <= 0:
+                        return SSStepResult(
+                            reward=0.0,
+                            episode_done=True,
+                            next_messages=self.history,
+                            conclusion="max_turns_exceeded",
+                        )
+                    return SSStepResult(
+                        reward=0.0,
+                        episode_done=False,
+                        next_messages=self.history,
+                        conclusion="no_code_found",
+                    )
+
+                await self.rust_env.set_content("src/main.rs", code)
+
+                reward, reward_metrics = await self.reward_fn(self.history)
+
+                return SSStepResult(
+                    reward=reward,
+                    episode_done=True,
+                    next_messages=self.history,
+                    conclusion="success",
+                )
+        except RustEnvError as e:
+            raise EnvironmentError(f"Environment error during step: {e}") from e
 
     async def get_state(self) -> SimplifiedSolverEnvState:
         return self.initial_state.with_messages(self.history)
@@ -446,10 +462,10 @@ async def build_simplified_solver_env(
         exclude = ["target", ".git"]
         tree_structure = await rust_env.tree(".", exclude=exclude, truncate=20)
 
-        state_ref = {"remaining_turns": max_turns}
+        mutable_state = SimplifiedSolverMutableState(remaining_turns=max_turns)
         tools_list = [
             SearchTool(rust_doc_analyzer),
-            ReplaceAndRunTool(rust_env, state_ref),
+            ReplaceAndRunTool(rust_env, mutable_state),
         ]
 
         msg_env = SimplifiedSolverEnv(
@@ -468,7 +484,7 @@ async def build_simplified_solver_env(
                 verifier=verifier,
                 tree_structure=tree_structure,
             ),
-            state_ref=state_ref,
+            mutable_state=mutable_state,
         )
 
         yield SimplifiedSolverTokenEnv(

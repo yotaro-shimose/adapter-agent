@@ -13,11 +13,11 @@ class TaskQueue[T]:
     queue: asyncio.Queue[T]
 
     @classmethod
-    def create(cls, order: Literal["FIFO", "LIFO"]) -> Self:
+    def create(cls, order: Literal["FIFO", "LIFO"], maxsize: int) -> Self:
         if order == "FIFO":
-            return cls(queue=asyncio.Queue[T]())
+            return cls(queue=asyncio.Queue[T](maxsize=maxsize))
         elif order == "LIFO":
-            return cls(queue=asyncio.LifoQueue[T]())
+            return cls(queue=asyncio.LifoQueue[T](maxsize=maxsize))
         else:
             raise ValueError("Invalid order")
 
@@ -48,3 +48,7 @@ class TaskQueue[T]:
 
     def qsize(self) -> int:
         return self.queue.qsize()
+
+    @property
+    def maxsize(self) -> int:
+        return self.queue.maxsize

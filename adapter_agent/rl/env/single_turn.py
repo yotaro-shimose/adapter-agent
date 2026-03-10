@@ -5,6 +5,7 @@ from typing import Self
 
 import tinker
 from coder_mcp.runtime import RustCodingEnvironment
+from coder_mcp.runtime.rust_env import RustEnvError
 from tinker_cookbook.completers import StopCondition
 from tinker_cookbook.renderers import Renderer
 from tinker_cookbook.renderers.base import Message as TinkerMessage
@@ -19,6 +20,7 @@ from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.rl.env.reward import LLMAsAJudgeSingleTurn
 from adapter_agent.rl.env.simplified_solver import SSConclusion
+from adapter_agent.rl.env.standard import EnvironmentError
 from adapter_agent.util.parsing import extract_rust_code
 
 logger = logging.getLogger(__name__)
@@ -142,8 +144,14 @@ class SingleTurnEnv(Env):
                 conclusion="no_code_found",
             )
 
-        await self.rust_env.set_content("src/main.rs", code)
-        output, success = await self.rust_env.run_cargo()
+        try:
+            await self.rust_env.set_content("src/main.rs", code)
+            output, success = await self.rust_env.run_cargo()
+        except RustEnvError as e:
+            raise EnvironmentError(
+                f"Environment error during single turn step: {e}"
+            ) from e
+
         new_message = TinkerMessage(role="user", content=output)
         self.history.append(new_message)
         if not success:

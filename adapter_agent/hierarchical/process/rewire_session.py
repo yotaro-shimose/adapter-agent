@@ -1,7 +1,6 @@
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Self
 
 import numpy as np
 from oai_utils.tinker import TinkerModel
@@ -48,35 +47,45 @@ def _log_trajectory_debug(transcript: str) -> None:
     )
 
 
-@dataclass
-class RewireSessionResult:
+@dataclass(kw_only=True)
+class RewireSessionResultNormal:
     task: Task
-    rewired: list[TinkerMessage] | None
-    conclusion: SSConclusion
     trials: list[TinkerMessage]
+    conclusion: SSConclusion
+    trajectory: Trajectory
+    reward: float
 
-    @classmethod
-    def error(
-        cls, task: Task, conclusion: SSConclusion, trials: list[TinkerMessage]
-    ) -> Self:
-        return cls(task=task, rewired=None, trials=trials, conclusion=conclusion)
 
-    @classmethod
-    def success(
-        cls,
-        task: Task,
-        trials: list[TinkerMessage],
-        rewired: list[TinkerMessage],
-    ) -> Self:
-        return cls(
-            task=task,
-            trials=trials,
-            conclusion="success",
-            rewired=rewired,
-        )
+@dataclass(kw_only=True)
+class RewireSessionResultSuccess(RewireSessionResultNormal):
+    conclusion: SSConclusion = "success"
+    rewired: list[TinkerMessage]
+    reward: float = 1.0
 
     def is_successful(self) -> bool:
-        return self.conclusion == "success"
+        return True
+
+
+@dataclass(kw_only=True)
+class RewireSessionResultFailure(RewireSessionResultNormal):
+    reward: float = 0.0
+
+    def is_successful(self) -> bool:
+        return False
+
+
+@dataclass(kw_only=True)
+class RewireSessionResultError:
+    task: Task
+    conclusion: SSConclusion
+
+    def is_successful(self) -> bool:
+        return False
+
+
+type RewireSessionResult = (
+    RewireSessionResultSuccess | RewireSessionResultFailure | RewireSessionResultError
+)
 
 
 @dataclass

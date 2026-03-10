@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal, Mapping, Self, Sequence
 
+import numpy as np
 import tinker
 import tinker_cookbook.checkpoint_utils
 import weave  # noqa: F401
@@ -25,11 +26,14 @@ from tinker_cookbook.utils.ml_log import Logger as MLLogger
 
 from adapter_agent.data import QASFTDataset
 from adapter_agent.hierarchical.agent.analyzer import Analyzer
+from adapter_agent.hierarchical.agent.task_verifier import TaskVerifier
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.gh import Library
 from adapter_agent.hierarchical.process.rewire import ss_solve
 from adapter_agent.hierarchical.process.rewire_session import (
     RewireSessionResult,
+    RewireSessionResultNormal,
+    RewireSessionResultSuccess,
 )
 from adapter_agent.hierarchical.process.rewire_session_single_turn import (
     SolveVerifyTinkerSingleTurnResult,
@@ -66,14 +70,22 @@ class RLSample:
     task: Task
     group: TrajectoryGroup
 
+    def is_uniform_reward(self) -> bool:
+        if len(self.group.final_rewards_G) == 0:
+            return True
+        return all(
+            r == self.group.final_rewards_G[0] for r in self.group.final_rewards_G
+        )
+
+
+type BatchType = Literal["Study", "Practice"]
+
 
 class TinkerBatch(BaseModel):
     datum: list[Datum]
     loss_fn: LossFnType
     tasks: dict[str, Counted[Task]]
-
-
-type BatchType = Literal["Study", "Practice"]
+    batch_type: BatchType
 
 
 @dataclass
@@ -103,8 +115,8 @@ class CountDownStore[T]:
 
 @dataclass
 class HybridReplayBuffer:
-    min_batch_size: int
-    max_batch_size: int
+    sft_batch_size: int
+    rl_group_size: int
     sft_store: CountDownStore[SFTSample]
     rl_store: CountDownStore[RLSample]
     renderer: Renderer
@@ -112,13 +124,13 @@ class HybridReplayBuffer:
     async def get_batch(self) -> TinkerBatch | None:
         batch_type = self.choose_available_batch_type()
         if batch_type == "Study":
-            items = self.sft_store.get_batch(self.max_batch_size)
+            items = self.sft_store.get_batch(self.sft_batch_size)
             datum = [
                 conversation_to_datum(
                     item.item.messages,
                     self.renderer,
                     max_length=None,
-                    train_on_what=TrainOnWhat.LAST_ASSISTANT_MESSAGE,
+                    train_on_what=TrainOnWhat.ALL_ASSISTANT_MESSAGES,
                 )
                 for item in items
             ]
@@ -126,9 +138,11 @@ class HybridReplayBuffer:
                 item.item.task.id: Counted(item=item.item.task, count=item.count)
                 for item in items
             }
-            return TinkerBatch(datum=datum, loss_fn="cross_entropy", tasks=tasks)
+            return TinkerBatch(
+                datum=datum, loss_fn="cross_entropy", tasks=tasks, batch_type="Study"
+            )
         elif batch_type == "Practice":
-            items = self.rl_store.get_batch(self.max_batch_size)
+            items = self.rl_store.get_batch(self.rl_group_size)
             traj_groups = [item.item.group for item in items]
             datum, _prepare_minibatch_metrics = await prepare_minibatch_simplified(
                 traj_groups
@@ -141,6 +155,7 @@ class HybridReplayBuffer:
                     item.item.task.id: Counted(item=item.item.task, count=item.count)
                     for item in items
                 },
+                batch_type="Practice",
             )
         else:
             return None
@@ -148,9 +163,9 @@ class HybridReplayBuffer:
     def choose_available_batch_type(self) -> BatchType | None:
         availables: list[BatchType] = []
 
-        if len(self.sft_store) >= self.min_batch_size:
+        if len(self.sft_store) >= self.sft_batch_size:
             availables.append("Study")
-        if len(self.rl_store) >= self.min_batch_size:
+        if len(self.rl_store) >= self.rl_group_size:
             availables.append("Practice")
 
         if len(availables) == 0:
@@ -170,16 +185,17 @@ class HybridReplayBuffer:
     @classmethod
     def create(
         cls,
-        min_batch_size: int,
-        max_batch_size: int,
-        max_reuse: int,
+        sft_batch_size: int,
+        rl_group_size: int,
+        max_sft_reuse: int,
+        max_rl_reuse: int,
         renderer: Renderer,
     ) -> Self:
         return cls(
-            min_batch_size=min_batch_size,
-            max_batch_size=max_batch_size,
-            sft_store=CountDownStore({}, init_count=max_reuse),
-            rl_store=CountDownStore({}, init_count=max_reuse),
+            sft_batch_size=sft_batch_size,
+            rl_group_size=rl_group_size,
+            sft_store=CountDownStore({}, init_count=max_sft_reuse),
+            rl_store=CountDownStore({}, init_count=max_rl_reuse),
             renderer=renderer,
         )
 
@@ -226,13 +242,16 @@ class MetricManager:
 @dataclass
 class UniRLState:
     # Model
-    study_task_queue: TaskQueue[Task]
+    study_task_queue: TaskQueue[Counted[Task]]
     practice_task_queue: TaskQueue[Task]
     buffer: HybridReplayBuffer
     litellm_model_name: str
     renderer: Renderer
     sampling_client_manager: SharedSamplingClient
     metric_manager: MetricManager
+    task_verifier: TaskVerifier
+    library_name: str
+    max_study_retry: int
 
     def get_latest_model(self) -> TinkerModel:
         current_model = TinkerModel(
@@ -245,40 +264,156 @@ class UniRLState:
     def is_finished(self) -> bool:
         return self.study_task_queue.is_done() and self.practice_task_queue.is_done()
 
-    def register_study_rollout(self, item: RewireSessionResult):
-        metrics = conclusion_to_metrics(item.conclusion)
-        self.metric_manager.register_study_metrics(metrics)
-        if item.rewired:
-            self.buffer.sft_store.put(SFTSample(task=item.task, messages=item.rewired))
+    async def register_study_group(
+        self,
+        worker_id: int,
+        items: list[RewireSessionResult],
+        counted_task: Counted[Task],
+    ):
+        analyzer = Analyzer(model=self.get_latest_model())
+        for item in items:
+            metrics = conclusion_to_metrics(item.conclusion)
+            self.metric_manager.register_study_metrics(metrics)
+            if isinstance(item, RewireSessionResultSuccess):
+                self.buffer.sft_store.put(
+                    SFTSample(task=item.task, messages=item.rewired)
+                )
+                self.buffer.sft_store.put(
+                    SFTSample(task=item.task, messages=item.trials)
+                )
+        task = counted_task.item
+
+        num_success = sum(
+            1 for ret in items if isinstance(ret, RewireSessionResultSuccess)
+        )
+
+        if num_success > 0:
+            logger.info(
+                f"Study worker {worker_id} produced {num_success}/{len(items)} successful trajectory"
+            )
+        else:
+            remaining_count = counted_task.count - 1
+            if remaining_count == 0:
+                logger.info(
+                    f"Study worker {worker_id} produced {num_success}/{len(items)} successful trajectory. Task failed too many times, giving up without generating subtasks."
+                )
+                return
+
+            await self.study_task_queue.put(
+                item=Counted(count=remaining_count, item=task)
+            )
+            logger.info(
+                f"Study worker {worker_id} produced {num_success}/{len(items)} successful trajectory. Added retry task. Remaining count: {remaining_count}"
+            )
+
+            trials_list = [
+                ret.trials
+                for ret in items
+                if isinstance(ret, RewireSessionResultNormal)
+            ]
+            if len(trials_list) > 0:
+                trials = trials_list[0]
+                try:
+                    if random.random() < self.newitem_probability("Study"):
+                        subtask = await analyzer.analyze_trajectory(trials)
+                        try:
+                            verification_result = await self.task_verifier.verify_task(
+                                task=subtask, library_name=self.library_name
+                            )
+                            if verification_result.output_type != "success":
+                                logger.warning(
+                                    f"Study worker {worker_id} discarded generated subtask because it failed verification: {verification_result.output_type}. Task: {subtask.instruction}"
+                                )
+                            else:
+                                await self.study_task_queue.put(
+                                    item=Counted(
+                                        count=self.max_study_retry, item=subtask
+                                    )
+                                )
+                                logger.info(
+                                    f"Study worker {worker_id} produced failed trajectory. Added subtask `{subtask.instruction if subtask else None}`"
+                                )
+                        except Exception as ve:
+                            logger.warning(
+                                f"Study worker {worker_id} discarded generated subtask due to verification exception: {ve}"
+                            )
+                except Exception as e:
+                    logger.debug(
+                        f"Study worker {worker_id} failed to analyze trajectory: {e}."
+                    )
 
     def uniform_reward(self, rewards: list[float]) -> bool:
         return all(r == rewards[0] for r in rewards)
 
-    def register_practice_group(self, items: list[SolveVerifyTinkerSingleTurnResult]):
+    async def register_practice_group(
+        self, worker_id: int, items: list[SolveVerifyTinkerSingleTurnResult]
+    ):
         rewards = [item.reward for item in items]
-        if self.uniform_reward(rewards):
-            return
+        task = items[0].env_state.task
+
         for item in items:
-            self.buffer.rl_store.put(
-                RLSample(
-                    task=item.env_state.task,
-                    group=TrajectoryGroup(
-                        trajectories_G=[item.trajectory for item in items],
-                        final_rewards_G=rewards,
-                        metrics_G=[],
-                    ),
-                )
-            )
             self.metric_manager.register_practice_metrics(
                 conclusion_to_metrics(item.conclusion)
             )
 
+        success_counts = sum([int(ret.is_success()) for ret in items])
+
+        if success_counts == 0:
+            await self.study_task_queue.put(
+                Counted(count=self.max_study_retry, item=task)
+            )
+            logger.info(
+                f"Practice worker {worker_id} generated {success_counts}/{len(items)} successful samples, putting it to study queue."
+            )
+            return
+
+        elif success_counts == len(items):
+            logger.info(
+                f"Practice worker {worker_id} generated {success_counts}/{len(items)} successful samples, removing the task from the queue"
+            )
+            return
+
+        else:
+            await self.practice_task_queue.put(task)
+            logger.info(
+                f"Practice worker {worker_id} generated {success_counts}/{len(items)} successful samples, putting it back to practice queue."
+            )
+
+        if self.uniform_reward(rewards):
+            return
+
+        rl_sample = RLSample(
+            task=task,
+            group=TrajectoryGroup(
+                trajectories_G=[item.trajectory for item in items],
+                final_rewards_G=rewards,
+                metrics_G=[],
+            ),
+        )
+        if not rl_sample.is_uniform_reward():
+            self.buffer.rl_store.put(rl_sample)
+
     async def get_batch(self) -> TinkerBatch | None:
         return await self.buffer.get_batch()
+
+    def newitem_probability(self, batch_type: BatchType) -> float:
+        if batch_type == "Study":
+            queue = self.study_task_queue
+        elif batch_type == "Practice":
+            queue = self.practice_task_queue
+        else:
+            raise ValueError("Unexpected batch type")
+
+        if queue.maxsize == 0:
+            return 1.0
+        qsize = queue.qsize()
+        return (1 + np.cos(np.pi * qsize / queue.maxsize)) / 2
 
 
 class StudyRolloutParams(BaseModel):
     qwen_no_think: bool
+    rollouts_per_task: int
+    max_study_retry: int
 
 
 class PracticeRolloutParams(BaseModel):
@@ -293,40 +428,33 @@ async def study_rollout(
     env_params: EnvParams,
 ):
     logger.info(f"Study worker {worker_id} started.")
-    latest_model = state.get_latest_model()
-    analyzer = Analyzer(model=latest_model)
+    initial_model = state.get_latest_model()
 
     while not state.is_finished():
-        async with state.study_task_queue.get_item_manager() as task:
+        latest_model = state.get_latest_model()
+        async with state.study_task_queue.get_item_manager() as counted_task:
+            task = counted_task.item
             logger.debug(
                 f"Study worker {worker_id} got a task. Remaining study tasks: {state.study_task_queue.qsize()}"
             )
-            ret = await ss_solve(
-                solver_model=latest_model,
-                verifier=verifier,
-                rewirer_model=latest_model,
-                task=task,
-                max_turns=env_params.max_turns,
-                qwen_no_think=study_rollout_params.qwen_no_think,
+            rets = await asyncio.gather(
+                *[
+                    ss_solve(
+                        solver_model=latest_model,
+                        verifier=verifier,
+                        rewirer_model=initial_model,
+                        task=task,
+                        max_turns=env_params.max_turns,
+                        qwen_no_think=study_rollout_params.qwen_no_think,
+                    )
+                    for _ in range(study_rollout_params.rollouts_per_task)
+                ]
             )
-            state.register_study_rollout(ret)
-            is_successful = ret.rewired is not None
-            if is_successful:
-                logger.info(f"Study worker {worker_id} produced successful trajectory")
-            else:
-                await state.study_task_queue.put(item=task)
-                subtask = None
-                if len(ret.trials) > 0:
-                    try:
-                        subtask = await analyzer.analyze_trajectory(ret.trials)
-                        await state.study_task_queue.put(item=subtask)
-                    except Exception as e:
-                        logger.debug(
-                            f"Study worker {worker_id} failed to analyze trajectory: {e}"
-                        )
-                logger.info(
-                    f"Study worker {worker_id} produced failed trajectory. Added retry task and subtask `{subtask.instruction[:100] if subtask else None}`"
-                )
+            await state.register_study_group(
+                worker_id=worker_id,
+                items=rets,
+                counted_task=counted_task,
+            )
 
 
 async def practice_rollout(
@@ -354,28 +482,15 @@ async def practice_rollout(
                     for _ in range(practice_rollout_params.rollouts_per_task)
                 ]
             )
-            state.register_practice_group(rets)
-            success_counts = sum([int(ret.is_success()) for ret in rets])
-
-            if success_counts == 0:
-                await state.study_task_queue.put(task)
-                logger.info(
-                    f"Practice Worker generated {success_counts}/{len(rets)} successful samples, putting it to study queue."
-                )
-            elif success_counts == len(rets):
-                logger.info(
-                    f"Practice Worker generated {success_counts}/{len(rets)} successful samples, removing the task from the queue"
-                )
-            else:
-                await state.practice_task_queue.put(task)
-                logger.info(
-                    f"Practice Worker generated {success_counts}/{len(rets)} successful samples, putting it to practice queue again."
-                )
+            await state.register_practice_group(worker_id=worker_id, items=rets)
 
 
 class UniRLTrainParams(BaseModel):
     update_freq: int
+    save_freq: int
     adam_params: AdamParams
+    max_sft_reuse: int
+    max_rl_reuse: int
 
 
 class UniRLConfig(BaseModel):
@@ -387,9 +502,8 @@ class UniRLConfig(BaseModel):
     train_params: UniRLTrainParams
     num_study_workers: int
     num_practice_workers: int
-    min_batch_size: int
-    max_batch_size: int
-    max_reuse: int
+    sft_batch_size: int
+    rl_group_size: int
     log_freq: int
 
 
@@ -398,18 +512,21 @@ async def train_worker(
     train_params: UniRLTrainParams,
     training_client: tinker.TrainingClient,
     ml_logger: MLLogger,
+    experiment_setting: ExperimentSettings,
 ):
     logger.info("Train worker started.")
     step = 0
     tasks_to_practice: dict[str, Task] = dict()
     while not state.is_finished():
         batch = await state.get_batch()
-        logger.info(
-            f"Train worker step: {step}. Remaining practice tasks: {state.practice_task_queue.qsize()}"
-        )
+
         if batch is None:
             await asyncio.sleep(1)
             continue
+        step += 1
+        logger.info(
+            f"Train worker step: {step}. Remaining practice tasks: {state.practice_task_queue.qsize()}"
+        )
         fwd_bwd_future = await training_client.forward_backward_async(
             batch.datum,
             loss_fn=batch.loss_fn,
@@ -417,30 +534,44 @@ async def train_worker(
         optim_future = await training_client.optim_step_async(train_params.adam_params)
         fwd_bwd_result = await fwd_bwd_future.result_async()
         await optim_future.result_async()
-        exhausted_tasks = {
-            counted_item.item.id: counted_item.item
-            for counted_item in batch.tasks.values()
-            if counted_item.count == 0
-        }
-        tasks_to_practice.update(exhausted_tasks)
-        step += 1
-        ml_logger.log_metrics(fwd_bwd_result.metrics)
+        if batch.batch_type == "Study":
+            exhausted_tasks = {
+                counted_item.item.id: counted_item.item
+                for counted_item in batch.tasks.values()
+                if counted_item.count == 0
+            }
+            tasks_to_practice.update(exhausted_tasks)
+        ml_logger.log_metrics(
+            {
+                **fwd_bwd_result.metrics,
+                "buffer_size/study": len(state.buffer.sft_store),
+                "buffer_size/practice": len(state.buffer.rl_store),
+            }
+        )
+
+        if step % train_params.save_freq == 0:
+            logger.info(f"Saving checkpoint at train step {step}...")
+            await tinker_cookbook.checkpoint_utils.save_checkpoint_async(
+                training_client=training_client,
+                name=f"step_{step}",
+                log_path=str(experiment_setting.log_root()),
+                loop_state={},
+                kind="both",
+                ttl_seconds=experiment_setting.ttl_seconds,
+            )
+
         if step % train_params.update_freq == 0:
             new_client = (
                 await training_client.save_weights_and_get_sampling_client_async()
             )
             await state.sampling_client_manager.update_client(new_client)
             logger.info(
-                f"Train Worker -> Latest sampling client updated. New ID: {id(await state.sampling_client_manager.get_client())}"
+                f"Train Worker -> Latest sampling client updated. New ID: {id(await state.sampling_client_manager.get_client())}. "
+                f"Buffer sizes - Study: {len(state.buffer.sft_store)}, Practice: {len(state.buffer.rl_store)}"
             )
             for task in tasks_to_practice.values():
                 await state.practice_task_queue.put(task)
             tasks_to_practice.clear()
-
-
-class _SuppressExtensionWarning(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        return "train_on_what=ALL_ASSISTANT_MESSAGES" not in record.getMessage()
 
 
 def setup_logging(cfg: UniRLConfig) -> MLLogger:
@@ -454,11 +585,6 @@ def setup_logging(cfg: UniRLConfig) -> MLLogger:
     )
     logger.setLevel(level=logging.DEBUG)
     logging.basicConfig(level=logging.INFO)
-
-    logging.getLogger("tinker_cookbook.renderers.base").addFilter(
-        _SuppressExtensionWarning()
-    )
-
     logging.getLogger("adapter_agent.hierarchical.agent.rewirer").setLevel(
         logging.WARNING
     )
@@ -466,7 +592,7 @@ def setup_logging(cfg: UniRLConfig) -> MLLogger:
         logging.INFO
     )
     logging.getLogger("adapter_agent.hierarchical.process.rewire").setLevel(
-        logging.INFO
+        logging.WARNING
     )
     logging.getLogger(
         "adapter_agent.hierarchical.process.rewire_session_single_turn"
@@ -537,7 +663,7 @@ async def main():
             experiment_name=f"Adapter Agent_UniRL_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         ),
         env_params=EnvParams(
-            max_turns=2,
+            max_turns=10,
             r_min=0.5,
             library=Library(name="numrs2", local_path=Path("repositories/numrs")),
             image_name="coder-mcp-numrs2:latest",
@@ -547,22 +673,26 @@ async def main():
             model_name="Qwen/Qwen3-8B",
             lora_rank=32,
         ),
-        study_rollout_params=StudyRolloutParams(max_rewire=2, qwen_no_think=True),
-        practice_rollout_params=PracticeRolloutParams(rollouts_per_task=4),
+        study_rollout_params=StudyRolloutParams(
+            rollouts_per_task=8, qwen_no_think=True, max_study_retry=3
+        ),
+        practice_rollout_params=PracticeRolloutParams(rollouts_per_task=8),
         train_params=UniRLTrainParams(
             update_freq=1,
+            save_freq=50,
             adam_params=AdamParams(
                 learning_rate=1e-4,
                 beta1=0.9,
                 beta2=0.95,
                 eps=1e-12,
             ),
+            max_sft_reuse=20,
+            max_rl_reuse=5,
         ),
-        num_study_workers=128,
-        num_practice_workers=8,
-        min_batch_size=128,
-        max_batch_size=128,
-        max_reuse=20,
+        num_study_workers=32,
+        num_practice_workers=32,
+        sft_batch_size=128,
+        rl_group_size=32,
         log_freq=50,
     )
 
@@ -570,11 +700,20 @@ async def main():
     ml_logger = setup_logging(cfg)
 
     tasks = load_tasks(cfg)
-    study_queue = TaskQueue.create(order="LIFO")
-    practice_queue = TaskQueue.create(order="FIFO")
+    study_queue = TaskQueue.create(order="LIFO", maxsize=500)
+
+    if study_queue.maxsize > 0 and len(tasks) > study_queue.maxsize:
+        raise ValueError(
+            f"Number of initial tasks ({len(tasks)}) exceeds the maximum "
+            f"capacity of the study queue ({study_queue.maxsize})."
+        )
+
+    practice_queue = TaskQueue.create(order="FIFO", maxsize=0)
 
     for task in tasks:
-        await study_queue.put(task)
+        await study_queue.put(
+            Counted(count=cfg.study_rollout_params.max_study_retry, item=task)
+        )
 
     service_client, training_client = await setup_tinker_clients(
         cfg.model_loading_settings
@@ -586,14 +725,15 @@ async def main():
         cfg.model_loading_settings,
         rust_doc_analyzer,
     )
+    task_verifier = TaskVerifier(model=get_gemini())
 
     sampling_client_manager = SharedSamplingClient(model.sampling_client)
 
-    buffer = HybridReplayBuffer(
-        min_batch_size=cfg.min_batch_size,
-        max_batch_size=cfg.max_batch_size,
-        sft_store=CountDownStore({}, init_count=cfg.max_reuse),
-        rl_store=CountDownStore({}, init_count=cfg.max_reuse),
+    buffer = HybridReplayBuffer.create(
+        sft_batch_size=cfg.sft_batch_size,
+        rl_group_size=cfg.rl_group_size,
+        max_sft_reuse=cfg.train_params.max_sft_reuse,
+        max_rl_reuse=cfg.train_params.max_rl_reuse,
         renderer=model.renderer,
     )
 
@@ -604,11 +744,14 @@ async def main():
         litellm_model_name=model.model,
         renderer=model.renderer,
         sampling_client_manager=sampling_client_manager,
-        metric_manager=MetricManager(ml_logger, [], [], log_freq=10),
+        metric_manager=MetricManager(ml_logger, [], [], log_freq=cfg.log_freq),
+        task_verifier=task_verifier,
+        library_name=cfg.env_params.library.name,
+        max_study_retry=cfg.study_rollout_params.max_study_retry,
     )
 
     async with litellm_concurrent_limit(
-        cfg.num_study_workers
+        cfg.num_study_workers * cfg.study_rollout_params.rollouts_per_task
         + cfg.num_practice_workers * cfg.practice_rollout_params.rollouts_per_task
         + 10
     ):
@@ -617,10 +760,17 @@ async def main():
             train_params=cfg.train_params,
             training_client=training_client,
             ml_logger=ml_logger,
+            experiment_setting=cfg.experiment_setting,
         )
 
         study_workers = [
-            study_rollout(i, state, verifier, cfg.study_rollout_params, cfg.env_params)
+            study_rollout(
+                i,
+                state,
+                verifier,
+                cfg.study_rollout_params,
+                cfg.env_params,
+            )
             for i in range(cfg.num_study_workers)
         ]
 

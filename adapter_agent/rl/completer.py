@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import cast
 
 import tinker
 from tinker_cookbook import renderers
@@ -10,6 +11,10 @@ from tinker_cookbook.completers import (
 )
 
 from adapter_agent.util.exception import MaximumContextExceeded
+
+
+class MessageWithLogprobs(renderers.Message):
+    tokens_with_logprobs: TokensWithLogprobs
 
 
 @dataclass
@@ -67,7 +72,7 @@ class TinkerMessageCompleter(MessageCompleter):
         else:
             self.stop_condition = stop_condition
 
-    async def __call__(self, messages: list[renderers.Message]) -> renderers.Message:
+    async def __call__(self, messages: list[renderers.Message]) -> MessageWithLogprobs:
         # Render the conversation for the model
         model_input = self.renderer.build_generation_prompt(messages)
 
@@ -98,4 +103,10 @@ class TinkerMessageCompleter(MessageCompleter):
             response.sequences[0].tokens
         )
 
-        return parsed_message
+        parsed_message_with_logprobs = cast(MessageWithLogprobs, parsed_message)
+        parsed_message_with_logprobs["tokens_with_logprobs"] = TokensWithLogprobs(
+            tokens=response.sequences[0].tokens,
+            maybe_logprobs=response.sequences[0].logprobs,
+        )
+
+        return parsed_message_with_logprobs
