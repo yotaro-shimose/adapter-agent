@@ -534,6 +534,8 @@ async def train_worker(
     logger.info("Train worker started.")
     step = 0
     tasks_to_practice: dict[str, Task] = dict()
+    pending_fwd_bwd_future = None
+    pending_optim_future = None
     while not state.is_finished():
         batch = await state.get_batch()
 
@@ -544,11 +546,25 @@ async def train_worker(
         logger.info(
             f"Train worker step: {step}. Remaining practice tasks: {state.practice_task_queue.qsize()}"
         )
+
         fwd_bwd_future = await training_client.forward_backward_async(
             batch.datum,
             loss_fn=batch.loss_fn,
         )
         optim_future = await training_client.optim_step_async(train_params.adam_params)
+        if pending_fwd_bwd_future is not None and pending_optim_future is not None:
+            fwd_bwd_result = await pending_fwd_bwd_future.result_async()
+            await pending_optim_future.result_async()
+            ml_logger.log_metrics(
+                {
+                    **fwd_bwd_result.metrics,
+                    "buffer_size/study": len(state.buffer.sft_store),
+                    "buffer_size/practice": len(state.buffer.rl_store),
+                }
+            )
+        pending_fwd_bwd_future = fwd_bwd_future
+        pending_optim_future = optim_future
+
         fwd_bwd_result = await fwd_bwd_future.result_async()
         await optim_future.result_async()
         if batch.batch_type == "Study":
@@ -558,13 +574,6 @@ async def train_worker(
                 if counted_item.count == 0
             }
             tasks_to_practice.update(exhausted_tasks)
-        ml_logger.log_metrics(
-            {
-                **fwd_bwd_result.metrics,
-                "buffer_size/study": len(state.buffer.sft_store),
-                "buffer_size/practice": len(state.buffer.rl_store),
-            }
-        )
 
         if step % train_params.save_freq == 0:
             logger.info(f"Saving checkpoint at train step {step}...")
@@ -718,7 +727,7 @@ async def main():
     ml_logger = setup_logging(cfg)
 
     tasks = load_tasks(cfg)
-    study_queue = TaskQueue.create(order="LIFO", maxsize=500)
+    study_queue = TaskQueue.create(order="LIFO", maxsize=200)
 
     if study_queue.maxsize > 0 and len(tasks) > study_queue.maxsize:
         raise ValueError(

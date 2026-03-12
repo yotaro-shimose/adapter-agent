@@ -11,12 +11,10 @@ dependencies = [
     "polars>=1.37.1",
     "python-dotenv>=1.0.0",
     "rich>=14.2.0",
-    "torch>=2.9.0",
     "transformers>=4.56.0",
     "trl>=0.26.2",
     "flash-attn",
     "vllm>=0.13.0",
-    "coder-mcp",
     "litellm==1.81",
     "openai>=2.14.0",
     "chz>=0.4.0",
@@ -27,6 +25,8 @@ dependencies = [
     "seaborn>=0.13.2",
     "weave>=0.52.28",
     "more-itertools>=10.8.0",
+    "torch>=2.9.0",
+    "coder-mcp",
 ]
 
 [build-system]
@@ -39,9 +39,6 @@ no-build-isolation-package = ["flash-attn"]
 index-strategy = "unsafe-best-match"
 
 [tool.uv.sources]
-torch = [
-    { index = "pytorch-cu130" }
-]
 vllm = [
     { index = "vllm-cu130" }
 ]
@@ -59,7 +56,9 @@ test = [
 [[tool.uv.index]]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
+explicit = true
 
 [[tool.uv.index]]
 name = "vllm-cu130"
 url = "https://wheels.vllm.ai/0.13.0/cu130"
+explicit = true
