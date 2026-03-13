@@ -7,8 +7,7 @@ from agents import (
     RunContextWrapper,
     function_tool,
 )
-from coder_mcp.runtime.runtime import Runtime
-from coder_mcp.runtime.rust_env import RustCodingEnvironment
+from coder_mcp.runtime import Runtime
 from oai_utils import RunResultWrapper
 from oai_utils.agent import AgentRunFailure, AgentsSDKModel, AgentWrapper
 from oai_utils.tinker.agent_sdk_model import raw_responses_to_trajectory
@@ -37,7 +36,7 @@ fn main() {
 
 class SimplifiedSolverContext(WithRustDocAnalyzer):
     question: str
-    runtime: RustCodingEnvironment
+    runtime: Runtime
     remaining_turns: int
     qa: QA | None = None
     qra: QRA | None = None
@@ -116,7 +115,7 @@ class SimplifiedSolver[T: AgentsSDKModel](Solver[T]):
     async def try_solve(
         self,
         task: Task,
-        runtime: RustCodingEnvironment,
+        runtime: Runtime,
         library_name: str,
         tree_structure: str = "",
         max_turns: int = 10,
