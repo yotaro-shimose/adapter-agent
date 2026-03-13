@@ -1,7 +1,7 @@
 import logging
 from dataclasses import dataclass
 
-from coder_mcp.runtime.rust_env import RustCodingEnvironment
+from coder_mcp.runtime import DockerRuntime
 from tinker_cookbook.rl.types import Trajectory
 
 from adapter_agent.data import QA
@@ -35,7 +35,7 @@ async def solve_verify(
     solver: Solver,
     verifier: Verifier,
     task: Task,
-    image_name: str,
+    image_uri: str,
     library_name: str,
     max_turns: int = 15,
     collect_trajectory: bool = False,
@@ -44,7 +44,7 @@ async def solve_verify(
 ) -> SolveVerifyResult:
     """
     Encapsulates the pattern of:
-    1. Setting up a RustCodingEnvironment using a pre-built image
+    1. Setting up a Runtime using a pre-built image
     2. Generating a file tree
     3. Solving the task (with or without search)
     4. Verifying the solution if a QA is produced
@@ -52,9 +52,7 @@ async def solve_verify(
     if exclude is None:
         exclude = ["target", ".git"]
 
-    async with RustCodingEnvironment(
-        image_name=image_name, workspace_dir=None
-    ) as rust_env:
+    async with DockerRuntime(image_name=image_uri, workspace_dir=None) as rust_env:
         tree_structure = await rust_env.tree(".", exclude=exclude, truncate=20)
 
         if use_search:

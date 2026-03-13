@@ -46,6 +46,15 @@ class TaskQueue[T]:
     async def put(self, item: T) -> None:
         await self.queue.put(item)
 
+    async def get(self) -> T:
+        return await self.queue.get()
+
+    def put_nowait(self, item: T) -> None:
+        self.queue.put_nowait(item)
+
+    def get_nowait(self) -> T:
+        return self.queue.get_nowait()
+
     def qsize(self) -> int:
         return self.queue.qsize()
 

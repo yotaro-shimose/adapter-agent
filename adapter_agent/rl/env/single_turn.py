@@ -4,21 +4,20 @@ from dataclasses import dataclass, field
 from typing import Self
 
 import tinker
-from coder_mcp.runtime import RustCodingEnvironment
-from coder_mcp.runtime.rust_env import RustEnvError
+from coder_mcp.runtime import CoderMCPRuntimeError, Runtime
 from tinker_cookbook.completers import StopCondition
 from tinker_cookbook.renderers import Renderer
 from tinker_cookbook.renderers.base import Message as TinkerMessage
 from tinker_cookbook.renderers.base import TextPart, ThinkingPart
 from tinker_cookbook.rl import types
 from tinker_cookbook.rl.types import Env
-from tinker_cookbook.tool_use.agent_tool_message_env import RewardFn
 from typing_extensions import AsyncGenerator
 
 from adapter_agent.hierarchical.agent.solver import CONTEXT
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.rl.env.reward import LLMAsAJudgeSingleTurn
+from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.rl.env.simplified_solver import SSConclusion
 from adapter_agent.util.exception import CodingEnvironmentError
 from adapter_agent.util.parsing import extract_rust_code
@@ -29,7 +28,6 @@ logger = logging.getLogger(__name__)
 @dataclass
 class SingleTurnEnvState:
     task: Task
-    image_name: str
     library_name: str
     prethink: str | None
     messages: list[TinkerMessage]
@@ -39,7 +37,6 @@ class SingleTurnEnvState:
         return cls(
             task=task,
             library_name="numrs2",
-            image_name="coder-mcp-numrs2:latest",
             prethink=prethink,
             messages=[],
         )
@@ -47,7 +44,6 @@ class SingleTurnEnvState:
     def with_messages(self, messages: list[TinkerMessage]) -> Self:
         return self.__class__(
             task=self.task,
-            image_name=self.image_name,
             library_name=self.library_name,
             prethink=self.prethink,
             messages=messages,
@@ -62,10 +58,10 @@ class SingleTurnStepResult(types.StepResult):
 @dataclass
 class SingleTurnEnv(Env):
     initial_state: SingleTurnEnvState
-    rust_env: RustCodingEnvironment
+    rust_env: Runtime
     renderer: Renderer
     initial_messages: list[TinkerMessage]
-    reward_fn: RewardFn
+    reward_fn: LLMAsAJudgeSingleTurn
     history: list[TinkerMessage] = field(default_factory=list)
     prethink: str | None = None
 
@@ -147,7 +143,7 @@ class SingleTurnEnv(Env):
         try:
             await self.rust_env.set_content("src/main.rs", code)
             output, success = await self.rust_env.run_cargo()
-        except RustEnvError as e:
+        except CoderMCPRuntimeError as e:
             raise CodingEnvironmentError(
                 f"Environment error during single turn step: {e}"
             ) from e
@@ -162,7 +158,12 @@ class SingleTurnEnv(Env):
                 next_stop_condition=self.renderer.get_stop_sequences(),
                 conclusion="code_did_not_compile",
             )
-        reward, reward_metrics = await self.reward_fn(self.history)
+        try:
+            reward, reward_metrics = await self.reward_fn(self.history)
+        except Exception as e:
+            raise CodingEnvironmentError(
+                f"Environment error during single turn reward calculation: {e}"
+            ) from e
         return SingleTurnStepResult(
             reward=reward,
             episode_done=True,
@@ -177,7 +178,7 @@ class SingleTurnEnv(Env):
     @classmethod
     async def from_env_state(
         cls,
-        rust_env: RustCodingEnvironment,
+        rust_env: Runtime,
         env_state: SingleTurnEnvState,
         renderer: Renderer,
         verifier: Verifier,
@@ -240,11 +241,15 @@ async def build_single_turn_env(
     env_state: SingleTurnEnvState,
     renderer: Renderer,
     verifier: Verifier,
+    runtime_settings: RuntimeSettings,
 ) -> AsyncGenerator[SingleTurnEnv, None]:
-    async with RustCodingEnvironment(image_name=env_state.image_name) as rust_env:
-        yield await SingleTurnEnv.from_env_state(
-            rust_env=rust_env,
-            env_state=env_state,
-            renderer=renderer,
-            verifier=verifier,
-        )
+    try:
+        async with runtime_settings.build_runtime() as rust_env:
+            yield await SingleTurnEnv.from_env_state(
+                rust_env=rust_env,
+                env_state=env_state,
+                renderer=renderer,
+                verifier=verifier,
+            )
+    except CoderMCPRuntimeError as e:
+        raise CodingEnvironmentError(f"Environment error during setup: {e}") from e

@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import AsyncGenerator, Self
 
-from coder_mcp.runtime import RustCodingEnvironment
+from coder_mcp.runtime import CloudRunRuntime, Runtime
 from tinker_cookbook.completers import StopCondition
 from tinker_cookbook.renderers import Renderer
 from tinker_cookbook.renderers.base import Message, ToolSpec
@@ -37,7 +37,7 @@ fn main() {
 @dataclass
 class CoderEnvTool:
     remaining_turns: int
-    rust_env: RustCodingEnvironment
+    rust_env: Runtime
 
     @tool
     async def run(self) -> ToolResult:
@@ -113,7 +113,7 @@ class EnvStateBase:
     ]  # The history of code for every turn (we add new entry even if no changes are made)
     max_turns: int
     remaining_turns: int  # If no action is taken, the turn is 0
-    image_name: str
+    image_uri: str
     library_name: str
 
 
@@ -128,14 +128,14 @@ class InitEnvState(EnvStateBase):
         task: Task,
         max_turns: int,
         library_name: str = "numrs2",
-        image_name: str = "coder-mcp-numrs2:latest",
+        image_uri: str = "europe-north1-docker.pkg.dev/dsat2-405406/shimose-repo/coder-mcp-numrs2:latest",
     ) -> Self:
         return cls(
             task=task,
             code_history=[CARGO_INIT_MAIN_RS],
             max_turns=max_turns,
             remaining_turns=max_turns,
-            image_name=image_name,
+            image_uri=image_uri,
             library_name=library_name,
             messages=None,
             prethink=None,
@@ -154,7 +154,7 @@ type EnvState = InitEnvState | ResumedEnvState
 @dataclass
 class RustCoderEnv(Env):
     initial_state: EnvStateBase
-    rust_env: RustCodingEnvironment
+    rust_env: Runtime
     internal: PrefillableMessageEnv
     code_history: list[str]
 
@@ -180,7 +180,7 @@ class RustCoderEnv(Env):
             code_history=self.code_history,
             max_turns=self.initial_state.max_turns,
             remaining_turns=message_env._turn_count,
-            image_name=self.initial_state.image_name,
+            image_uri=self.initial_state.image_uri,
             library_name=self.initial_state.library_name,
             messages=message_env.history,
             prethink=None,
@@ -189,7 +189,7 @@ class RustCoderEnv(Env):
     @classmethod
     async def from_env_state(
         cls,
-        rust_env: RustCodingEnvironment,
+        rust_env: Runtime,
         env_state: EnvState,
         renderer: Renderer,
         verifier: Verifier,
@@ -244,7 +244,7 @@ async def build_coder_env(
     verifier: Verifier,
     max_trajectory_tokens: int = 32 * 1024,
 ) -> AsyncGenerator[RustCoderEnv, None]:
-    async with RustCodingEnvironment(image_name=env_state.image_name) as rust_env:
+    async with CloudRunRuntime(image_uri=env_state.image_uri) as rust_env:
         yield await RustCoderEnv.from_env_state(
             rust_env=rust_env,
             env_state=env_state,

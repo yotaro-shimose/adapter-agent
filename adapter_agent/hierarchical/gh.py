@@ -138,7 +138,7 @@ async def main():
     limit = 1000
     max_concurrent = 100
     # Define target library
-    library = Library(name="numrs", local_path=Path("repositories/numrs/SUMMARY.md"))
+    library = Library(name="numrs2", local_path=Path("repositories/numrs/SUMMARY.md"))
 
     # 1. Initialize the BigQuery client
     client = bigquery.Client(project="dsat2-405406")

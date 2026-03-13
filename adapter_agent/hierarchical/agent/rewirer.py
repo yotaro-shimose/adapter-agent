@@ -2,7 +2,7 @@ import logging
 from dataclasses import dataclass
 
 from agents import ModelSettings, RunContextWrapper, StopAtTools, function_tool
-from coder_mcp.runtime.rust_env import RustCodingEnvironment
+from coder_mcp.runtime import CloudRunRuntime, Runtime
 from oai_utils.agent import AgentRunFailure, AgentsSDKModel, AgentWrapper
 from pydantic import BaseModel
 from tinker_cookbook.renderers.base import Message as TinkerMessage
@@ -172,7 +172,7 @@ class Rewirer[T: AgentsSDKModel](BaseAgent[T]):
             code_history=state.code_history[: rewire_result.turn_to_replace],
             max_turns=state.max_turns,
             remaining_turns=state.max_turns - (rewire_result.turn_to_replace - 1),
-            image_name=state.image_name,
+            image_uri=state.image_uri,
             library_name=state.library_name,
             messages=new_messages,
             prethink=new_reasoning,
@@ -339,7 +339,7 @@ class SingleTurnFeedbackResult(BaseModel):
 
 class SingleTurnFeedbackContext(WithRustDocAnalyzer):
     result: SingleTurnFeedbackResult | None = None
-    runtime: RustCodingEnvironment | None = None
+    runtime: Runtime | None = None
 
 
 @function_tool
@@ -401,7 +401,7 @@ class SingleTurnRewirer[T: AgentsSDKModel](BaseAgent[T]):
             raise ValueError("State messages is None")
         original_transcript = format_trajectory_transcript(state.messages)
 
-        async with RustCodingEnvironment(image_name=state.image_name) as rust_env:
+        async with CloudRunRuntime(image_uri=state.image_uri) as rust_env:
             # Seed the student's code so replace_and_run has something to replace
             assistant_content = ""
             for msg in reversed(state.messages):
@@ -419,7 +419,7 @@ class SingleTurnRewirer[T: AgentsSDKModel](BaseAgent[T]):
 
         new_env_state = state.__class__(
             task=state.task,
-            image_name=state.image_name,
+            image_uri=state.image_uri,
             library_name=state.library_name,
             prethink=new_reasoning,
             messages=[],
@@ -439,7 +439,7 @@ class SingleTurnRewirer[T: AgentsSDKModel](BaseAgent[T]):
         return new_env_state
 
     async def get_feedback(
-        self, state: "SingleTurnEnvState", runtime: RustCodingEnvironment
+        self, state: "SingleTurnEnvState", runtime: Runtime
     ) -> SingleTurnFeedbackResult:
         PROMPT = """\
 <Role>

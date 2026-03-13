@@ -173,3 +173,23 @@ async def prepare_minibatch_simplified(
         metrics.update(kl_penalty_metrics)
 
     return data_D, metrics
+
+
+def prepare_minibatch_simplified_sync(
+    trajectory_groups: list[TrajectoryGroup],
+    regularization: AdvantageRegularizer = "output_token",
+) -> tuple[list[tinker.Datum], dict[str, float]]:
+    metrics = {}
+    trajectory_groups = remove_constant_reward_groups(trajectory_groups)
+    if not trajectory_groups:
+        return [], metrics
+
+    advantages_G = compute_advantages(trajectory_groups, regularization)
+
+    # Assert any of the advantages are non-zero
+    all_advantages = torch.cat(advantages_G)
+    assert torch.any(all_advantages != 0), "All advantages are zero!"
+
+    data_D, _metadata_D = assemble_training_data(trajectory_groups, advantages_G)
+
+    return data_D, metrics

@@ -12,8 +12,9 @@ from adapter_agent.hierarchical.process.rewire_session import (
     get_total_reward,
 )
 from adapter_agent.rl.completer import TinkerTokenCompleter
+from adapter_agent.rl.env.conclusion import SSConclusion
 from adapter_agent.rl.env.reward import LLMAsAJudge
-from adapter_agent.rl.env.simplified_solver import SSConclusion
+from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.rl.env.single_turn import (
     SingleTurnEnvState,
     build_single_turn_env,
@@ -37,11 +38,13 @@ async def solve_verify_tinker_single_turn(
     solver_model: TinkerModel,
     env_state: SingleTurnEnvState,
     verifier: Verifier,
+    runtime_settings: RuntimeSettings,
 ) -> SolveVerifyTinkerSingleTurnResult:
     async with build_single_turn_env(
         env_state=env_state,
         renderer=solver_model.renderer,
         verifier=verifier,
+        runtime_settings=runtime_settings,
     ) as env:
         solver_sampler = solver_model.sampling_client
         policy = TinkerTokenCompleter(solver_sampler, max_tokens=None)

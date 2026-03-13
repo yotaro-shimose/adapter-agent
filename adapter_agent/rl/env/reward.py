@@ -3,14 +3,14 @@ from dataclasses import dataclass
 from itertools import chain
 from typing import TypedDict
 
-from coder_mcp.runtime import RustCodingEnvironment
-from coder_mcp.runtime.rust_env import RustEnvError
+from coder_mcp.runtime import CoderMCPRuntimeError, Runtime
 from pydantic import BaseModel, ValidationError
 from tinker_cookbook.renderers.base import Message as TinkerMessage
 
 from adapter_agent.data import QA
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.types import Task
+from adapter_agent.rl.env.conclusion import SSConclusion
 from adapter_agent.util.exception import CodingEnvironmentError
 
 logger = logging.getLogger(__name__)
@@ -30,7 +30,7 @@ class LLMAsAJudgeMetrics(TypedDict):
 
 @dataclass
 class LLMAsAJudge:
-    rust_env: RustCodingEnvironment
+    rust_env: Runtime
     verifier: Verifier
     tree_structure: str
     task: Task
@@ -42,7 +42,7 @@ class LLMAsAJudge:
             raise ValueError("History for LLMAsAJudge cannot be empty")
         try:
             execution_output, success = await self.rust_env.run_cargo()
-        except RustEnvError as e:
+        except CoderMCPRuntimeError as e:
             raise CodingEnvironmentError(
                 f"Environment error during run_cargo: {e}"
             ) from e
@@ -94,7 +94,7 @@ class LLMAsAJudge:
             )
         try:
             content = await self.rust_env.view_file("src/main.rs")
-        except RustEnvError as e:
+        except CoderMCPRuntimeError as e:
             raise CodingEnvironmentError(
                 f"Environment error during view_file: {e}"
             ) from e
@@ -140,32 +140,27 @@ class LLMAsAJudge:
 
 @dataclass
 class LLMAsAJudgeSingleTurn:
-    rust_env: RustCodingEnvironment
+    rust_env: Runtime
     verifier: Verifier
     tree_structure: str
     task: Task
 
     async def __call__(
         self, history: list[TinkerMessage]
-    ) -> tuple[float, dict[str, float]]:
+    ) -> tuple[float, SSConclusion]:
         if len(history) == 0:
             raise ValueError("History for LLMAsAJudge cannot be empty")
         try:
             execution_output, success = await self.rust_env.run_cargo()
-        except RustEnvError as e:
+        except CoderMCPRuntimeError as e:
             raise CodingEnvironmentError(
                 f"Environment error during run_cargo: {e}"
             ) from e
         if not success:
-            return 0.0, dict(
-                code_did_not_compile=1.0,
-                verifier_failed=0.0,
-                verifier_error=0.0,
-            )
-
+            return 0.0, "code_did_not_compile"
         try:
             content = await self.rust_env.view_file("src/main.rs")
-        except RustEnvError as e:
+        except CoderMCPRuntimeError as e:
             raise CodingEnvironmentError(
                 f"Environment error during view_file: {e}"
             ) from e
@@ -192,24 +187,12 @@ class LLMAsAJudgeSingleTurn:
                 main_rs_content=content,
             )
         except Exception as e:
-            logger.debug(f"Failed to verify: {e}")
-            return 0.0, dict(
-                code_did_not_compile=0.0,
-                verifier_failed=0.0,
-                verifier_error=1.0,
-            )
+            raise CodingEnvironmentError(f"Environment error during verify: {e}") from e
+
         if verification_result.success:
-            return 1.0, dict(
-                code_did_not_compile=0.0,
-                verifier_failed=0.0,
-                verifier_error=0.0,
-            )
+            return 1.0, "success"
         else:
-            return 0.0, dict(
-                code_did_not_compile=0.0,
-                verifier_failed=1.0,
-                verifier_error=0.0,
-            )
+            return 0.0, "verification_failed"
 
     @classmethod
     def is_successful_reward(cls, reward: float) -> bool:

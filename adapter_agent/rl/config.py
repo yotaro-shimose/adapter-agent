@@ -9,6 +9,7 @@ from tinker.types.loss_fn_type import LossFnType
 from adapter_agent.data import QASFTDataset, TinkerMessagesDataset
 from adapter_agent.hierarchical.gh import Library
 from adapter_agent.rl.advantage import AdvantageRegularizer
+from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 
 
 class OptimizerParams(BaseModel):
@@ -42,20 +43,28 @@ class RolloutParams(BaseModel):
 
 
 class EnvParams(BaseModel):
-    max_turns: int = 5
-    r_min: float = 0.5
+    max_turns: int
     library: Library
-    image_name: str
     dataset_path: Path
+    runtime_settings: RuntimeSettings
 
     @classmethod
-    def numrs2(cls, max_turns: int, r_min: float, dataset_path: Path) -> Self:
+    def numrs2(
+        cls,
+        max_turns: int,
+        dataset_path: Path,
+        runtime_settings: RuntimeSettings | None = None,
+    ) -> Self:
+        if runtime_settings is None:
+            runtime_settings = RuntimeSettings(
+                type="docker",
+                image_uri="coder-mcp-numrs2:latest",
+            )
         return cls(
             max_turns=max_turns,
-            r_min=r_min,
             library=Library(name="numrs2", local_path=Path("repositories/numrs")),
-            image_name="coder-mcp-numrs2:latest",
             dataset_path=dataset_path,
+            runtime_settings=runtime_settings,
         )
 
 

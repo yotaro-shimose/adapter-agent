@@ -8,8 +8,7 @@ from agents import (
     StopAtTools,
     function_tool,
 )
-from coder_mcp.runtime import RustCodingEnvironment
-from coder_mcp.runtime.runtime import Runtime
+from coder_mcp.runtime import Runtime
 from coder_mcp.types import CoderToolName
 from oai_utils import RunResultWrapper
 from oai_utils.agent import AgentRunFailure, AgentsSDKModel, AgentWrapper
@@ -102,7 +101,7 @@ class Solver[T: AgentsSDKModel](BaseAgent[T]):
     async def try_solve(
         self,
         task: Task,
-        runtime: RustCodingEnvironment,
+        runtime: Runtime,
         library_name: str,
         tree_structure: str = "",
         max_turns: int = 10,

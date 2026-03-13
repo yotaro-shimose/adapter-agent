@@ -16,6 +16,7 @@ from adapter_agent.hierarchical.process.rewire_session import (
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
 from adapter_agent.model_helper import get_gemini
+from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 
 
 async def study_rollout(
@@ -23,14 +24,17 @@ async def study_rollout(
     solver_model: TinkerModel,
     verifier: Verifier,
 ):
-
     ret = await ss_solve(
         solver_model=solver_model,
         verifier=verifier,
         rewirer_model=solver_model,
         task=task,
-        max_turns=5,
+        max_turns=10,
         qwen_no_think=True,
+        runtime_settings=RuntimeSettings(
+            type="docker",
+            image_uri="coder-mcp-numrs2:latest",
+        ),
     )
     if isinstance(ret, RewireSessionResultNormal):
         log_trajectory(ret.trials)

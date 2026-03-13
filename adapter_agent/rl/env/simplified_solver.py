@@ -2,11 +2,13 @@ import asyncio
 import json
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, Literal, Self, TypedDict, cast
+from typing import Any, Self, TypedDict, cast
 
 import tinker
-from coder_mcp.runtime import RustCodingEnvironment
-from coder_mcp.runtime.rust_env import RustEnvError
+from coder_mcp.runtime import (
+    CoderMCPRuntimeError,
+    Runtime,
+)
 from tinker_cookbook.completers import StopCondition
 from tinker_cookbook.renderers import Renderer
 from tinker_cookbook.renderers.base import Message as TinkerMessage
@@ -25,8 +27,10 @@ from adapter_agent.hierarchical.agent.simplified_solver import CARGO_INIT_MAIN_R
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
+from adapter_agent.rl.env.conclusion import SSConclusion
 from adapter_agent.rl.env.injection import _inject_tools_into_prompt
 from adapter_agent.rl.env.reward import LLMAsAJudgeSingleTurn
+from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.util.exception import CodingEnvironmentError
 from adapter_agent.util.parsing import extract_rust_code
 
@@ -34,7 +38,6 @@ from adapter_agent.util.parsing import extract_rust_code
 @dataclass
 class SimplifiedSolverEnvState:
     task: Task
-    image_name: str
     library_name: str
     prethink: str | None
     messages: list[TinkerMessage]
@@ -47,7 +50,6 @@ class SimplifiedSolverEnvState:
         return cls(
             task=task,
             library_name="numrs2",
-            image_name="coder-mcp-numrs2:latest",
             prethink=prethink,
             messages=[],
             qwen_no_think=qwen_no_think,
@@ -56,7 +58,6 @@ class SimplifiedSolverEnvState:
     def with_messages(self, messages: list[TinkerMessage]) -> Self:
         return self.__class__(
             task=self.task,
-            image_name=self.image_name,
             library_name=self.library_name,
             prethink=self.prethink,
             messages=messages,
@@ -106,7 +107,7 @@ class SearchTool(Tool):
 class ReplaceAndRunTool(Tool):
     def __init__(
         self,
-        runtime: RustCodingEnvironment,
+        runtime: Runtime,
         mutable_state: SimplifiedSolverMutableState,
     ):
         self.runtime = runtime
@@ -150,22 +151,6 @@ class ReplaceAndRunTool(Tool):
             tool_call_id=input.call_id,
         )
         return ToolResult(messages=[msg])
-
-
-type SSConclusion = Literal[
-    "success",
-    "context_length_exceeded",
-    "no_code_found",
-    "no_text_content",
-    "code_did_not_compile",
-    "verification_failed",
-    "verification_error",
-    "environment_error",
-    "rewire_failed",
-    "max_turns_exceeded",
-    "not_finished",
-    "parse_failed",
-]
 
 
 class SSMetrics(TypedDict):
@@ -213,7 +198,7 @@ class SSStepResult(MessageStepResult):
 @dataclass
 class SimplifiedSolverEnv(MessageEnv):
     initial_state: SimplifiedSolverEnvState
-    rust_env: RustCodingEnvironment
+    rust_env: Runtime
     rust_doc_analyzer: RustDocAnalyzer
     initial_messages: list[TinkerMessage]
     reward_fn: LLMAsAJudgeSingleTurn
@@ -296,15 +281,15 @@ class SimplifiedSolverEnv(MessageEnv):
 
                 await self.rust_env.set_content("src/main.rs", code)
 
-                reward, reward_metrics = await self.reward_fn(self.history)
+                reward, conclusion = await self.reward_fn(self.history)
 
                 return SSStepResult(
                     reward=reward,
                     episode_done=True,
                     next_messages=self.history,
-                    conclusion="success",
+                    conclusion=conclusion,
                 )
-        except RustEnvError as e:
+        except CoderMCPRuntimeError as e:
             raise CodingEnvironmentError(f"Environment error during step: {e}") from e
 
     async def get_state(self) -> SimplifiedSolverEnvState:
@@ -455,42 +440,46 @@ async def build_simplified_solver_env(
     renderer: Renderer,
     verifier: Verifier,
     rust_doc_analyzer: RustDocAnalyzer,
+    runtime_settings: RuntimeSettings,
     max_trajectory_tokens: int = 32 * 1024,
     max_turns: int = 10,
 ) -> AsyncGenerator[SimplifiedSolverTokenEnv, None]:
-    async with RustCodingEnvironment(image_name=env_state.image_name) as rust_env:
-        exclude = ["target", ".git"]
-        tree_structure = await rust_env.tree(".", exclude=exclude, truncate=20)
+    try:
+        async with runtime_settings.build_runtime() as rust_env:
+            exclude = ["target", ".git"]
+            tree_structure = await rust_env.tree(".", exclude=exclude, truncate=20)
 
-        mutable_state = SimplifiedSolverMutableState(remaining_turns=max_turns)
-        tools_list = [
-            SearchTool(rust_doc_analyzer),
-            ReplaceAndRunTool(rust_env, mutable_state),
-        ]
+            mutable_state = SimplifiedSolverMutableState(remaining_turns=max_turns)
+            tools_list = [
+                SearchTool(rust_doc_analyzer),
+                ReplaceAndRunTool(rust_env, mutable_state),
+            ]
 
-        msg_env = SimplifiedSolverEnv(
-            initial_state=env_state,
-            rust_env=rust_env,
-            rust_doc_analyzer=rust_doc_analyzer,
-            initial_messages=get_simplified_solver_initial_messages(
-                env_state=env_state,
-                tree_structure=tree_structure,
-                tools=[t.to_spec() for t in tools_list],
-                renderer=renderer,
-            ),
-            reward_fn=LLMAsAJudgeSingleTurn(
-                task=env_state.task,
+            msg_env = SimplifiedSolverEnv(
+                initial_state=env_state,
                 rust_env=rust_env,
-                verifier=verifier,
-                tree_structure=tree_structure,
-            ),
-            mutable_state=mutable_state,
-        )
+                rust_doc_analyzer=rust_doc_analyzer,
+                initial_messages=get_simplified_solver_initial_messages(
+                    env_state=env_state,
+                    tree_structure=tree_structure,
+                    tools=[t.to_spec() for t in tools_list],
+                    renderer=renderer,
+                ),
+                reward_fn=LLMAsAJudgeSingleTurn(
+                    task=env_state.task,
+                    rust_env=rust_env,
+                    verifier=verifier,
+                    tree_structure=tree_structure,
+                ),
+                mutable_state=mutable_state,
+            )
 
-        yield SimplifiedSolverTokenEnv(
-            renderer=renderer,
-            message_env=msg_env,
-            prethink=env_state.prethink,
-            failed_parse_reward=-1.0,
-            max_trajectory_tokens=max_trajectory_tokens,
-        )
+            yield SimplifiedSolverTokenEnv(
+                renderer=renderer,
+                message_env=msg_env,
+                prethink=env_state.prethink,
+                failed_parse_reward=-1.0,
+                max_trajectory_tokens=max_trajectory_tokens,
+            )
+    except CoderMCPRuntimeError as e:
+        raise CodingEnvironmentError(f"Environment error during setup: {e}") from e

@@ -2,7 +2,7 @@ import logging
 import re
 from typing import cast
 
-from coder_mcp.runtime.rust_env import RustEnvError
+from coder_mcp.runtime import CoderMCPRuntimeError
 from oai_utils.tinker import TinkerModel
 from tinker_cookbook.renderers.base import Message as TinkerMessage
 from tinker_cookbook.renderers.base import TextPart, ThinkingPart
@@ -20,6 +20,7 @@ from adapter_agent.hierarchical.process.rewire_session import (
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.rl.completer import TinkerMessageCompleter
 from adapter_agent.rl.env.reward import LLMAsAJudge
+from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.rl.env.simplified_solver import (
     SimplifiedSolverEnv,
     SimplifiedSolverEnvState,
@@ -37,7 +38,6 @@ async def _rewire_solution(
     msg_env: SimplifiedSolverEnv,
     last_assistant_msg: TinkerMessage,
 ) -> list[TinkerMessage] | None:
-
     if isinstance(last_assistant_msg["content"], str):
         final_text = last_assistant_msg["content"]
     else:
@@ -129,18 +129,22 @@ Okay, let's see. [Your reasoning here...]
     try:
         execution_output, _ = await msg_env.rust_env.run_cargo()
         main_rs_content = await msg_env.rust_env.view_file("src/main.rs")
-    except RustEnvError as e:
+    except CoderMCPRuntimeError as e:
         logger.error(f"Environment error during rewiring execution: {e}")
         return None
 
     qa = QA(question=task.instruction, answer=answer_str)
-
-    verification_result = await verifier.verify(
-        qa=qa,
-        tree_structure=msg_env.reward_fn.tree_structure,
-        execution_output=execution_output,
-        main_rs_content=main_rs_content,
-    )
+    try:
+        verification_result = await verifier.verify(
+            qa=qa,
+            tree_structure=msg_env.reward_fn.tree_structure,
+            execution_output=execution_output,
+            main_rs_content=main_rs_content,
+        )
+    except Exception as e:
+        raise CodingEnvironmentError(
+            f"Environment error during rewiring verification: {e}"
+        ) from e
 
     if verification_result.success:
         rewired_traj = list(msg_env.initial_messages)
@@ -174,121 +178,123 @@ async def ss_solve(
     rewirer_model: TinkerModel,
     task: Task,
     max_turns: int,
+    runtime_settings: RuntimeSettings,
     qwen_no_think: bool = False,
 ) -> RewireSessionResult:
     ss_state = SimplifiedSolverEnvState.numrs2(task=task, qwen_no_think=qwen_no_think)
-    async with build_simplified_solver_env(
-        env_state=ss_state,
-        renderer=solver_model.renderer,
-        verifier=verifier,
-        rust_doc_analyzer=verifier.rust_doc_analyzer,
-        max_turns=max_turns,
-    ) as env:
-        msg_env = cast(SimplifiedSolverEnv, env.message_env)
-
-        completer = TinkerMessageCompleter(
-            solver_model.sampling_client,
+    try:
+        async with build_simplified_solver_env(
+            env_state=ss_state,
             renderer=solver_model.renderer,
-            max_tokens=None,  # type: ignore
-        )
+            verifier=verifier,
+            rust_doc_analyzer=verifier.rust_doc_analyzer,
+            max_turns=max_turns,
+            runtime_settings=runtime_settings,
+        ) as env:
+            msg_env = cast(SimplifiedSolverEnv, env.message_env)
 
-        ob = await msg_env.initial_observation()
-        transitions = []
-        while True:
-            try:
-                ac_message = await completer(ob)
-                ac_with_logprobs = ac_message["tokens_with_logprobs"]
-            except MaximumContextExceeded:
-                logger.debug("Maximum context length exceeded during the rewiring loop")
-                ob.append(
-                    TinkerMessage(
-                        role="tool",
-                        content="The result of your action resulted in context length overflow.",
-                    )
-                )
+            completer = TinkerMessageCompleter(
+                solver_model.sampling_client,
+                renderer=solver_model.renderer,
+                max_tokens=None,  # type: ignore
+            )
 
-                trajectory = (
-                    Trajectory(
-                        transitions=transitions,
-                        final_ob=solver_model.renderer.build_generation_prompt(ob),
+            ob = await msg_env.initial_observation()
+            transitions = []
+            while True:
+                try:
+                    ac_message = await completer(ob)
+                    ac_with_logprobs = ac_message["tokens_with_logprobs"]
+                except MaximumContextExceeded:
+                    logger.debug(
+                        "Maximum context length exceeded during the rewiring loop"
                     )
-                    if transitions
-                    else None
+                    ob.append(
+                        TinkerMessage(
+                            role="tool",
+                            content="The result of your action resulted in context length overflow.",
+                        )
+                    )
+
+                    trajectory = (
+                        Trajectory(
+                            transitions=transitions,
+                            final_ob=solver_model.renderer.build_generation_prompt(ob),
+                        )
+                        if transitions
+                        else None
+                    )
+                    if trajectory is None:
+                        return RewireSessionResultError(
+                            task=task,
+                            conclusion="context_length_exceeded",
+                        )
+
+                    return RewireSessionResultFailure(
+                        task=task,
+                        trials=ob,
+                        conclusion="context_length_exceeded",
+                        trajectory=trajectory,
+                    )
+
+                model_input = solver_model.renderer.build_generation_prompt(ob)
+                step_result = await msg_env.step(ac_message)
+                if ac_with_logprobs is not None:
+                    transition = Transition(
+                        ob=model_input,
+                        ac=ac_with_logprobs,
+                        reward=step_result.reward,
+                        episode_done=step_result.episode_done,
+                        metrics=getattr(step_result, "metrics", {}),
+                        logs=getattr(step_result, "logs", {}),
+                    )
+                    transitions.append(transition)
+
+                ob = step_result.next_messages
+                if step_result.episode_done:
+                    break
+
+            trajectory = Trajectory(
+                transitions=transitions,
+                final_ob=solver_model.renderer.build_generation_prompt(ob),
+            )
+
+            if LLMAsAJudge.is_successful_reward(step_result.reward):
+                # Retrieve the final valid Rust code from the environment history
+                # Assuming the last assistant message before reward contains the code
+                last_assistant_msg = next(
+                    (m for m in reversed(ob) if m["role"] == "assistant")
                 )
-                if trajectory is None:
+                rewired_msg_traj = await _rewire_solution(
+                    rewirer_model=rewirer_model,
+                    verifier=verifier,
+                    task=task,
+                    msg_env=msg_env,
+                    last_assistant_msg=last_assistant_msg,
+                )
+                if rewired_msg_traj is not None:
+                    return RewireSessionResultSuccess(
+                        task=task,
+                        trials=ob,
+                        rewired=rewired_msg_traj,
+                        trajectory=trajectory,
+                    )
+                else:
                     return RewireSessionResultError(
                         task=task,
-                        conclusion="context_length_exceeded",
+                        conclusion="rewire_failed",
                     )
-
+            else:
+                log_trajectory_if_debug(ob)
                 return RewireSessionResultFailure(
                     task=task,
                     trials=ob,
-                    conclusion="context_length_exceeded",
+                    conclusion=step_result.conclusion,
                     trajectory=trajectory,
                 )
-
-            model_input = solver_model.renderer.build_generation_prompt(ob)
-
-            try:
-                step_result = await msg_env.step(ac_message)
-            except CodingEnvironmentError as e:
-                logger.error(f"Environment error during step: {e}")
-                return RewireSessionResultError(
-                    task=task,
-                    conclusion="environment_error",
-                )
-
-            if ac_with_logprobs is not None:
-                transition = Transition(
-                    ob=model_input,
-                    ac=ac_with_logprobs,
-                    reward=step_result.reward,
-                    episode_done=step_result.episode_done,
-                    metrics=getattr(step_result, "metrics", {}),
-                    logs=getattr(step_result, "logs", {}),
-                )
-                transitions.append(transition)
-
-            ob = step_result.next_messages
-            if step_result.episode_done:
-                break
-
-        trajectory = Trajectory(
-            transitions=transitions,
-            final_ob=solver_model.renderer.build_generation_prompt(ob),
+    except CodingEnvironmentError as e:
+        logger.error(f"Environment error: {e}")
+        return RewireSessionResultError(
+            task=task,
+            conclusion="environment_error",
         )
-
-        if LLMAsAJudge.is_successful_reward(step_result.reward):
-            # Retrieve the final valid Rust code from the environment history
-            # Assuming the last assistant message before reward contains the code
-            last_assistant_msg = next(
-                (m for m in reversed(ob) if m["role"] == "assistant")
-            )
-            rewired_msg_traj = await _rewire_solution(
-                rewirer_model=rewirer_model,
-                verifier=verifier,
-                task=task,
-                msg_env=msg_env,
-                last_assistant_msg=last_assistant_msg,
-            )
-            if rewired_msg_traj is not None:
-                return RewireSessionResultSuccess(
-                    task=task,
-                    trials=ob,
-                    rewired=rewired_msg_traj,
-                    trajectory=trajectory,
-                )
-            else:
-                return RewireSessionResultError(
-                    task=task,
-                    conclusion="rewire_failed",
-                )
-        else:
-            log_trajectory_if_debug(ob)
-            return RewireSessionResultFailure(
-                task=task,
-                trials=ob,
-                conclusion=step_result.conclusion,
-                trajectory=trajectory,
-            )

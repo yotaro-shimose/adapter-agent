@@ -1,6 +1,6 @@
 import logging
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 from oai_utils.tinker import TinkerModel
@@ -17,7 +17,7 @@ from adapter_agent.hierarchical.agent.rewirer import (
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.rl.completer import TinkerTokenCompleter
-from adapter_agent.rl.env.simplified_solver import SSConclusion
+from adapter_agent.rl.env.conclusion import SSConclusion
 from adapter_agent.rl.env.standard import (
     EnvState,
     LLMAsAJudge,
@@ -58,7 +58,7 @@ class RewireSessionResultNormal:
 
 @dataclass(kw_only=True)
 class RewireSessionResultSuccess(RewireSessionResultNormal):
-    conclusion: SSConclusion = "success"
+    conclusion: SSConclusion = field(default="success", init=False)
     rewired: list[TinkerMessage]
     reward: float = 1.0
 

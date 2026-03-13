@@ -2,6 +2,7 @@ import logging
 import re
 from dataclasses import dataclass
 
+from agents import RunConfig
 from oai_utils.agent import AgentsSDKModel, AgentWrapper
 from tinker_cookbook.renderers.base import Message as TinkerMessage
 
@@ -42,12 +43,15 @@ Provide your reasoning, and then output the subtask instruction inside a <subtas
             model=self.model,
         )
 
-        result = await agent.run(f"""\
+        result = await agent.run(
+            f"""\
 Analyze the following trajectory and generate a sub-task.
 <Trajectory>
 {format_trajectory_transcript(trajectory)}
 </Trajectory>
-""")
+""",
+            run_config=RunConfig(tracing_disabled=True),
+        )
         response_text = result.final_output()
         match = re.search(r"<subtask>(.*?)</subtask>", response_text, re.DOTALL)
         if not match:
