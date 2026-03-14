@@ -31,6 +31,10 @@ dependencies = [
     "debugpy>=1.8.20",
     "requests>=2.32.5",
     "urllib3>=2.6.3",
+    "chardet~=5.0",
+    "pyvis>=0.3.2",
+    "networkx>=3.6.1",
+    "streamlit>=1.55.0",
 ]
 
 [build-system]
