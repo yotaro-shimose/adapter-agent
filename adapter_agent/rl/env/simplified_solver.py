@@ -42,10 +42,15 @@ class SimplifiedSolverEnvState:
     prethink: str | None
     messages: list[TinkerMessage]
     qwen_no_think: bool = False
+    knowledge: str | None = None
 
     @classmethod
     def numrs2(
-        cls, task: Task, prethink: str | None = None, qwen_no_think: bool = False
+        cls,
+        task: Task,
+        prethink: str | None = None,
+        qwen_no_think: bool = False,
+        knowledge: str | None = None,
     ) -> Self:
         return cls(
             task=task,
@@ -53,6 +58,7 @@ class SimplifiedSolverEnvState:
             prethink=prethink,
             messages=[],
             qwen_no_think=qwen_no_think,
+            knowledge=knowledge,
         )
 
     def with_messages(self, messages: list[TinkerMessage]) -> Self:
@@ -324,14 +330,18 @@ Unverified answer gets automatically rejected. You should confirm your work by r
 Once you confirmed that the solution works, you must output your final answer as a complete, fully functioning source code enclosed in a ```rust ... ``` block. You can also provide any necessary explanation.
 Note you MUST submit your answer after running the code and verifying the output. Code which does not work will be automatically rejected.
 </HowTo>
+"""
 
-<Guidelines>
+    guidelines = """\
 Verification: Once again, you MUST verify your answer. You should make your best efforts to avoid hallucination and make sure your answer is correct.
 Self-contained: Note your solution has to be fully self-contained including both fully functioning source code and explanation.
 Code block inclusion: Your final answer must include exactly one ```rust\n<your_code_here>\n``` block. It's content will be pasted to main.rs and executed for verification.
 Simple Search Keyword: When using the `search` tool, it is highly recommended to use only one keyword such as "array" or "conv2d" otherwise the search tool does not return anything.
 Error Reflection: If replace_and_run fails, analyze the error carefully. WHen you find your understanding about the library is wrong, use search tool again.
-</Guidelines>"""
+"""
+    if env_state.knowledge is not None:
+        guidelines += "Knowledge: You will also be provided with some knowledge about the library which may help you to solve the problem. You can use or not to use it."
+    PROMPT += f"\n<Guidelines>\n{guidelines}\n</Guidelines>"
 
     initial_message = f"""<Task>
 {env_state.task.instruction}
@@ -343,7 +353,12 @@ Error Reflection: If replace_and_run fails, analyze the error carefully. WHen yo
 
 <Current src/main.rs>
 {CARGO_INIT_MAIN_RS}
-</Current src/main.rs>"""
+</Current src/main.rs>
+"""
+
+    if env_state.knowledge is not None:
+        initial_message += f"\n\n<Knowledge>\n{env_state.knowledge}\n</Knowledge>"
+
     if env_state.qwen_no_think:
         initial_message = "/no_think " + initial_message
 

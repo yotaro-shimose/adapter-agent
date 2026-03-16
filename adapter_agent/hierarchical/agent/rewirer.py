@@ -1,4 +1,5 @@
 import logging
+import re
 from dataclasses import dataclass
 
 from agents import ModelSettings, RunContextWrapper, StopAtTools, function_tool
@@ -54,7 +55,9 @@ def report_feedback(
 
 
 def format_trajectory_transcript(
-    messages: list[TinkerMessage], use_thinking: bool = False
+    messages: list[TinkerMessage],
+    use_thinking: bool = False,
+    flip_tag: bool = False,
 ) -> str:
     """Formats a list of agent-environment messages into a readable transcript."""
     transcript_lines = []
@@ -110,7 +113,14 @@ def format_trajectory_transcript(
             transcript_lines.append(content)
             transcript_lines.append("")
 
-    return "\n".join(transcript_lines)
+    transcript = "\n".join(transcript_lines)
+
+    if flip_tag:
+        # Rewrite HTML tags: <Tag>Content</Tag> -> >Tag<Content/Tag<
+        transcript = re.sub(
+            r"<([^>]+)>(.*?)</\1>", r">\1<\2/\1<", transcript, flags=re.DOTALL
+        )
+    return transcript
 
 
 def _log_rewire_result_debug(
@@ -401,7 +411,9 @@ class SingleTurnRewirer[T: AgentsSDKModel](BaseAgent[T]):
             raise ValueError("State messages is None")
         original_transcript = format_trajectory_transcript(state.messages)
 
-        async with CloudRunRuntime(image_uri=state.image_uri) as rust_env:
+        async with CloudRunRuntime(
+            image_uri=state.runtime_settings.image_uri
+        ) as rust_env:
             # Seed the student's code so replace_and_run has something to replace
             assistant_content = ""
             for msg in reversed(state.messages):

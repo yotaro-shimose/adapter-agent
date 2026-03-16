@@ -34,6 +34,7 @@ from adapter_agent.model_helper import get_gemini
 from adapter_agent.rl.config import EnvParams, ExperimentSettings, ModelLoadingSettings
 from adapter_agent.rl.env.simplified_solver import conclusion_to_metrics
 from adapter_agent.rl.shared_sampling_client import SharedSamplingClient
+from adapter_agent.rl.task_net import TaskNetwork, TaskWithMeta
 from adapter_agent.rl.trajectory import prepare_minibatch_simplified_sync
 from adapter_agent.util.logger_util import setup_base_loglevel
 from adapter_agent.util.task_queue import TaskQueue
@@ -45,12 +46,6 @@ logger = logging.getLogger(__name__)
 class Counted[T]:
     count: int
     item: T
-
-
-@dataclass
-class CountedTask:
-    count: int | None
-    item: Task
 
 
 @dataclass
@@ -290,7 +285,7 @@ class MetricManager:
 @dataclass
 class UniRLState:
     # Model
-    study_task_queue: TaskQueue[CountedTask]
+    study_task_queue: TaskNetwork
     practice_task_queue: TaskQueue[Task]
     buffer: HybridReplayBuffer
     litellm_model_name: str
@@ -320,7 +315,7 @@ class UniRLState:
         )
 
     @ray.method
-    async def get_next_study_task(self) -> CountedTask:
+    async def get_next_study_task(self) -> TaskWithMeta:
         return await self.study_task_queue.get()
 
     @ray.method
@@ -350,9 +345,10 @@ class UniRLState:
         self,
         worker_id: int,
         items: list[RewireSessionResult],
-        counted_task: CountedTask,
+        counted_task: TaskWithMeta,
     ):
         for item in items:
+            counted_task.register_result(item.conclusion)
             metrics = conclusion_to_metrics(item.conclusion)
             buffer_metrics = self.buffer.get_metrics()
             task_queue_metrics = {
@@ -368,8 +364,6 @@ class UniRLState:
                 self.buffer.sft_store.put(
                     SFTSample(task=item.task, messages=item.rewired)
                 )
-        task = counted_task.item
-
         num_success = sum(
             1 for ret in items if isinstance(ret, RewireSessionResultSuccess)
         )
@@ -379,8 +373,8 @@ class UniRLState:
                 f"Study worker {worker_id} produced {num_success}/{len(items)} successful trajectory"
             )
         else:
-            if counted_task.count is not None:
-                remaining_count = counted_task.count - 1
+            if counted_task.attempt is not None:
+                remaining_count = counted_task.attempt - 1
                 if remaining_count == 0:
                     logger.info(
                         f"Study worker {worker_id} produced {num_success}/{len(items)} successful trajectory. Task failed too many times, giving up without generating subtasks."
@@ -388,9 +382,7 @@ class UniRLState:
                     return
             else:
                 remaining_count = None
-            await self.study_task_queue.put(
-                item=CountedTask(count=remaining_count, item=task)
-            )
+            await self.study_task_queue.put(item=counted_task)
             logger.info(
                 f"Study worker {worker_id} produced {num_success}/{len(items)} successful trajectory. Added retry task. Remaining count: {remaining_count}"
             )
@@ -417,8 +409,8 @@ class UniRLState:
                                 )
                             else:
                                 await self.study_task_queue.put(
-                                    item=CountedTask(
-                                        count=self.max_study_retry, item=subtask
+                                    item=TaskWithMeta.from_task(
+                                        subtask, level=counted_task.level + 1
                                     )
                                 )
                                 logger.info(
@@ -456,7 +448,9 @@ class UniRLState:
 
         if success_counts == 0:
             await self.study_task_queue.put(
-                CountedTask(count=self.max_study_retry, item=task)
+                TaskWithMeta.from_task(
+                    task, level=0
+                )  # Practice tasks are likely top-level or level not easily tracked here
             )
             logger.info(
                 f"Practice worker {worker_id} generated {success_counts}/{len(items)} successful samples, putting it to study queue."

@@ -8,7 +8,7 @@ from typing import cast
 from oai_utils.tinker import TinkerModel
 
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
-from adapter_agent.rl.unirl_state import CountedTask
+from adapter_agent.rl.unirl_state import TaskWithMeta
 
 # Silence Ray logs
 os.environ["RAY_DEDUP_LOGS"] = "0"
@@ -394,7 +394,7 @@ async def main():
     setup_rollout_logging()
 
     tasks = load_gh_archive()
-    study_queue = TaskQueue[CountedTask].create(
+    study_queue = TaskQueue[TaskWithMeta].create(
         order="LIFO", maxsize=cfg.study_queue_size
     )
 
@@ -409,7 +409,7 @@ async def main():
     for task in tasks:
         # TaskQueue.put_nowait is sync
         study_queue.put_nowait(
-            CountedTask(count=None, item=task)  # Initial TaskはNone
+            TaskWithMeta.from_task(task, level=0)  # Initial TaskはNone
         )
 
     rust_doc_analyzer = RustDocAnalyzer.from_libdir(cfg.env_params.library.local_path)

@@ -25,6 +25,18 @@ class QA(BaseModel):
 class QRA(QA):
     reasoning: str
 
+    def to_tinker_messages(self) -> list[TinkerMessage]:
+        return [
+            TinkerMessage(role="user", content=self.question),
+            TinkerMessage(
+                role="assistant",
+                content=[
+                    ThinkingPart(type="thinking", thinking=self.reasoning),
+                    TextPart(type="text", text=self.answer),
+                ],
+            ),
+        ]
+
 
 class QRADataset(BaseModel):
     problems: list[QRA]

@@ -208,13 +208,21 @@ def get_single_turn_initial_messages(
 ) -> list[TinkerMessage]:
     if env_state.messages:
         return env_state.messages
+    return get_single_turn_initial_messages_from_libtask(
+        env_state.library_name, env_state.task
+    )
+
+
+def get_single_turn_initial_messages_from_libtask(
+    library_name: str, task: Task
+) -> list[TinkerMessage]:
     system_prompt = f"""
 <Role>
 You are an expert Rust software engineer.
 Your task is to solve user provided problem.
 </Role>
 
-{CONTEXT.format(library_name=env_state.library_name)}
+{CONTEXT.format(library_name=library_name)}
 
 <HowTo>
 You DO NOT have access to library documents or source codes. You are expected to solve the problem based on your knowledge / recall.
@@ -227,7 +235,7 @@ The code will be automatically pasted into src/main.rs, compiled and run. So tha
 
     initial_message = f"""
 <Task>
-{env_state.task.instruction}
+{task.instruction}
 </Task>
 """
     return [

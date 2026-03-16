@@ -5,10 +5,9 @@ from typing import cast
 from coder_mcp.runtime import CoderMCPRuntimeError
 from oai_utils.tinker import TinkerModel
 from tinker_cookbook.renderers.base import Message as TinkerMessage
-from tinker_cookbook.renderers.base import TextPart, ThinkingPart
 from tinker_cookbook.rl.types import Trajectory, Transition
 
-from adapter_agent.data import QA
+from adapter_agent.data import QA, QRA
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.process.rewire_session import (
     RewireSessionResult,
@@ -37,7 +36,7 @@ async def _rewire_solution(
     task: Task,
     msg_env: SimplifiedSolverEnv,
     last_assistant_msg: TinkerMessage,
-) -> list[TinkerMessage] | None:
+) -> QRA | None:
     if isinstance(last_assistant_msg["content"], str):
         final_text = last_assistant_msg["content"]
     else:
@@ -147,24 +146,14 @@ Okay, let's see. [Your reasoning here...]
         ) from e
 
     if verification_result.success:
-        rewired_traj = list(msg_env.initial_messages)
-
-        new_assistant_content: list = [
-            ThinkingPart(type="thinking", thinking=reasoning_str),
-            TextPart(type="text", text=answer_str),
-        ]
-
-        rewired_traj.append(
-            TinkerMessage(
-                role="assistant",
-                content=new_assistant_content,
-            )
+        qra = QRA(
+            question=task.instruction,
+            answer=answer_str,
+            reasoning=reasoning_str,
         )
 
-        log_trajectory_if_debug(rewired_traj)
-
         logger.info("Successfully solved and rewired")
-        return rewired_traj
+        return qra
     else:
         logger.debug(
             f"Verification of rewired answer failed: {verification_result.reasoning}"
@@ -180,8 +169,11 @@ async def ss_solve(
     max_turns: int,
     runtime_settings: RuntimeSettings,
     qwen_no_think: bool = False,
+    knowledges: str | None = None,
 ) -> RewireSessionResult:
-    ss_state = SimplifiedSolverEnvState.numrs2(task=task, qwen_no_think=qwen_no_think)
+    ss_state = SimplifiedSolverEnvState.numrs2(
+        task=task, qwen_no_think=qwen_no_think, knowledge=knowledges
+    )
     try:
         async with build_simplified_solver_env(
             env_state=ss_state,
@@ -265,18 +257,18 @@ async def ss_solve(
                 last_assistant_msg = next(
                     (m for m in reversed(ob) if m["role"] == "assistant")
                 )
-                rewired_msg_traj = await _rewire_solution(
+                rewired_qra = await _rewire_solution(
                     rewirer_model=rewirer_model,
                     verifier=verifier,
                     task=task,
                     msg_env=msg_env,
                     last_assistant_msg=last_assistant_msg,
                 )
-                if rewired_msg_traj is not None:
+                if rewired_qra is not None:
                     return RewireSessionResultSuccess(
                         task=task,
                         trials=ob,
-                        rewired=rewired_msg_traj,
+                        qra=rewired_qra,
                         trajectory=trajectory,
                     )
                 else:
