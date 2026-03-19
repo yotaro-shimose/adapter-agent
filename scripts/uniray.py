@@ -1,35 +1,36 @@
 import asyncio
 import logging
 import os
-from datetime import datetime
-from pathlib import Path
-from typing import cast
-
-from oai_utils.tinker import TinkerModel
-
-from adapter_agent.rl.env.runtime_settings import RuntimeSettings
-from adapter_agent.rl.unirl_state import TaskWithMeta
 
 # Silence Ray logs
 os.environ["RAY_DEDUP_LOGS"] = "0"
 os.environ["RAY_COLOR_PREFIX"] = "0"
 os.environ["OPENAI_AGENTS_DISABLE_TRACING"] = "1"
-from asyncio import timeout
 from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import cast
 
 import ray
 import tinker
 import tinker_cookbook.checkpoint_utils
 from dotenv import load_dotenv
 from oai_utils.litellm import litellm_concurrent_limit
-from oai_utils.tinker import setup_tinkermodel
+from oai_utils.tinker import TinkerModel, setup_tinkermodel
 from ray.actor import ActorHandle
 from tinker import AdamParams
 
+from adapter_agent.hierarchical.agent.analyzer import Analyzer
+from adapter_agent.hierarchical.agent.knowledge_summarizer import KnowledgeSummarizer
 from adapter_agent.hierarchical.agent.task_verifier import TaskVerifier
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.gh import Library
 from adapter_agent.hierarchical.process.rewire import ss_solve
+from adapter_agent.hierarchical.process.rewire_session import (
+    RewireSessionResultFailure,
+    RewireSessionResultNormal,
+    log_trajectory,
+)
 from adapter_agent.hierarchical.process.rewire_session_single_turn import (
     solve_verify_tinker_single_turn,
 )
@@ -37,15 +38,17 @@ from adapter_agent.hierarchical.types import Task
 from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
 from adapter_agent.model_helper import get_gemini
 from adapter_agent.rl.config import EnvParams, ExperimentSettings, ModelLoadingSettings
+from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.rl.env.single_turn import SingleTurnEnvState
 from adapter_agent.rl.shared_sampling_client import SharedSamplingClient
+from adapter_agent.rl.task_net import TaskNetwork
 from adapter_agent.rl.unirl_state import (
     HybridReplayBuffer,
     PracticeRolloutParams,
-    StudyRolloutParams,
     UniRLConfig,
     UniRLState,
     UniRLTrainParams,
+    study_task_manager_from_state_handle,
 )
 from adapter_agent.util.exception import CodingEnvironmentError
 from adapter_agent.util.logger_util import setup_base_loglevel
@@ -59,7 +62,6 @@ def study_rollout(
     worker_id: int,
     state: ActorHandle[UniRLState],
     verifier: Verifier,
-    study_rollout_params: StudyRolloutParams,
     env_params: EnvParams,
 ):
     setup_rollout_logging()
@@ -68,7 +70,6 @@ def study_rollout(
             worker_id,
             state,
             verifier,
-            study_rollout_params,
             env_params,
         )
     )
@@ -78,42 +79,60 @@ async def _study_rollout(
     worker_id: int,
     state: ActorHandle[UniRLState],
     verifier: Verifier,
-    study_rollout_params: StudyRolloutParams,
     env_params: EnvParams,
 ):
     logger.info(f"Study worker {worker_id} started.")
     initial_model: TinkerModel = await state.get_latest_model.remote()
     initial_model.register_tinkerllm_to_litellm()
+    knowledge_summarizer = KnowledgeSummarizer(model=get_gemini())
 
     while True:
         latest_model = await state.get_latest_model.remote()
-        try:
-            async with timeout(10.0):
-                counted_task = await state.get_next_study_task.remote()
-        except asyncio.TimeoutError as e:
-            logger.warning(f"Study worker {worker_id} timed out getting a task: {e}")
-            continue
-        task = counted_task.item
-        logger.debug(f"Study worker {worker_id} got a task. ")
-        rets = await asyncio.gather(
-            *[
-                ss_solve(
-                    solver_model=latest_model,
-                    verifier=verifier,
-                    rewirer_model=initial_model,
-                    task=task,
-                    max_turns=env_params.max_turns,
-                    qwen_no_think=study_rollout_params.qwen_no_think,
-                    runtime_settings=env_params.runtime_settings,
+        study_task_manager = await study_task_manager_from_state_handle(state)
+
+        async with study_task_manager as current:
+            task = current.task
+            knowledges_str = None
+            if task.knowledges:
+                knowledges_str = await knowledge_summarizer.summarize(
+                    task.knowledges, task_instruction=task.task.instruction
                 )
-                for _ in range(study_rollout_params.rollouts_per_task)
-            ]
-        )
-        state.register_study_group.remote(
-            worker_id,
-            rets,
-            counted_task,
-        )
+
+            ret = await ss_solve(
+                solver_model=latest_model,
+                verifier=verifier,
+                rewirer_model=latest_model,
+                task=task.task,
+                max_turns=env_params.max_turns,
+                qwen_no_think=env_params.qwen_no_think,
+                runtime_settings=env_params.runtime_settings,
+                knowledges=knowledges_str,
+            )
+
+            if not task.is_generation or not isinstance(
+                ret, RewireSessionResultFailure
+            ):
+                current.register_result(ret, new_task=None)
+                continue
+
+            try:
+                analyzer = Analyzer(model=get_gemini())
+                subtask = await analyzer.analyze_trajectory(ret.trials)
+
+                # task_verifier = TaskVerifier(model=get_gemini())
+                # verification_result = await task_verifier.verify_task(
+                #     task=subtask, library_name="numrs2"
+                # )
+                # print(f"Verification Result: {verification_result.output_type}")
+
+                # if verification_result.output_type == "valid":
+                current.register_result(ret, new_task=subtask)
+
+                continue
+            except Exception as e:
+                logger.error(f"Subtask generation failed: {e}")
+                current.register_result(ret, new_task=None)
+                continue
 
 
 @ray.remote
@@ -357,6 +376,7 @@ async def main():
             #     type="docker",
             #     image_uri="coder-mcp-numrs2:latest",
             # ),
+            qwen_no_think=True,
             runtime_settings=RuntimeSettings(
                 type="cloudrun",
                 image_uri="europe-north1-docker.pkg.dev/dsat2-405406/shimose-repo/coder-mcp-numrs2",
@@ -365,10 +385,6 @@ async def main():
         model_loading_settings=ModelLoadingSettings(
             model_name="Qwen/Qwen3-8B",
             lora_rank=32,
-        ),
-        study_queue_size=500,
-        study_rollout_params=StudyRolloutParams(
-            rollouts_per_task=6, qwen_no_think=True, max_study_retry=5
         ),
         practice_rollout_params=PracticeRolloutParams(rollouts_per_task=6),
         train_params=UniRLTrainParams(
@@ -387,30 +403,18 @@ async def main():
             rl_group_size=32,
         ),
         num_study_workers=20,
-        num_practice_workers=8,
+        num_practice_workers=0,
         log_freq=50,
     )
 
     setup_rollout_logging()
 
     tasks = load_gh_archive()
-    study_queue = TaskQueue[TaskWithMeta].create(
-        order="LIFO", maxsize=cfg.study_queue_size
-    )
-
-    if study_queue.maxsize > 0 and len(tasks) > study_queue.maxsize:
-        raise ValueError(
-            f"Number of initial tasks ({len(tasks)}) exceeds the maximum "
-            f"capacity of the study queue ({study_queue.maxsize})."
-        )
-
+    study_queue = TaskNetwork()
     practice_queue = TaskQueue.create(order="FIFO", maxsize=0)
 
-    for task in tasks:
-        # TaskQueue.put_nowait is sync
-        study_queue.put_nowait(
-            TaskWithMeta.from_task(task, level=0)  # Initial TaskはNone
-        )
+    # TODO: add more tasks
+    study_queue.add_root(tasks[0])
 
     rust_doc_analyzer = RustDocAnalyzer.from_libdir(cfg.env_params.library.local_path)
     service_client = tinker.ServiceClient()
@@ -444,7 +448,6 @@ async def main():
             sampling_client_manager=sampling_client_manager,
             task_verifier=task_verifier,
             library_name=cfg.env_params.library.name,
-            max_study_retry=cfg.study_rollout_params.max_study_retry,
             cfg=cfg,
         ),
     )
@@ -460,7 +463,7 @@ async def main():
         ),
     )
     async with litellm_concurrent_limit(
-        cfg.num_study_workers * cfg.study_rollout_params.rollouts_per_task
+        cfg.num_study_workers
         + cfg.num_practice_workers * cfg.practice_rollout_params.rollouts_per_task
         + 10
     ):
@@ -475,7 +478,6 @@ async def main():
                 i,
                 state,
                 verifier,
-                cfg.study_rollout_params,
                 cfg.env_params,
             )
             study_workers.append(worker)

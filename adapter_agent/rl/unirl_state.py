@@ -5,10 +5,10 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping, Self, Sequence
 
-import numpy as np
 import ray
 from oai_utils.tinker import TinkerModel
 from pydantic import BaseModel
+from ray.actor import ActorHandle
 from tinker import AdamParams, Datum
 from tinker.types import LossFnType
 from tinker_cookbook.renderers import TrainOnWhat
@@ -19,10 +19,8 @@ from tinker_cookbook.supervised.data import conversation_to_datum
 from tinker_cookbook.utils import ml_log
 from tinker_cookbook.utils.ml_log import Logger as MLLogger
 
-from adapter_agent.hierarchical.agent.analyzer import Analyzer
 from adapter_agent.hierarchical.agent.task_verifier import TaskVerifier
 from adapter_agent.hierarchical.process.rewire_session import (
-    RewireSessionResult,
     RewireSessionResultNormal,
     RewireSessionResultSuccess,
 )
@@ -30,11 +28,15 @@ from adapter_agent.hierarchical.process.rewire_session_single_turn import (
     SolveVerifyTinkerSingleTurnResult,
 )
 from adapter_agent.hierarchical.types import Task
-from adapter_agent.model_helper import get_gemini
 from adapter_agent.rl.config import EnvParams, ExperimentSettings, ModelLoadingSettings
 from adapter_agent.rl.env.simplified_solver import conclusion_to_metrics
 from adapter_agent.rl.shared_sampling_client import SharedSamplingClient
-from adapter_agent.rl.task_net import TaskNetwork, TaskWithMeta
+from adapter_agent.rl.task_net import (
+    StudyTask,
+    StudyTaskCompleted,
+    StudyTaskContext,
+    TaskNetwork,
+)
 from adapter_agent.rl.trajectory import prepare_minibatch_simplified_sync
 from adapter_agent.util.logger_util import setup_base_loglevel
 from adapter_agent.util.task_queue import TaskQueue
@@ -70,12 +72,6 @@ class RLSample:
 type BatchType = Literal["Study", "Practice"]
 
 
-class StudyRolloutParams(BaseModel):
-    qwen_no_think: bool
-    rollouts_per_task: int
-    max_study_retry: int
-
-
 class PracticeRolloutParams(BaseModel):
     rollouts_per_task: int
 
@@ -95,13 +91,10 @@ class UniRLConfig(BaseModel):
     experiment_setting: ExperimentSettings
     env_params: EnvParams
     model_loading_settings: ModelLoadingSettings
-    study_rollout_params: StudyRolloutParams
     practice_rollout_params: PracticeRolloutParams
     train_params: UniRLTrainParams
-    study_queue_size: int
     num_study_workers: int
     num_practice_workers: int
-
     log_freq: int
 
 
@@ -268,7 +261,7 @@ class MetricManager:
         non_averaging_metrics: dict[str, float | int],
     ):
         self.study_metrics_list.append(metrics)
-        if len(self.study_metrics_list) % self.log_freq == 0:
+        if self.should_study_log():
             mean_metrics = self.mean_metrics(self.study_metrics_list)
             self.ml_logger.log_metrics(self.with_prefix(mean_metrics, "study"))
             self.ml_logger.log_metrics(self.with_prefix(non_averaging_metrics, "study"))
@@ -280,6 +273,9 @@ class MetricManager:
             mean_metrics = self.mean_metrics(self.practice_metrics_list)
             self.ml_logger.log_metrics(self.with_prefix(mean_metrics, "practice"))
             self.practice_metrics_list = []
+
+    def should_study_log(self) -> bool:
+        return len(self.study_metrics_list) % self.log_freq == 0
 
 
 @dataclass
@@ -293,7 +289,6 @@ class UniRLState:
     sampling_client_manager: SharedSamplingClient
     task_verifier: TaskVerifier
     library_name: str
-    max_study_retry: int
     cfg: UniRLConfig
     metric_manager: MetricManager = field(init=False)
     ml_logger: MLLogger = field(init=False)
@@ -315,8 +310,41 @@ class UniRLState:
         )
 
     @ray.method
-    async def get_next_study_task(self) -> TaskWithMeta:
-        return await self.study_task_queue.get()
+    def get_next_study_task(self) -> StudyTask:
+        study_task = self.study_task_queue.get_and_setup_next_study_task()
+        return study_task
+
+    @ray.method
+    def register_study_result(self, study_task: StudyTaskCompleted):
+        self.study_task_queue.study_task_teardown(study_task)
+        result = study_task.result
+        if not isinstance(result, RewireSessionResultNormal):
+            return
+
+        self.handle_study_result(result)
+        if isinstance(result, RewireSessionResultSuccess):
+            self.buffer.sft_store.put(
+                SFTSample(
+                    task=study_task.task, messages=result.qra.to_tinker_messages()
+                )
+            )
+        if self.metric_manager.should_study_log():
+            self.study_task_queue.save_visualization(
+                self.cfg.experiment_setting.log_root() / "task_net.html"
+            )
+
+    def handle_study_result(self, result: RewireSessionResultNormal):
+        metrics = conclusion_to_metrics(result.conclusion)
+        buffer_metrics = self.buffer.get_metrics()
+        task_queue_metrics = {
+            "study_queue_size": self.study_task_queue.node_count(),
+            "practice_queue_size": self.practice_task_queue.qsize(),
+        }
+        non_averaging_metrics: dict[str, float | int] = {
+            **buffer_metrics,
+            **task_queue_metrics,
+        }
+        self.metric_manager.register_study_metrics(metrics, non_averaging_metrics)
 
     @ray.method
     async def get_next_practice_task(self) -> Task:
@@ -338,150 +366,64 @@ class UniRLState:
         return self._get_latest_model()
 
     def is_finished(self) -> bool:
-        return self.study_task_queue.is_done() and self.practice_task_queue.is_done()
-
-    @ray.method
-    async def register_study_group(
-        self,
-        worker_id: int,
-        items: list[RewireSessionResult],
-        counted_task: TaskWithMeta,
-    ):
-        for item in items:
-            counted_task.register_result(item.conclusion)
-            metrics = conclusion_to_metrics(item.conclusion)
-            buffer_metrics = self.buffer.get_metrics()
-            task_queue_metrics = {
-                "study_queue_size": self.study_task_queue.qsize(),
-                "practice_queue_size": self.practice_task_queue.qsize(),
-            }
-            non_averaging_metrics: dict[str, float | int] = {
-                **buffer_metrics,
-                **task_queue_metrics,
-            }
-            self.metric_manager.register_study_metrics(metrics, non_averaging_metrics)
-            if isinstance(item, RewireSessionResultSuccess):
-                self.buffer.sft_store.put(
-                    SFTSample(task=item.task, messages=item.rewired)
-                )
-        num_success = sum(
-            1 for ret in items if isinstance(ret, RewireSessionResultSuccess)
-        )
-
-        if num_success > 0:
-            logger.info(
-                f"Study worker {worker_id} produced {num_success}/{len(items)} successful trajectory"
-            )
-        else:
-            if counted_task.attempt is not None:
-                remaining_count = counted_task.attempt - 1
-                if remaining_count == 0:
-                    logger.info(
-                        f"Study worker {worker_id} produced {num_success}/{len(items)} successful trajectory. Task failed too many times, giving up without generating subtasks."
-                    )
-                    return
-            else:
-                remaining_count = None
-            await self.study_task_queue.put(item=counted_task)
-            logger.info(
-                f"Study worker {worker_id} produced {num_success}/{len(items)} successful trajectory. Added retry task. Remaining count: {remaining_count}"
-            )
-
-            trials_list = [
-                ret.trials
-                for ret in items
-                if isinstance(ret, RewireSessionResultNormal)
-            ]
-            if len(trials_list) > 0:
-                logger.debug(f"Study worker {worker_id} analyzing trajectory...")
-                trials = trials_list[0]
-                analyzer = Analyzer(model=get_gemini())  # TODO: Make this configurable
-                try:
-                    if random.random() < self.newitem_probability("Study"):
-                        subtask = await analyzer.analyze_trajectory(trials)
-                        try:
-                            verification_result = await self.task_verifier.verify_task(
-                                task=subtask, library_name=self.library_name
-                            )
-                            if verification_result.output_type != "success":
-                                logger.warning(
-                                    f"Study worker {worker_id} discarded generated subtask because it failed verification: {verification_result.output_type}. Task: {subtask.instruction}"
-                                )
-                            else:
-                                await self.study_task_queue.put(
-                                    item=TaskWithMeta.from_task(
-                                        subtask, level=counted_task.level + 1
-                                    )
-                                )
-                                logger.info(
-                                    f"Study worker {worker_id} produced failed trajectory. Added subtask `{subtask.instruction if subtask else None}`"
-                                )
-                        except Exception as ve:
-                            logger.warning(
-                                f"Study worker {worker_id} discarded generated subtask due to verification exception: {ve}"
-                            )
-                except Exception as e:
-                    logger.debug(
-                        f"Study worker {worker_id} failed to analyze trajectory: {e}."
-                    )
-            else:
-                logger.info(
-                    f"Study worker {worker_id} did not generate a new item because it did not have trajectory to reflect."
-                )
+        # TODO: implement actual finish condition
+        return False
 
     @ray.method
     async def register_practice_group(
         self, worker_id: int, items: list[SolveVerifyTinkerSingleTurnResult]
     ):
-        if not items:
-            return
+        # TODO: fix this
+        raise NotImplementedError
+        # if not items:
+        #     return
 
-        rewards = [item.reward for item in items]
-        task = items[0].env_state.task
+        # rewards = [item.reward for item in items]
+        # task = items[0].env_state.task
 
-        for item in items:
-            self.metric_manager.register_practice_metrics(
-                conclusion_to_metrics(item.conclusion)
-            )
+        # for item in items:
+        #     self.metric_manager.register_practice_metrics(
+        #         conclusion_to_metrics(item.conclusion)
+        #     )
 
-        success_counts = sum([int(ret.is_success()) for ret in items])
+        # success_counts = sum([int(ret.is_success()) for ret in items])
 
-        if success_counts == 0:
-            await self.study_task_queue.put(
-                TaskWithMeta.from_task(
-                    task, level=0
-                )  # Practice tasks are likely top-level or level not easily tracked here
-            )
-            logger.info(
-                f"Practice worker {worker_id} generated {success_counts}/{len(items)} successful samples, putting it to study queue."
-            )
-            return
+        # if success_counts == 0:
+        #     await self.study_task_queue.put(
+        #         TaskWithMeta.from_task(
+        #             task, level=0
+        #         )  # Practice tasks are likely top-level or level not easily tracked here
+        #     )
+        #     logger.info(
+        #         f"Practice worker {worker_id} generated {success_counts}/{len(items)} successful samples, putting it to study queue."
+        #     )
+        #     return
 
-        elif success_counts == len(items):
-            logger.info(
-                f"Practice worker {worker_id} generated {success_counts}/{len(items)} successful samples, removing the task from the queue"
-            )
-            return
+        # elif success_counts == len(items):
+        #     logger.info(
+        #         f"Practice worker {worker_id} generated {success_counts}/{len(items)} successful samples, removing the task from the queue"
+        #     )
+        #     return
 
-        else:
-            await self.practice_task_queue.put(task)
-            logger.info(
-                f"Practice worker {worker_id} generated {success_counts}/{len(items)} successful samples, putting it back to practice queue."
-            )
+        # else:
+        #     await self.practice_task_queue.put(task)
+        #     logger.info(
+        #         f"Practice worker {worker_id} generated {success_counts}/{len(items)} successful samples, putting it back to practice queue."
+        #     )
 
-        if self.uniform_reward(rewards):
-            return
+        # if self.uniform_reward(rewards):
+        #     return
 
-        rl_sample = RLSample(
-            task=task,
-            group=TrajectoryGroup(
-                trajectories_G=[item.trajectory for item in items],
-                final_rewards_G=rewards,
-                metrics_G=[],
-            ),
-        )
-        if not rl_sample.is_uniform_reward():
-            self.buffer.rl_store.put(rl_sample)
+        # rl_sample = RLSample(
+        #     task=task,
+        #     group=TrajectoryGroup(
+        #         trajectories_G=[item.trajectory for item in items],
+        #         final_rewards_G=rewards,
+        #         metrics_G=[],
+        #     ),
+        # )
+        # if not rl_sample.is_uniform_reward():
+        #     self.buffer.rl_store.put(rl_sample)
 
     @ray.method
     def get_batch(self) -> TinkerBatch | None:
@@ -507,18 +449,13 @@ class UniRLState:
             return True
         return all(r == rewards[0] for r in rewards)
 
-    def newitem_probability(self, batch_type: BatchType) -> float:
-        if batch_type == "Study":
-            queue = self.study_task_queue
-        elif batch_type == "Practice":
-            queue = self.practice_task_queue
-        else:
-            raise ValueError("Unexpected batch type")
 
-        if queue.maxsize == 0:
-            probability = 1.0
-        else:
-            qsize = queue.qsize()
-            probability = (1 + np.cos(np.pi * qsize / queue.maxsize)) / 2
-        logger.debug(f"New item probability: {probability}")
-        return probability
+async def study_task_manager_from_state_handle(
+    state: ActorHandle[UniRLState],
+) -> StudyTaskContext:
+    ret = await state.get_next_study_task.remote()
+    register = state.register_study_result.remote
+    return StudyTaskContext(
+        task=ret,
+        register=register,
+    )

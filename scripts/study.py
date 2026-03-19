@@ -17,7 +17,7 @@ from adapter_agent.hierarchical.types import Task
 from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
 from adapter_agent.model_helper import get_gemini
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
-from adapter_agent.rl.task_net import StudyGenerationTask, TaskNetwork
+from adapter_agent.rl.task_net import StudyTaskContext, TaskNetwork
 
 
 async def study_rollout(
@@ -28,17 +28,17 @@ async def study_rollout(
 ):
     knowledge_summarizer = KnowledgeSummarizer(model=get_gemini())
     while True:
-        with task_network.get_next_study_task() as current:
+        async with StudyTaskContext.next_task_from_network(task_network) as current:
             task_network.save_visualization(vis_path)
 
-            task = current.task.item
+            task = current.task
             knowledges_str = None
-            if current.knowledges:
+            if task.knowledges:
                 print(
-                    f"Summarizing {len(current.knowledges)} knowledges for task: {task.instruction}"
+                    f"Summarizing {len(task.knowledges)} knowledges for task: {task.task.instruction}"
                 )
                 knowledges_str = await knowledge_summarizer.summarize(
-                    current.knowledges, task_instruction=task.instruction
+                    task.knowledges, task_instruction=task.task.instruction
                 )
                 print(f"Summary generated: {knowledges_str}")
 
@@ -46,7 +46,7 @@ async def study_rollout(
                 solver_model=solver_model,
                 verifier=verifier,
                 rewirer_model=solver_model,
-                task=task,
+                task=task.task,
                 max_turns=10,
                 qwen_no_think=True,
                 runtime_settings=RuntimeSettings(
@@ -60,10 +60,10 @@ async def study_rollout(
                 print("Session completed with conclusion:", ret.conclusion)
                 log_trajectory(ret.trials, flip_tag=True)
 
-            if not isinstance(current, StudyGenerationTask) or not isinstance(
+            if not task.is_generation or not isinstance(
                 ret, RewireSessionResultFailure
             ):
-                current.register_result(ret)
+                current.register_result(ret, new_task=None)
                 continue
 
             try:

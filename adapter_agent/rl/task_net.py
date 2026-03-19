@@ -1,9 +1,11 @@
+from __future__ import annotations
+
 import random
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
+from inspect import isawaitable
 from pathlib import Path
-from typing import Any, Generator, Self
+from typing import Any, Awaitable, Callable, Self
 
 from pydantic import BaseModel
 from pyvis.network import Network
@@ -63,45 +65,32 @@ class TaskWithMeta:
         return latest_sft
 
 
-@dataclass
-class StudyTaskResult:
-    result: RewireSessionResult
-    new_task: Task | None = None
-
-
-@dataclass
-class StudyTaskBase:
-    task: TaskWithMeta
+@dataclass(kw_only=True)
+class StudyTask:
+    task: Task
     knowledges: list[QRA] = field(default_factory=list)
+    is_generation: bool
 
     @property
     def id(self) -> str:
-        return self.task.item.id
+        return self.task.id
 
-
-@dataclass
-class StudyNoGenerationTask(StudyTaskBase):
-    result: RewireSessionResult | None = None
-
-    def register_result(self, result: RewireSessionResult):
-        if self.result is not None:
-            raise ValueError("Study task result is already set")
-        self.result = result
-
-
-@dataclass
-class StudyGenerationTask(StudyTaskBase):
-    result: StudyTaskResult | None = None
-
-    def register_result(
+    def complete(
         self, result: RewireSessionResult, new_task: Task | None = None
-    ):
-        if self.result is not None:
-            raise ValueError("Study task result is already set")
-        self.result = StudyTaskResult(result=result, new_task=new_task)
+    ) -> StudyTaskCompleted:
+        return StudyTaskCompleted(
+            task=self.task,
+            knowledges=self.knowledges,
+            is_generation=self.is_generation,
+            result=result,
+            new_task=new_task,
+        )
 
 
-type StudyTask = StudyNoGenerationTask | StudyGenerationTask
+@dataclass(kw_only=True)
+class StudyTaskCompleted(StudyTask):
+    result: RewireSessionResult
+    new_task: Task | None = None
 
 
 class PDParams(BaseModel):
@@ -131,11 +120,7 @@ class TaskNetwork:
         self.nodes[child.item.id] = child
         self._add_edge(parent_id, child.item.id)
 
-    @contextmanager
-    def get_next_study_task(self) -> Generator[StudyTask, None, None]:
-        """
-        Selects the next task to study using a progressive widening-like approach.
-        """
+    def get_next_study_task(self) -> StudyTask:
         if self.root_id is None:
             raise ValueError("TaskNetwork has no root node.")
 
@@ -165,16 +150,18 @@ class TaskNetwork:
             generation = self._should_generate_subtask(curr_id)
 
             if generation:
-                study_task = StudyGenerationTask(
-                    task=node,
+                study_task = StudyTask(
+                    task=node.item,
                     knowledges=self._get_solved_subtask_qras(curr_id),
+                    is_generation=True,
                 )
                 break
 
             if self._should_prioritize_parent(curr_id):
-                study_task = StudyNoGenerationTask(
-                    task=node,
+                study_task = StudyTask(
+                    task=node.item,
                     knowledges=self._get_solved_subtask_qras(curr_id),
+                    is_generation=False,
                 )
                 break
 
@@ -185,9 +172,10 @@ class TaskNetwork:
 
             if not unsolved_children:
                 # If there are no unsolved children, treat as leaf node
-                study_task = StudyNoGenerationTask(
-                    task=node,
+                study_task = StudyTask(
+                    task=node.item,
                     knowledges=self._get_solved_subtask_qras(curr_id),
+                    is_generation=False,
                 )
                 break
 
@@ -195,51 +183,50 @@ class TaskNetwork:
             curr_id = min(
                 unsolved_children, key=lambda c_id: subtree_trials.get(c_id, 0)
             )
+        return study_task
 
+    def get_and_setup_next_study_task(self) -> StudyTask:
+        study_task = self.get_next_study_task()
+        self.study_task_setup(study_task)
+        return study_task
+
+    def study_task_setup(self, study_task: StudyTask):
         self._execution_countup(study_task)
-        yield study_task
-        self._execution_countdown(study_task)
-        self._process_study_task_result(study_task)
+
+    def study_task_teardown(self, completed: StudyTaskCompleted):
+        self._execution_countdown(completed)
+        self._process_study_task_result(completed)
 
     def _execution_countup(self, study_task: StudyTask):
         self.executing_tasks[study_task.id] = (
             self.executing_tasks.get(study_task.id, 0) + 1
         )
-        if isinstance(study_task, StudyGenerationTask):
+        if study_task.is_generation:
             self.executing_generations[study_task.id] = (
                 self.executing_generations.get(study_task.id, 0) + 1
             )
 
-    def _execution_countdown(self, study_task: StudyTask):
-        if study_task.id not in self.executing_tasks:
-            raise ValueError(f"Task {study_task.id} is not in executing tasks")
-        self.executing_tasks[study_task.id] = self.executing_tasks[study_task.id] - 1
-        if self.executing_tasks[study_task.id] == 0:
-            del self.executing_tasks[study_task.id]
-        if isinstance(study_task, StudyGenerationTask):
-            if study_task.id not in self.executing_generations:
-                raise ValueError(
-                    f"Task {study_task.id} is not in executing generations"
-                )
-            self.executing_generations[study_task.id] = (
-                self.executing_generations[study_task.id] - 1
+    def _execution_countdown(self, completed: StudyTaskCompleted):
+        if completed.id not in self.executing_tasks:
+            raise ValueError(f"Task {completed.id} is not in executing tasks")
+        self.executing_tasks[completed.id] = self.executing_tasks[completed.id] - 1
+        if self.executing_tasks[completed.id] == 0:
+            del self.executing_tasks[completed.id]
+        if completed.is_generation:
+            if completed.id not in self.executing_generations:
+                raise ValueError(f"Task {completed.id} is not in executing generations")
+            self.executing_generations[completed.id] = (
+                self.executing_generations[completed.id] - 1
             )
-            if self.executing_generations[study_task.id] == 0:
-                del self.executing_generations[study_task.id]
+            if self.executing_generations[completed.id] == 0:
+                del self.executing_generations[completed.id]
 
-    def _process_study_task_result(self, study_task: StudyTask):
-        if isinstance(study_task, StudyGenerationTask):
-            if study_task.result is None:
-                raise ValueError("Study task result is None")
-            self.nodes[study_task.id].register_result(study_task.result.result)
-            if study_task.result.new_task is not None:
-                self._add_child_node(study_task.id, study_task.result.new_task)
-        elif isinstance(study_task, StudyNoGenerationTask):
-            if study_task.result is None:
-                raise ValueError("Study task result is None")
-            self.nodes[study_task.id].register_result(study_task.result)
-        else:
-            raise ValueError(f"Unknown study task type: {type(study_task)}")
+    def _process_study_task_result(self, completed: StudyTaskCompleted):
+        self.nodes[completed.id].register_result(completed.result)
+        if completed.new_task is not None:
+            if not completed.is_generation:
+                raise ValueError("Task is not generation task but result has new task")
+            self._add_child_node(completed.id, completed.new_task)
 
     def _get_latest_child_success_ts(self, node_id: str) -> datetime | None:
         latest_ts: datetime | None = None
@@ -419,3 +406,34 @@ class TaskNetwork:
         else:
             pyvis_net = self.to_pyvis()
         pyvis_net.save_graph(str(path))
+
+    def node_count(self) -> int:
+        return len(self.nodes)
+
+
+@dataclass
+class StudyTaskContext:
+    task: StudyTask
+    register: (
+        Callable[[StudyTaskCompleted], Awaitable[None]]
+        | Callable[[StudyTaskCompleted], None]
+    )
+    completed: StudyTaskCompleted | None = None
+
+    @classmethod
+    def next_task_from_network(cls, task_network: TaskNetwork):
+        task = task_network.get_and_setup_next_study_task()
+        return cls(task=task, register=task_network.study_task_teardown)
+
+    def register_result(self, result: RewireSessionResult, new_task: Task | None):
+        self.completed = self.task.complete(result=result, new_task=new_task)
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.completed is None:
+            raise ValueError("No result registered for task.")
+        ret = self.register(self.completed)
+        if isawaitable(ret):
+            await ret

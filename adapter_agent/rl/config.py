@@ -47,6 +47,7 @@ class EnvParams(BaseModel):
     library: Library
     dataset_path: Path
     runtime_settings: RuntimeSettings
+    qwen_no_think: bool
 
     @classmethod
     def numrs2(
@@ -54,6 +55,7 @@ class EnvParams(BaseModel):
         max_turns: int,
         dataset_path: Path,
         runtime_settings: RuntimeSettings | None = None,
+        qwen_no_think: bool = True,
     ) -> Self:
         if runtime_settings is None:
             runtime_settings = RuntimeSettings(
@@ -65,6 +67,7 @@ class EnvParams(BaseModel):
             library=Library(name="numrs2", local_path=Path("repositories/numrs")),
             dataset_path=dataset_path,
             runtime_settings=runtime_settings,
+            qwen_no_think=qwen_no_think,
         )
 
 
