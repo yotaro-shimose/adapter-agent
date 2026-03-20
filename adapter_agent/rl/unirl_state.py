@@ -72,7 +72,13 @@ class RLSample:
 type BatchType = Literal["Study", "Practice"]
 
 
+class StudyRolloutParams(BaseModel):
+    num_study_actor: int
+    rollouts_per_actor: int
+
+
 class PracticeRolloutParams(BaseModel):
+    num_practice_workers: int
     rollouts_per_task: int
 
 
@@ -91,10 +97,9 @@ class UniRLConfig(BaseModel):
     experiment_setting: ExperimentSettings
     env_params: EnvParams
     model_loading_settings: ModelLoadingSettings
+    study_rollout_params: StudyRolloutParams
     practice_rollout_params: PracticeRolloutParams
     train_params: UniRLTrainParams
-    num_study_workers: int
-    num_practice_workers: int
     log_freq: int
 
 

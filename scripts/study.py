@@ -13,11 +13,11 @@ from adapter_agent.hierarchical.process.rewire_session import (
     RewireSessionResultNormal,
     log_trajectory,
 )
-from adapter_agent.hierarchical.types import Task
 from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
 from adapter_agent.model_helper import get_gemini
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.rl.task_net import StudyTaskContext, TaskNetwork
+from scripts.uniray import load_gh_archive
 
 
 async def study_rollout(
@@ -93,9 +93,9 @@ async def main():
     # task = Task.from_instruction(
     #     "Please implement a three layer neural network with ReLU activation function and 100 units in each layer. Only the forward path should be implemented."
     # )
-    task = Task.from_instruction(
-        instruction="Create a function which does 3d rotate operation of vectors around given point. The input should be N x 3 Array object and your function should return the array of the same shape but with rotated coordinates."
-    )
+    # task = Task.from_instruction(
+    #     instruction="Create a function which does 3d rotate operation of vectors around given point. The input should be N x 3 Array object and your function should return the array of the same shape but with rotated coordinates."
+    # )
 
     # task = Task.from_instruction(
     #     "Task 1: Write a function that applies a simple 3D rotation matrix to a single vector using `numrs2` library."
@@ -103,6 +103,7 @@ async def main():
     # task = Task.from_instruction(
     #     "Implement a function that multiplies two 3x3 matrices using the `numrs2` library. The function should take two 3x3 matrices as input and return their product."
     # )
+
     service_client = tinker.ServiceClient()
     model, _tokenizer, _renderer = setup_tinkermodel(
         service_client=service_client, model_name="Qwen/Qwen3-8B"
@@ -114,11 +115,13 @@ async def main():
         model=get_gemini(),
         rust_doc_analyzer=rust_doc_analyzer,
     )
-    task_network = TaskNetwork()
-    task_network.add_root(task)
+    tasks = load_gh_archive()
+
+    task_network = TaskNetwork(tasks_pool=tasks[:10])
+
     vis_path = Path("data/graphviz/task_net.html")
-    launch_interval = 15
-    num_workers = 15
+    launch_interval = 5
+    num_workers = 50
 
     tasks = []
     for i in range(num_workers):

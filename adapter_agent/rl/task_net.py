@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from inspect import isawaitable
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Self
+from typing import Any, Awaitable, Callable, ClassVar, Self
 
 from pydantic import BaseModel
 from pyvis.network import Network
@@ -28,8 +28,8 @@ class Attempt:
 @dataclass
 class TaskWithMeta:
     item: Task
-    level: int  # 0 = root
     sft_conclusions: list[Attempt] = field(default_factory=list)
+    PSEUDO_ROOT_ID: ClassVar[str] = "pseudo_root"
 
     def register_result(self, result: RewireSessionResult):
         if isinstance(result, RewireSessionResultNormal):
@@ -41,10 +41,22 @@ class TaskWithMeta:
             )
 
     @classmethod
-    def from_task(cls, task: Task, level: int = 0) -> Self:
+    def pseudo_root(cls) -> Self:
+        return cls(
+            item=Task(
+                id=cls.PSEUDO_ROOT_ID,
+                instruction="pseudo_root",
+            ),
+            sft_conclusions=[],
+        )
+
+    def is_pseudo_root(self) -> bool:
+        return self.item.id == self.PSEUDO_ROOT_ID
+
+    @classmethod
+    def from_task(cls, task: Task) -> Self:
         return cls(
             item=task,
-            level=level,
             sft_conclusions=[],
         )
 
@@ -93,37 +105,45 @@ class StudyTaskCompleted(StudyTask):
     new_task: Task | None = None
 
 
-class PDParams(BaseModel):
+class PWParams(BaseModel):
+    """Progressive Widening parameters"""
+
     k: float = 1.0
     alpha: float = 0.5
 
 
 @dataclass
 class TaskNetwork:
+    tasks_pool: list[Task]
     nodes: dict[str, TaskWithMeta] = field(default_factory=dict)
-    root_id: str | None = None
     children_map: dict[str, list[str]] = field(default_factory=dict)
     executing_tasks: dict[str, int] = field(default_factory=dict)
     executing_generations: dict[str, int] = field(default_factory=dict)
+    pd_params: PWParams = field(default_factory=PWParams)
     n_mandatory_parent_trials: int = 3
-    pd_params: PDParams = field(default_factory=PDParams)
+    root_id: str = field(init=False)
 
-    def add_root(self, task: Task):
-        self.nodes[task.id] = TaskWithMeta.from_task(task)
-        self.root_id = task.id
+    def __post_init__(self):
+        pseudo_root = TaskWithMeta.pseudo_root()
+        self.nodes[pseudo_root.item.id] = pseudo_root
+        self.root_id = pseudo_root.item.id
+
+    def add_branch_root(self) -> Task | None:
+        if not self.tasks_pool:
+            return None
+        next_task = self.tasks_pool.pop()
+        self._add_child_node(self.root_id, next_task)
+        return next_task
 
     def _add_edge(self, parent_id: str, child_id: str):
         self.children_map.setdefault(parent_id, []).append(child_id)
 
     def _add_child_node(self, parent_id: str, new_task: Task):
-        child = TaskWithMeta.from_task(new_task, level=self.nodes[parent_id].level + 1)
+        child = TaskWithMeta.from_task(new_task)
         self.nodes[child.item.id] = child
         self._add_edge(parent_id, child.item.id)
 
     def get_next_study_task(self) -> StudyTask:
-        if self.root_id is None:
-            raise ValueError("TaskNetwork has no root node.")
-
         curr_id = self.root_id
 
         # Pre-calculate subtree trials N(s) for all nodes
@@ -150,11 +170,21 @@ class TaskNetwork:
             generation = self._should_generate_subtask(curr_id)
 
             if generation:
-                study_task = StudyTask(
-                    task=node.item,
-                    knowledges=self._get_solved_subtask_qras(curr_id),
-                    is_generation=True,
-                )
+                if node.is_pseudo_root():
+                    new_task = self.add_branch_root()
+                    if new_task is None:
+                        raise ValueError("No more tasks in the pool.")
+                    study_task = StudyTask(
+                        task=new_task,
+                        knowledges=[],
+                        is_generation=False,
+                    )
+                else:
+                    study_task = StudyTask(
+                        task=node.item,
+                        knowledges=self._get_solved_subtask_qras(curr_id),
+                        is_generation=True,
+                    )
                 break
 
             if self._should_prioritize_parent(curr_id):
@@ -171,12 +201,21 @@ class TaskNetwork:
             ]
 
             if not unsolved_children:
-                # If there are no unsolved children, treat as leaf node
-                study_task = StudyTask(
-                    task=node.item,
-                    knowledges=self._get_solved_subtask_qras(curr_id),
-                    is_generation=False,
-                )
+                if node.is_pseudo_root():
+                    new_task = self.add_branch_root()
+                    if new_task is None:
+                        raise ValueError("No more tasks in the pool.")
+                    study_task = StudyTask(
+                        task=new_task,
+                        knowledges=[],
+                        is_generation=False,
+                    )
+                else:
+                    study_task = StudyTask(
+                        task=node.item,
+                        knowledges=self._get_solved_subtask_qras(curr_id),
+                        is_generation=False,
+                    )
                 break
 
             # Traverse to the child with minimum subtree trials among unsolved children
@@ -240,6 +279,8 @@ class TaskNetwork:
         return latest_ts
 
     def _should_prioritize_parent(self, node_id: str) -> bool:
+        if node_id == self.root_id:
+            return False
         latest_child_success = self._get_latest_child_success_ts(node_id)
         if latest_child_success is None:
             return False
@@ -252,15 +293,28 @@ class TaskNetwork:
         )
         return trials_after_success < self.n_mandatory_parent_trials
 
+    def _get_ns(self, node_id: str) -> int:
+        node = self.nodes[node_id]
+        return node.sft_attempts_count + self.executing_tasks.get(node_id, 0)
+
     def _should_generate_subtask(self, node_id: str) -> bool:
         children = self.children_map.get(node_id, [])
         # Progressive widening condition with virtual nodes
         # |A(s)|_effective = |children| + executing_generations
         node = self.nodes[node_id]
-        n_s = node.sft_attempts_count + self.executing_tasks.get(node_id, 0)
-        effective_children_count = len(children) + self.executing_generations.get(
-            node_id, 0
-        )
+
+        if node.is_pseudo_root():
+            if len(self.tasks_pool) == 0:
+                return False
+            n_s = sum(self._get_ns(child_id) for child_id in children)
+            effective_children_count = len(
+                [c for c in children if not self.nodes[c].is_sft_solved]
+            )
+        else:
+            n_s = self._get_ns(node_id)
+            effective_children_count = len(children) + self.executing_generations.get(
+                node_id, 0
+            )
         return (
             effective_children_count
             <= self.pd_params.k * (n_s**self.pd_params.alpha) - 1

@@ -2,6 +2,8 @@ import asyncio
 import logging
 import os
 
+from adapter_agent.rl.unirl_state import StudyRolloutParams
+
 # Silence Ray logs
 os.environ["RAY_DEDUP_LOGS"] = "0"
 os.environ["RAY_COLOR_PREFIX"] = "0"
@@ -28,8 +30,6 @@ from adapter_agent.hierarchical.gh import Library
 from adapter_agent.hierarchical.process.rewire import ss_solve
 from adapter_agent.hierarchical.process.rewire_session import (
     RewireSessionResultFailure,
-    RewireSessionResultNormal,
-    log_trajectory,
 )
 from adapter_agent.hierarchical.process.rewire_session_single_turn import (
     solve_verify_tinker_single_turn,
@@ -57,82 +57,83 @@ from adapter_agent.util.task_queue import TaskQueue
 logger = logging.getLogger(__name__)
 
 
-@ray.remote
-def study_rollout(
-    worker_id: int,
-    state: ActorHandle[UniRLState],
-    verifier: Verifier,
-    env_params: EnvParams,
-):
-    setup_rollout_logging()
-    asyncio.run(
-        _study_rollout(
-            worker_id,
-            state,
-            verifier,
-            env_params,
+@dataclass
+class StudyActor:
+    process_id: int
+    state: ActorHandle[UniRLState]
+    verifier: Verifier
+    env_params: EnvParams
+    num_workers: int
+
+    def __post_init__(self):
+        setup_base_loglevel()
+        logging.basicConfig(level=logging.DEBUG)
+
+    @ray.method
+    async def run(self):
+        await asyncio.gather(
+            *[
+                self.study_worker(f"{self.process_id}-{worker_id}")
+                for worker_id in range(self.num_workers)
+            ]
         )
-    )
 
+    async def study_worker(
+        self,
+        worker_id: str,
+    ):
+        logger.info(f"Study worker {worker_id} started.")
+        initial_model: TinkerModel = await self.state.get_latest_model.remote()
+        initial_model.register_tinkerllm_to_litellm()
+        knowledge_summarizer = KnowledgeSummarizer(model=get_gemini())
 
-async def _study_rollout(
-    worker_id: int,
-    state: ActorHandle[UniRLState],
-    verifier: Verifier,
-    env_params: EnvParams,
-):
-    logger.info(f"Study worker {worker_id} started.")
-    initial_model: TinkerModel = await state.get_latest_model.remote()
-    initial_model.register_tinkerllm_to_litellm()
-    knowledge_summarizer = KnowledgeSummarizer(model=get_gemini())
+        while True:
+            latest_model = await self.state.get_latest_model.remote()
+            study_task_manager = await study_task_manager_from_state_handle(self.state)
 
-    while True:
-        latest_model = await state.get_latest_model.remote()
-        study_task_manager = await study_task_manager_from_state_handle(state)
+            async with study_task_manager as current:
+                task = current.task
+                knowledges_str = None
+                if task.knowledges:
+                    knowledges_str = await knowledge_summarizer.summarize(
+                        task.knowledges, task_instruction=task.task.instruction
+                    )
 
-        async with study_task_manager as current:
-            task = current.task
-            knowledges_str = None
-            if task.knowledges:
-                knowledges_str = await knowledge_summarizer.summarize(
-                    task.knowledges, task_instruction=task.task.instruction
+                ret = await ss_solve(
+                    solver_model=latest_model,
+                    verifier=self.verifier,
+                    rewirer_model=latest_model,
+                    task=task.task,
+                    max_turns=self.env_params.max_turns,
+                    qwen_no_think=self.env_params.qwen_no_think,
+                    runtime_settings=self.env_params.runtime_settings,
+                    knowledges=knowledges_str,
                 )
 
-            ret = await ss_solve(
-                solver_model=latest_model,
-                verifier=verifier,
-                rewirer_model=latest_model,
-                task=task.task,
-                max_turns=env_params.max_turns,
-                qwen_no_think=env_params.qwen_no_think,
-                runtime_settings=env_params.runtime_settings,
-                knowledges=knowledges_str,
-            )
+                if not task.is_generation or not isinstance(
+                    ret, RewireSessionResultFailure
+                ):
+                    current.register_result(ret, new_task=None)
+                    continue
 
-            if not task.is_generation or not isinstance(
-                ret, RewireSessionResultFailure
-            ):
-                current.register_result(ret, new_task=None)
-                continue
+                try:
+                    analyzer = Analyzer(model=get_gemini())
+                    subtask = await analyzer.analyze_trajectory(ret.trials)
 
-            try:
-                analyzer = Analyzer(model=get_gemini())
-                subtask = await analyzer.analyze_trajectory(ret.trials)
+                    # task_verifier = TaskVerifier(model=get_gemini())
+                    # verification_result = await task_verifier.verify_task(
+                    #     task=subtask, library_name="numrs2"
+                    # )
+                    # print(f"Verification Result: {verification_result.output_type}")
 
-                # task_verifier = TaskVerifier(model=get_gemini())
-                # verification_result = await task_verifier.verify_task(
-                #     task=subtask, library_name="numrs2"
-                # )
-                # print(f"Verification Result: {verification_result.output_type}")
+                    # if verification_result.output_type == "valid":
+                    current.register_result(ret, new_task=subtask)
 
-                # if verification_result.output_type == "valid":
-                current.register_result(ret, new_task=subtask)
-
-                continue
-            except Exception as e:
-                logger.error(f"Subtask generation failed: {e}")
-                current.register_result(ret, new_task=None)
-                continue
+                    continue
+                except Exception as e:
+                    logger.error(f"Subtask generation failed: {e}")
+                    current.register_result(ret, new_task=None)
+                    continue
 
 
 @ray.remote
@@ -210,7 +211,7 @@ class TrainWorker:
         self.training_client = setup_training_client(self.model_loading_settings)
 
     async def run(self):
-        logger.info("Train worker main loopstarted.")
+        logger.info("Train worker main loop started.")
         step = 0
         tasks_to_practice: dict[str, Task] = dict()
         pending_fwd_bwd_future = None
@@ -244,8 +245,6 @@ class TrainWorker:
             pending_fwd_bwd_future = fwd_bwd_future
             pending_optim_future = optim_future
 
-            fwd_bwd_result = await fwd_bwd_future.result_async()
-            await optim_future.result_async()
             if batch.batch_type == "Study":
                 exhausted_tasks = {
                     counted_item.item.id: counted_item.item
@@ -386,7 +385,14 @@ async def main():
             model_name="Qwen/Qwen3-8B",
             lora_rank=32,
         ),
-        practice_rollout_params=PracticeRolloutParams(rollouts_per_task=6),
+        study_rollout_params=StudyRolloutParams(
+            num_study_actor=10,
+            rollouts_per_actor=8,
+        ),
+        practice_rollout_params=PracticeRolloutParams(
+            rollouts_per_task=6,
+            num_practice_workers=0,
+        ),
         train_params=UniRLTrainParams(
             update_freq=1,
             save_freq=50,
@@ -403,18 +409,14 @@ async def main():
             rl_group_size=32,
         ),
         num_study_workers=20,
-        num_practice_workers=0,
-        log_freq=50,
+        log_freq=20,
     )
 
     setup_rollout_logging()
 
     tasks = load_gh_archive()
-    study_queue = TaskNetwork()
+    study_queue = TaskNetwork(tasks[:30])
     practice_queue = TaskQueue.create(order="FIFO", maxsize=0)
-
-    # TODO: add more tasks
-    study_queue.add_root(tasks[0])
 
     rust_doc_analyzer = RustDocAnalyzer.from_libdir(cfg.env_params.library.local_path)
     service_client = tinker.ServiceClient()
@@ -463,36 +465,44 @@ async def main():
         ),
     )
     async with litellm_concurrent_limit(
-        cfg.num_study_workers
-        + cfg.num_practice_workers * cfg.practice_rollout_params.rollouts_per_task
+        cfg.study_rollout_params.num_study_actor
+        * cfg.study_rollout_params.rollouts_per_actor
+        + cfg.practice_rollout_params.num_practice_workers
+        * cfg.practice_rollout_params.rollouts_per_task
         + 10
     ):
         train_task = train_worker_actor.run.remote()
         # Study Worker の起動
         study_workers = []
-        for i in range(cfg.num_study_workers):
-            # ここで少し待つ (例: 1秒おきに1つずつ起動)ことによって初期起動スパイクをさける
-            await asyncio.sleep(1.0)
+        StudyActorClass = ray.remote(StudyActor)
+        for i in range(cfg.study_rollout_params.num_study_actor):
+            # ここで少し待つ (例: 10秒おきに1つずつ起動)ことによって初期起動スパイクをさける
+            await asyncio.sleep(10.0)
 
-            worker = study_rollout.remote(
-                i,
-                state,
-                verifier,
-                cfg.env_params,
+            worker = cast(
+                ActorHandle[StudyActor],
+                StudyActorClass.remote(
+                    i,
+                    state,
+                    verifier,
+                    cfg.env_params,
+                    cfg.study_rollout_params.rollouts_per_actor,
+                ),
             )
-            study_workers.append(worker)
+            worker_task_ref = worker.run.remote()
+            study_workers.append(worker_task_ref)
             logger.info(f"Launched Study Worker {i}...")
 
         # Practice Worker の起動
         practice_workers = []
-        for i in range(cfg.num_practice_workers):
-            await asyncio.sleep(1.0)
+        # for i in range(cfg.practice_rollout_params.num_practice_workers):
+        #     await asyncio.sleep(1.0)
 
-            worker = practice_rollout.remote(
-                i, state, verifier, cfg.practice_rollout_params, cfg.env_params
-            )
-            practice_workers.append(worker)
-            logger.info(f"Launched Practice Worker {i}...")
+        #     worker = practice_rollout.remote(
+        #         i, state, verifier, cfg.practice_rollout_params, cfg.env_params
+        #     )
+        #     practice_workers.append(worker)
+        #     logger.info(f"Launched Practice Worker {i}...")
 
         ray.get([train_task, *study_workers, *practice_workers])
 
