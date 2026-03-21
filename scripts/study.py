@@ -2,15 +2,17 @@ import asyncio
 from pathlib import Path
 
 import tinker
+from oai_utils import AgentsSDKModel
 from oai_utils.tinker import TinkerModel, setup_tinkermodel
 
 from adapter_agent.hierarchical.agent.analyzer import Analyzer
+from adapter_agent.hierarchical.agent.knowledge_slicer import KnowledgeSlicer
 from adapter_agent.hierarchical.agent.knowledge_summarizer import KnowledgeSummarizer
-from adapter_agent.hierarchical.agent.verifier import Verifier
-from adapter_agent.hierarchical.process.rewire import ss_solve
+from adapter_agent.hierarchical.process.rewire import ss_solve_verify
 from adapter_agent.hierarchical.process.rewire_session import (
     RewireSessionResultFailure,
     RewireSessionResultNormal,
+    RewireSessionResultSuccess,
     log_trajectory,
 )
 from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
@@ -23,9 +25,11 @@ from scripts.uniray import load_gh_archive
 async def study_rollout(
     task_network: TaskNetwork,
     solver_model: TinkerModel,
-    verifier: Verifier,
+    verifier_model: AgentsSDKModel,
+    rust_doc_analyzer: RustDocAnalyzer,
     vis_path: Path,
 ):
+    tasks_queue = []
     knowledge_summarizer = KnowledgeSummarizer(model=get_gemini())
     while True:
         async with StudyTaskContext.next_task_from_network(task_network) as current:
@@ -42,10 +46,10 @@ async def study_rollout(
                 )
                 print(f"Summary generated: {knowledges_str}")
 
-            ret = await ss_solve(
+            ret = await ss_solve_verify(
                 solver_model=solver_model,
-                verifier=verifier,
-                rewirer_model=solver_model,
+                verifier_model=verifier_model,
+                rust_doc_analyzer=rust_doc_analyzer,
                 task=task.task,
                 max_turns=10,
                 qwen_no_think=True,
@@ -59,6 +63,11 @@ async def study_rollout(
             if isinstance(ret, RewireSessionResultNormal):
                 print("Session completed with conclusion:", ret.conclusion)
                 log_trajectory(ret.trials, flip_tag=True)
+
+            if isinstance(ret, RewireSessionResultSuccess):
+                slicer = KnowledgeSlicer(model=get_gemini())
+                _qras = await slicer.slice(ret.knowledge)
+                print(f"Generated {len(_qras)} QRAs from normalized knowledge.")
 
             if not task.is_generation or not isinstance(
                 ret, RewireSessionResultFailure
@@ -111,13 +120,10 @@ async def main():
 
     rust_doc_analyzer = RustDocAnalyzer.from_libdir(Path("repositories/numrs"))
 
-    verifier = Verifier(
-        model=get_gemini(),
-        rust_doc_analyzer=rust_doc_analyzer,
-    )
+    verifier_model = get_gemini()
     tasks = load_gh_archive()
 
-    task_network = TaskNetwork(tasks_pool=tasks[:10])
+    task_network = TaskNetwork(tasks_pool=tasks[:1])
 
     vis_path = Path("data/graphviz/task_net.html")
     launch_interval = 5
@@ -127,7 +133,11 @@ async def main():
     for i in range(num_workers):
         print(f"Launching worker {i + 1}/{num_workers}...")
         tasks.append(
-            asyncio.create_task(study_rollout(task_network, model, verifier, vis_path))
+            asyncio.create_task(
+                study_rollout(
+                    task_network, model, verifier_model, rust_doc_analyzer, vis_path
+                )
+            )
         )
         if i < num_workers - 1:
             await asyncio.sleep(launch_interval)

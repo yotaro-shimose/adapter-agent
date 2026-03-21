@@ -30,7 +30,6 @@ from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
 from adapter_agent.rl.env.conclusion import SSConclusion
 from adapter_agent.rl.env.injection import _inject_tools_into_prompt
 from adapter_agent.rl.env.reward import LLMAsAJudgeSingleTurn
-from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.util.exception import CodingEnvironmentError
 from adapter_agent.util.parsing import extract_rust_code
 
@@ -455,46 +454,42 @@ async def build_simplified_solver_env(
     renderer: Renderer,
     verifier: Verifier,
     rust_doc_analyzer: RustDocAnalyzer,
-    runtime_settings: RuntimeSettings,
+    runtime: Runtime,
     max_trajectory_tokens: int = 32 * 1024,
     max_turns: int = 10,
 ) -> AsyncGenerator[SimplifiedSolverTokenEnv, None]:
-    try:
-        async with runtime_settings.build_runtime() as rust_env:
-            exclude = ["target", ".git"]
-            tree_structure = await rust_env.tree(".", exclude=exclude, truncate=20)
+    exclude = ["target", ".git"]
+    tree_structure = await runtime.tree(".", exclude=exclude, truncate=20)
 
-            mutable_state = SimplifiedSolverMutableState(remaining_turns=max_turns)
-            tools_list = [
-                SearchTool(rust_doc_analyzer),
-                ReplaceAndRunTool(rust_env, mutable_state),
-            ]
+    mutable_state = SimplifiedSolverMutableState(remaining_turns=max_turns)
+    tools_list = [
+        SearchTool(rust_doc_analyzer),
+        ReplaceAndRunTool(runtime, mutable_state),
+    ]
 
-            msg_env = SimplifiedSolverEnv(
-                initial_state=env_state,
-                rust_env=rust_env,
-                rust_doc_analyzer=rust_doc_analyzer,
-                initial_messages=get_simplified_solver_initial_messages(
-                    env_state=env_state,
-                    tree_structure=tree_structure,
-                    tools=[t.to_spec() for t in tools_list],
-                    renderer=renderer,
-                ),
-                reward_fn=LLMAsAJudgeSingleTurn(
-                    task=env_state.task,
-                    rust_env=rust_env,
-                    verifier=verifier,
-                    tree_structure=tree_structure,
-                ),
-                mutable_state=mutable_state,
-            )
+    msg_env = SimplifiedSolverEnv(
+        initial_state=env_state,
+        rust_env=runtime,
+        rust_doc_analyzer=rust_doc_analyzer,
+        initial_messages=get_simplified_solver_initial_messages(
+            env_state=env_state,
+            tree_structure=tree_structure,
+            tools=[t.to_spec() for t in tools_list],
+            renderer=renderer,
+        ),
+        reward_fn=LLMAsAJudgeSingleTurn(
+            task=env_state.task,
+            rust_env=runtime,
+            verifier=verifier,
+            tree_structure=tree_structure,
+        ),
+        mutable_state=mutable_state,
+    )
 
-            yield SimplifiedSolverTokenEnv(
-                renderer=renderer,
-                message_env=msg_env,
-                prethink=env_state.prethink,
-                failed_parse_reward=-1.0,
-                max_trajectory_tokens=max_trajectory_tokens,
-            )
-    except CoderMCPRuntimeError as e:
-        raise CodingEnvironmentError(f"Environment error during setup: {e}") from e
+    yield SimplifiedSolverTokenEnv(
+        renderer=renderer,
+        message_env=msg_env,
+        prethink=env_state.prethink,
+        failed_parse_reward=-1.0,
+        max_trajectory_tokens=max_trajectory_tokens,
+    )

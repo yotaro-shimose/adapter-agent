@@ -11,7 +11,6 @@ from tinker_cookbook.rl.types import (
 )
 from tinker_cookbook.utils import logtree
 
-from adapter_agent.data import QRA
 from adapter_agent.hierarchical.agent.rewirer import (
     format_trajectory_transcript,
 )
@@ -60,7 +59,7 @@ class RewireSessionResultNormal:
 @dataclass(kw_only=True)
 class RewireSessionResultSuccess(RewireSessionResultNormal):
     conclusion: SSConclusion = field(default="success", init=False)
-    qra: QRA
+    knowledge: str
     reward: float = 1.0
 
     def is_successful(self) -> bool:

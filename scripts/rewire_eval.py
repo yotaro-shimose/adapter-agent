@@ -8,7 +8,7 @@ import weave  # noqa: F401
 from oai_utils.async_utils import gather_with_semaphore
 
 from adapter_agent.hierarchical.gh import Library
-from adapter_agent.hierarchical.process.rewire import ss_solve
+from adapter_agent.hierarchical.process.rewire import ss_solve_verify
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
 from adapter_agent.rl.config import (
@@ -51,7 +51,7 @@ def setup_logging(cfg: RewireSFTConfig):
 async def process_task(task, solver_model, verifier, worker_id):
     logger.info(f"[Worker {worker_id}] Evaluating task: {task.instruction}")
     try:
-        result = await ss_solve(
+        result = await ss_solve_verify(
             solver_model=solver_model,
             verifier=verifier,
             rewirer_model=solver_model,

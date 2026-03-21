@@ -27,7 +27,7 @@ from adapter_agent.hierarchical.agent.knowledge_summarizer import KnowledgeSumma
 from adapter_agent.hierarchical.agent.task_verifier import TaskVerifier
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.gh import Library
-from adapter_agent.hierarchical.process.rewire import ss_solve
+from adapter_agent.hierarchical.process.rewire import ss_solve_verify
 from adapter_agent.hierarchical.process.rewire_session import (
     RewireSessionResultFailure,
 )
@@ -99,7 +99,7 @@ class StudyActor:
                         task.knowledges, task_instruction=task.task.instruction
                     )
 
-                ret = await ss_solve(
+                ret = await ss_solve_verify(
                     solver_model=latest_model,
                     verifier=self.verifier,
                     rewirer_model=latest_model,

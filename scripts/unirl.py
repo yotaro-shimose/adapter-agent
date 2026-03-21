@@ -12,12 +12,14 @@ from dotenv import load_dotenv
 from oai_utils.litellm import litellm_concurrent_limit
 from oai_utils.tinker import setup_tinkermodel
 from ray.actor import ActorHandle
+from tinker import AdamParams
+from tinker_cookbook.utils import ml_log
 
 from adapter_agent.data import QASFTDataset
 from adapter_agent.hierarchical.agent.task_verifier import TaskVerifier
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.gh import Library
-from adapter_agent.hierarchical.process.rewire import ss_solve
+from adapter_agent.hierarchical.process.rewire import ss_solve_verify
 from adapter_agent.hierarchical.process.rewire_session_single_turn import (
     solve_verify_tinker_single_turn,
 )
@@ -27,9 +29,6 @@ from adapter_agent.model_helper import get_gemini
 from adapter_agent.rl.config import EnvParams, ExperimentSettings, ModelLoadingSettings
 from adapter_agent.rl.env.single_turn import SingleTurnEnvState
 from adapter_agent.rl.shared_sampling_client import SharedSamplingClient
-from adapter_agent.util.exception import CodingEnvironmentError
-from adapter_agent.util.logger_util import setup_base_loglevel
-from adapter_agent.util.task_queue import TaskQueue
 from adapter_agent.rl.unirl_state import (
     Counted,
     HybridReplayBuffer,
@@ -40,9 +39,9 @@ from adapter_agent.rl.unirl_state import (
     UniRLState,
     UniRLTrainParams,
 )
-
-from tinker import AdamParams
-from tinker_cookbook.utils import ml_log
+from adapter_agent.util.exception import CodingEnvironmentError
+from adapter_agent.util.logger_util import setup_base_loglevel
+from adapter_agent.util.task_queue import TaskQueue
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +68,7 @@ async def study_rollout(
         logger.debug(f"Study worker {worker_id} got a task. ")
         rets = await asyncio.gather(
             *[
-                ss_solve(
+                ss_solve_verify(
                     solver_model=latest_model,
                     verifier=verifier,
                     rewirer_model=initial_model,
@@ -126,7 +125,7 @@ async def practice_rollout(
                 raise r
             else:
                 rets.append(r)
-        
+
         state.register_practice_group(worker_id, rets)
 
 
@@ -156,9 +155,7 @@ async def train_worker(
             batch.datum,
             loss_fn=batch.loss_fn,
         )
-        optim_future = await training_client.optim_step_async(
-            params.adam_params
-        )
+        optim_future = await training_client.optim_step_async(params.adam_params)
         if pending_fwd_bwd_future is not None and pending_optim_future is not None:
             fwd_bwd_result = await pending_fwd_bwd_future.result_async()
             await pending_optim_future.result_async()
@@ -192,7 +189,9 @@ async def train_worker(
             )
 
         if step % params.update_freq == 0:
-            new_client = await training_client.save_weights_and_get_sampling_client_async()
+            new_client = (
+                await training_client.save_weights_and_get_sampling_client_async()
+            )
             await state.update_sampling_client(new_client)
 
             logger.info("Train Worker -> Latest sampling client updated.")

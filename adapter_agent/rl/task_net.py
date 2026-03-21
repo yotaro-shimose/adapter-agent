@@ -10,7 +10,6 @@ from typing import Any, Awaitable, Callable, ClassVar, Self
 from pydantic import BaseModel
 from pyvis.network import Network
 
-from adapter_agent.data import QRA
 from adapter_agent.hierarchical.process.rewire_session import (
     RewireSessionResult,
     RewireSessionResultNormal,
@@ -80,7 +79,7 @@ class TaskWithMeta:
 @dataclass(kw_only=True)
 class StudyTask:
     task: Task
-    knowledges: list[QRA] = field(default_factory=list)
+    knowledges: list[str] = field(default_factory=list)
     is_generation: bool
 
     @property
@@ -182,7 +181,7 @@ class TaskNetwork:
                 else:
                     study_task = StudyTask(
                         task=node.item,
-                        knowledges=self._get_solved_subtask_qras(curr_id),
+                        knowledges=self._get_solved_subtask_knowledges(curr_id),
                         is_generation=True,
                     )
                 break
@@ -190,7 +189,7 @@ class TaskNetwork:
             if self._should_prioritize_parent(curr_id):
                 study_task = StudyTask(
                     task=node.item,
-                    knowledges=self._get_solved_subtask_qras(curr_id),
+                    knowledges=self._get_solved_subtask_knowledges(curr_id),
                     is_generation=False,
                 )
                 break
@@ -213,7 +212,7 @@ class TaskNetwork:
                 else:
                     study_task = StudyTask(
                         task=node.item,
-                        knowledges=self._get_solved_subtask_qras(curr_id),
+                        knowledges=self._get_solved_subtask_knowledges(curr_id),
                         is_generation=False,
                     )
                 break
@@ -320,8 +319,8 @@ class TaskNetwork:
             <= self.pd_params.k * (n_s**self.pd_params.alpha) - 1
         )
 
-    def _get_solved_subtask_qras(self, node_id: str) -> list[QRA]:
-        qras = []
+    def _get_solved_subtask_knowledges(self, node_id: str) -> list[str]:
+        knowledges = []
         for child_id in self.children_map.get(node_id, []):
             child_node = self.nodes[child_id]
             successful_attempts = [
@@ -332,12 +331,12 @@ class TaskNetwork:
             if len(successful_attempts) > 0:
                 attempt = random.choice(successful_attempts)
                 assert isinstance(attempt.result, RewireSessionResultSuccess)
-                qras.append(attempt.result.qra)
+                knowledges.append(attempt.result.knowledge)
 
             for attempt in child_node.sft_conclusions:
                 if isinstance(attempt.result, RewireSessionResultSuccess):
-                    qras.append(attempt.result.qra)
-        return qras
+                    knowledges.append(attempt.result.knowledge)
+        return knowledges
 
     def to_pyvis(
         self, node_ids: set[str] | None = None, recent_ids: set[str] | None = None

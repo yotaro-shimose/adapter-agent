@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from agents import RunConfig
 from oai_utils.agent import AgentsSDKModel, AgentWrapper
 
-from adapter_agent.data import QRA
 from adapter_agent.hierarchical.agent.base import BaseAgent
 
 logger = logging.getLogger(__name__)
@@ -13,17 +12,17 @@ logger = logging.getLogger(__name__)
 
 @dataclass(kw_only=True)
 class KnowledgeSummarizer[T: AgentsSDKModel](BaseAgent[T]):
-    async def summarize(self, knowledges: list[QRA], task_instruction: str) -> str:
+    async def summarize(self, knowledges: list[str], task_instruction: str) -> str:
         """
-        Summarizes a list of QRAs into a concise knowledge base for the Solver,
-        tailored to a specific task.
+        Summarizes a list of technical knowledge strings into a concise knowledge base
+        for the Solver, tailored to a specific task.
         """
         if not knowledges:
             return ""
 
         PROMPT = f"""
 You are a Senior Engineer specializing in technical documentation and knowledge extraction.
-Your goal is to summarize a collection of Question-Reasoning-Answer (QRA) blocks into a concise, high-density knowledge base.
+Your goal is to summarize a collection of technical knowledge summaries into a concise, high-density knowledge base.
 This knowledge base will be used by another AI agent (the Solver) to help it solve the following coding task in a Rust environment:
 
 <TASK>
@@ -46,19 +45,14 @@ Provide your reasoning, and then output the summarized knowledge base inside a <
             model=self.model,
         )
 
-        knowledges_text = "\n\n".join(
-            [
-                f"Question: {qra.question}\nReasoning: {qra.reasoning}\nAnswer: {qra.answer}"
-                for qra in knowledges
-            ]
-        )
+        knowledges_text = "\n\n---\n\n".join(knowledges)
 
         result = await agent.run(
             f"""\
-Summarize the following QRAs into a knowledge base specifically for the task: "{task_instruction}"
-<QRAs>
+Summarize the following technical knowledge base specifically for the task: "{task_instruction}"
+<TECHNICAL_KNOWLEDGE>
 {knowledges_text}
-</QRAs>
+</TECHNICAL_KNOWLEDGE>
 """,
             run_config=RunConfig(tracing_disabled=True),
         )
