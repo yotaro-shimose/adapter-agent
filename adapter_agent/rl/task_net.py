@@ -8,14 +8,17 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, ClassVar, Self
 
 from pydantic import BaseModel
+from pydantic.fields import Field
 from pyvis.network import Network
+from typing_extensions import TypeIs
 
+from adapter_agent.data import QRA
 from adapter_agent.hierarchical.process.rewire_session import (
     RewireSessionResult,
     RewireSessionResultNormal,
     RewireSessionResultSuccess,
 )
-from adapter_agent.hierarchical.types import Task
+from adapter_agent.hierarchical.types import Entity, Task
 
 
 @dataclass
@@ -28,9 +31,10 @@ class Attempt:
 class TaskWithMeta:
     item: Task
     sft_conclusions: list[Attempt] = field(default_factory=list)
+    knowledges: dict[str, NormalizedKnowledge] = field(default_factory=dict)
     PSEUDO_ROOT_ID: ClassVar[str] = "pseudo_root"
 
-    def register_result(self, result: RewireSessionResult):
+    def register_study_result(self, result: RewireSessionResult):
         if isinstance(result, RewireSessionResultNormal):
             self.sft_conclusions.append(
                 Attempt(
@@ -38,6 +42,16 @@ class TaskWithMeta:
                     timestamp=datetime.now(),
                 )
             )
+        if isinstance(result, RewireSessionResultSuccess):
+            knowledge = NormalizedKnowledge(
+                task_id=self.item.id, knowledge=result.knowledge
+            )
+            self.knowledges[knowledge.id] = knowledge
+
+    def register_slicing_result(self, knowledge_id: str, slice: QRA | None):
+        if slice is not None:
+            knowledge = self.knowledges[knowledge_id]
+            knowledge.slices.append(slice)
 
     @classmethod
     def pseudo_root(cls) -> Self:
@@ -62,6 +76,12 @@ class TaskWithMeta:
     @property
     def sft_attempts_count(self) -> int:
         return len(self.sft_conclusions)
+
+    @property
+    def failure_attempt_count(self) -> int:
+        return sum(
+            1 for attempt in self.sft_conclusions if not attempt.result.is_successful()
+        )
 
     @property
     def is_sft_solved(self) -> bool:
@@ -104,11 +124,37 @@ class StudyTaskCompleted(StudyTask):
     new_task: Task | None = None
 
 
+class SlicingTask(Entity):
+    task_id: str
+    knowledge: NormalizedKnowledge
+
+    def complete(self, slice: QRA | None) -> SlicingTaskCompleted:
+        return SlicingTaskCompleted(
+            task_id=self.task_id,
+            knowledge=self.knowledge,
+            slice=slice,
+        )
+
+
+class SlicingTaskCompleted(SlicingTask):
+    slice: QRA | None
+
+
+class NormalizedKnowledge(Entity):
+    task_id: str
+    knowledge: str
+    slices: list[QRA] = Field(default_factory=list)
+
+
 class PWParams(BaseModel):
     """Progressive Widening parameters"""
 
     k: float = 1.0
     alpha: float = 0.5
+
+
+type TaskNetworkTask = StudyTask | SlicingTask
+type TaskNetworkCompleted = StudyTaskCompleted | SlicingTaskCompleted
 
 
 @dataclass
@@ -118,9 +164,12 @@ class TaskNetwork:
     children_map: dict[str, list[str]] = field(default_factory=dict)
     executing_tasks: dict[str, int] = field(default_factory=dict)
     executing_generations: dict[str, int] = field(default_factory=dict)
+    executing_slicing: dict[str, int] = field(default_factory=dict)
     pd_params: PWParams = field(default_factory=PWParams)
     n_mandatory_parent_trials: int = 3
     root_id: str = field(init=False)
+    slice_base: int = 3
+    max_slice_per_node: int = 15
 
     def __post_init__(self):
         pseudo_root = TaskWithMeta.pseudo_root()
@@ -141,6 +190,15 @@ class TaskNetwork:
         child = TaskWithMeta.from_task(new_task)
         self.nodes[child.item.id] = child
         self._add_edge(parent_id, child.item.id)
+
+    def get_next_task(self) -> TaskNetworkTask:
+        knowledge_to_slice = self.get_knowledge_to_slice()
+        if knowledge_to_slice:
+            return SlicingTask(
+                task_id=knowledge_to_slice.task_id,
+                knowledge=knowledge_to_slice,
+            )
+        return self.get_next_study_task()
 
     def get_next_study_task(self) -> StudyTask:
         curr_id = self.root_id
@@ -223,10 +281,41 @@ class TaskNetwork:
             )
         return study_task
 
-    def get_and_setup_next_study_task(self) -> StudyTask:
-        study_task = self.get_next_study_task()
-        self.study_task_setup(study_task)
-        return study_task
+    def get_and_setup_next_task(self) -> TaskNetworkTask:
+        task = self.get_next_task()
+        if isinstance(task, SlicingTask):
+            self.slicing_task_setup(task)
+        elif isinstance(task, StudyTask):
+            self.study_task_setup(task)
+        else:
+            raise ValueError(f"Unknown task type: {type(task)}")
+        return task
+
+    def task_teardown(self, completed: TaskNetworkCompleted):
+        if isinstance(completed, SlicingTaskCompleted):
+            self.slicing_task_teardown(completed)
+        elif isinstance(completed, StudyTaskCompleted):
+            self.study_task_teardown(completed)
+        else:
+            raise ValueError(f"Unknown task type: {type(completed)}")
+
+    def slicing_task_setup(self, slicing_task: SlicingTask):
+        self.executing_slicing[slicing_task.knowledge.id] = (
+            self.executing_slicing.get(slicing_task.knowledge.id, 0) + 1
+        )
+
+    def slicing_task_teardown(self, completed: SlicingTaskCompleted):
+        knowledge_id = completed.knowledge.id
+        if knowledge_id not in self.executing_slicing:
+            raise ValueError(
+                f"Knowledge {knowledge_id} is not in executing slicing tasks"
+            )
+        self.executing_slicing[knowledge_id] = self.executing_slicing[knowledge_id] - 1
+        if self.executing_slicing[knowledge_id] == 0:
+            del self.executing_slicing[knowledge_id]
+        self.nodes[completed.task_id].register_slicing_result(
+            knowledge_id, completed.slice
+        )
 
     def study_task_setup(self, study_task: StudyTask):
         self._execution_countup(study_task)
@@ -260,7 +349,7 @@ class TaskNetwork:
                 del self.executing_generations[completed.id]
 
     def _process_study_task_result(self, completed: StudyTaskCompleted):
-        self.nodes[completed.id].register_result(completed.result)
+        self.nodes[completed.id].register_study_result(completed.result)
         if completed.new_task is not None:
             if not completed.is_generation:
                 raise ValueError("Task is not generation task but result has new task")
@@ -380,19 +469,26 @@ class TaskNetwork:
             elif node.item.id in recent_ids:
                 show_rate = True
 
+            slice_count = sum(len(k.slices) for k in node.knowledges.values())
+
             if node.item.id in self.executing_tasks:
                 instruction_label = f"⚡ {instruction_label}"
 
             gen_count = self.executing_generations.get(node.item.id, 0)
+
+            label = instruction_label
+            stats = []
+            if show_rate and total_count > 0:
+                stats.append(f"{success_count}/{total_count}")
             if gen_count > 0:
-                label = f"{instruction_label}\n({success_count}/{total_count}) 📂({gen_count})"
-            elif show_rate and total_count > 0:
-                label = f"{instruction_label}\n({success_count}/{total_count})"
-            else:
-                label = instruction_label
+                stats.append(f"📂({gen_count})")
+            if slice_count > 0:
+                stats.append(f"🍕({slice_count})")
+            if stats:
+                label += f"\n({', '.join(stats)})"
 
             attempts = node.sft_attempts_count
-            lightness = max(5, 80 - attempts * 15)
+            lightness = max(5, 80 - attempts * self.max_slice_per_node)
 
             if node.is_sft_solved:
                 color = "#28a745"
@@ -463,23 +559,24 @@ class TaskNetwork:
     def node_count(self) -> int:
         return len(self.nodes)
 
+    def get_knowledge_to_slice(self) -> NormalizedKnowledge | None:
+        for node_id in self.nodes:
+            node = self.nodes[node_id]
+            for knowledge in node.knowledges.values():
+                if len(knowledge.slices) + self.executing_slicing.get(
+                    knowledge.id, 0
+                ) < self.slice_base * min(
+                    (node.failure_attempt_count + 1), self.max_slice_per_node
+                ):
+                    return knowledge
+        return None
+
 
 @dataclass
-class StudyTaskContext:
-    task: StudyTask
-    register: (
-        Callable[[StudyTaskCompleted], Awaitable[None]]
-        | Callable[[StudyTaskCompleted], None]
-    )
-    completed: StudyTaskCompleted | None = None
-
-    @classmethod
-    def next_task_from_network(cls, task_network: TaskNetwork):
-        task = task_network.get_and_setup_next_study_task()
-        return cls(task=task, register=task_network.study_task_teardown)
-
-    def register_result(self, result: RewireSessionResult, new_task: Task | None):
-        self.completed = self.task.complete(result=result, new_task=new_task)
+class TaskResultContext[T, R]:
+    task: T
+    register: Callable[[R], Awaitable[None]] | Callable[[R], None]
+    completed: R | None = None
 
     async def __aenter__(self) -> Self:
         return self
@@ -490,3 +587,26 @@ class StudyTaskContext:
         ret = self.register(self.completed)
         if isawaitable(ret):
             await ret
+
+    def register_result(self, completed: R):
+        self.completed = completed
+
+
+@dataclass
+class TaskContext(TaskResultContext[TaskNetworkTask, TaskNetworkCompleted]):
+    @classmethod
+    def next_task_from_network(cls, task_network: TaskNetwork):
+        task = task_network.get_and_setup_next_task()
+        return cls(task=task, register=task_network.task_teardown)
+
+
+def is_study(
+    task: TaskResultContext,
+) -> TypeIs[TaskResultContext[StudyTask, StudyTaskCompleted]]:
+    return isinstance(task.task, StudyTask)
+
+
+def is_slice(
+    task: TaskResultContext,
+) -> TypeIs[TaskResultContext[SlicingTask, SlicingTaskCompleted]]:
+    return isinstance(task.task, SlicingTask)

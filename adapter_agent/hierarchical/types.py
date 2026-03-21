@@ -4,16 +4,19 @@ from pathlib import Path
 from typing import Self
 
 from agents import TResponseInputItem
-from pydantic import BaseModel, Json
+from pydantic import BaseModel, Field, Json
 
 
-class Task(BaseModel):
-    id: str
+class Entity(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+
+
+class Task(Entity):
     instruction: str
 
     @classmethod
     def from_instruction(cls, instruction: str) -> Self:
-        return cls(id=str(uuid.uuid4()), instruction=instruction)
+        return cls(instruction=instruction)
 
 
 class Trajectory(BaseModel):

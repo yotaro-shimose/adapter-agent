@@ -2,6 +2,9 @@ import asyncio
 import logging
 import os
 
+from oai_utils import AgentsSDKModel
+
+from adapter_agent.rl.task_net import is_study
 from adapter_agent.rl.unirl_state import StudyRolloutParams
 
 # Silence Ray logs
@@ -23,6 +26,7 @@ from ray.actor import ActorHandle
 from tinker import AdamParams
 
 from adapter_agent.hierarchical.agent.analyzer import Analyzer
+from adapter_agent.hierarchical.agent.knowledge_slicer import KnowledgeSlicer
 from adapter_agent.hierarchical.agent.knowledge_summarizer import KnowledgeSummarizer
 from adapter_agent.hierarchical.agent.task_verifier import TaskVerifier
 from adapter_agent.hierarchical.agent.verifier import Verifier
@@ -41,14 +45,17 @@ from adapter_agent.rl.config import EnvParams, ExperimentSettings, ModelLoadingS
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.rl.env.single_turn import SingleTurnEnvState
 from adapter_agent.rl.shared_sampling_client import SharedSamplingClient
-from adapter_agent.rl.task_net import TaskNetwork
+from adapter_agent.rl.task_net import (
+    TaskNetwork,
+    is_slice,
+)
 from adapter_agent.rl.unirl_state import (
     HybridReplayBuffer,
     PracticeRolloutParams,
     UniRLConfig,
     UniRLState,
     UniRLTrainParams,
-    study_task_manager_from_state_handle,
+    task_manager_from_state_handle,
 )
 from adapter_agent.util.exception import CodingEnvironmentError
 from adapter_agent.util.logger_util import setup_base_loglevel
@@ -61,7 +68,8 @@ logger = logging.getLogger(__name__)
 class StudyActor:
     process_id: int
     state: ActorHandle[UniRLState]
-    verifier: Verifier
+    verifier_model: AgentsSDKModel
+    rust_doc_analyzer: RustDocAnalyzer
     env_params: EnvParams
     num_workers: int
 
@@ -86,54 +94,59 @@ class StudyActor:
         initial_model: TinkerModel = await self.state.get_latest_model.remote()
         initial_model.register_tinkerllm_to_litellm()
         knowledge_summarizer = KnowledgeSummarizer(model=get_gemini())
+        knowledge_slicer = KnowledgeSlicer(model=get_gemini())
 
         while True:
             latest_model = await self.state.get_latest_model.remote()
-            study_task_manager = await study_task_manager_from_state_handle(self.state)
+            task_manager = await task_manager_from_state_handle(self.state)
 
-            async with study_task_manager as current:
-                task = current.task
-                knowledges_str = None
-                if task.knowledges:
-                    knowledges_str = await knowledge_summarizer.summarize(
-                        task.knowledges, task_instruction=task.task.instruction
+            async with task_manager as current:
+                if is_slice(current):
+                    try:
+                        qra = await knowledge_slicer.slice(
+                            current.task.knowledge.knowledge
+                        )
+                        current.register_result(current.task.complete(qra))
+                    except Exception as e:
+                        logger.error(f"Slicing failed: {e}")
+                        current.register_result(current.task.complete(None))
+                elif is_study(current):
+                    task = current.task
+                    knowledges_str = None
+                    if task.knowledges:
+                        knowledges_str = await knowledge_summarizer.summarize(
+                            task.knowledges, task_instruction=task.task.instruction
+                        )
+
+                    ret = await ss_solve_verify(
+                        solver_model=latest_model,
+                        verifier_model=self.verifier_model,
+                        rust_doc_analyzer=self.rust_doc_analyzer,
+                        task=task.task,
+                        max_turns=self.env_params.max_turns,
+                        qwen_no_think=self.env_params.qwen_no_think,
+                        runtime_settings=self.env_params.runtime_settings,
+                        knowledges=knowledges_str,
                     )
 
-                ret = await ss_solve_verify(
-                    solver_model=latest_model,
-                    verifier=self.verifier,
-                    rewirer_model=latest_model,
-                    task=task.task,
-                    max_turns=self.env_params.max_turns,
-                    qwen_no_think=self.env_params.qwen_no_think,
-                    runtime_settings=self.env_params.runtime_settings,
-                    knowledges=knowledges_str,
-                )
+                    if not task.is_generation or not isinstance(
+                        ret, RewireSessionResultFailure
+                    ):
+                        current.register_result(task.complete(ret))
+                        continue
 
-                if not task.is_generation or not isinstance(
-                    ret, RewireSessionResultFailure
-                ):
-                    current.register_result(ret, new_task=None)
-                    continue
+                    try:
+                        analyzer = Analyzer(model=get_gemini())
+                        subtask = await analyzer.analyze_trajectory(ret.trials)
 
-                try:
-                    analyzer = Analyzer(model=get_gemini())
-                    subtask = await analyzer.analyze_trajectory(ret.trials)
-
-                    # task_verifier = TaskVerifier(model=get_gemini())
-                    # verification_result = await task_verifier.verify_task(
-                    #     task=subtask, library_name="numrs2"
-                    # )
-                    # print(f"Verification Result: {verification_result.output_type}")
-
-                    # if verification_result.output_type == "valid":
-                    current.register_result(ret, new_task=subtask)
-
-                    continue
-                except Exception as e:
-                    logger.error(f"Subtask generation failed: {e}")
-                    current.register_result(ret, new_task=None)
-                    continue
+                        current.register_result(task.complete(ret, new_task=subtask))
+                        continue
+                    except Exception as e:
+                        logger.error(f"Subtask generation failed: {e}")
+                        current.register_result(task.complete(ret, new_task=None))
+                        continue
+                else:
+                    raise ValueError(f"Unknown task type: {current}")
 
 
 @ray.remote
@@ -260,7 +273,7 @@ class TrainWorker:
                     training_client=self.training_client,
                     name=f"step_{step}",
                     log_path=str(self.experiment_setting.log_root()),
-                    loop_state={},
+                    loop_state={"batch": step},
                     kind="both",
                     ttl_seconds=self.experiment_setting.ttl_seconds,
                 )
@@ -314,24 +327,6 @@ def load_gh_archive() -> list[Task]:
     ]
     logger.info(f"Loaded {len(tasks)} verified tasks.")
     return tasks
-
-
-def setup_agents(
-    service_client: tinker.ServiceClient,
-    model_loading_settings: ModelLoadingSettings,
-    rust_doc_analyzer: RustDocAnalyzer,
-):
-    logger.info(
-        f"Setting up model {model_loading_settings.model_name} from {model_loading_settings.resume_sampler_path}..."
-    )
-    model, tokenizer, renderer = setup_tinkermodel(
-        model_loading_settings.model_name,
-        model_loading_settings.resume_sampler_path,
-        service_client,
-    )
-    verifier_model = get_gemini()
-    verifier = Verifier(model=verifier_model, rust_doc_analyzer=rust_doc_analyzer)
-    return model, verifier
 
 
 def setup_training_client(
@@ -420,11 +415,12 @@ async def main():
 
     rust_doc_analyzer = RustDocAnalyzer.from_libdir(cfg.env_params.library.local_path)
     service_client = tinker.ServiceClient()
-    model, verifier = setup_agents(
+    model, tokenizer, renderer = setup_tinkermodel(
+        cfg.model_loading_settings.model_name,
+        cfg.model_loading_settings.resume_sampler_path,
         service_client,
-        cfg.model_loading_settings,
-        rust_doc_analyzer,
     )
+    verifier_model = get_gemini()
     task_verifier = TaskVerifier(model=get_gemini())
 
     sampling_client_manager = SharedSamplingClient(model.sampling_client)
@@ -484,11 +480,13 @@ async def main():
                 StudyActorClass.remote(
                     i,
                     state,
-                    verifier,
+                    verifier_model,
+                    rust_doc_analyzer,
                     cfg.env_params,
                     cfg.study_rollout_params.rollouts_per_actor,
                 ),
             )
+
             worker_task_ref = worker.run.remote()
             study_workers.append(worker_task_ref)
             logger.info(f"Launched Study Worker {i}...")

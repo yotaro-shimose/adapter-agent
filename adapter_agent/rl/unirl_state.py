@@ -20,10 +20,7 @@ from tinker_cookbook.utils import ml_log
 from tinker_cookbook.utils.ml_log import Logger as MLLogger
 
 from adapter_agent.hierarchical.agent.task_verifier import TaskVerifier
-from adapter_agent.hierarchical.process.rewire_session import (
-    RewireSessionResultNormal,
-    RewireSessionResultSuccess,
-)
+from adapter_agent.hierarchical.process.rewire_session import RewireSessionResultNormal
 from adapter_agent.hierarchical.process.rewire_session_single_turn import (
     SolveVerifyTinkerSingleTurnResult,
 )
@@ -32,10 +29,11 @@ from adapter_agent.rl.config import EnvParams, ExperimentSettings, ModelLoadingS
 from adapter_agent.rl.env.simplified_solver import conclusion_to_metrics
 from adapter_agent.rl.shared_sampling_client import SharedSamplingClient
 from adapter_agent.rl.task_net import (
-    StudyTask,
-    StudyTaskCompleted,
-    StudyTaskContext,
+    SlicingTaskCompleted,
+    TaskContext,
     TaskNetwork,
+    TaskNetworkCompleted,
+    TaskNetworkTask,
 )
 from adapter_agent.rl.trajectory import prepare_minibatch_simplified_sync
 from adapter_agent.util.logger_util import setup_base_loglevel
@@ -315,24 +313,31 @@ class UniRLState:
         )
 
     @ray.method
-    def get_next_study_task(self) -> StudyTask:
-        study_task = self.study_task_queue.get_and_setup_next_study_task()
-        return study_task
+    def get_next_task(self) -> TaskNetworkTask:
+        task = self.study_task_queue.get_and_setup_next_task()
+        return task
 
     @ray.method
-    def register_study_result(self, study_task: StudyTaskCompleted):
-        self.study_task_queue.study_task_teardown(study_task)
-        result = study_task.result
+    def register_task_result(self, completed: TaskNetworkCompleted):
+        self.study_task_queue.task_teardown(completed)
+        if isinstance(completed, SlicingTaskCompleted):
+            if completed.slice is not None:
+                self.buffer.sft_store.put(
+                    SFTSample(
+                        task=Task.from_instruction(
+                            completed.knowledge.knowledge
+                        ),  # Use knowledge as task for SFT
+                        messages=completed.slice.to_tinker_messages(),
+                    )
+                )
+            return
+
+        result = completed.result
         if not isinstance(result, RewireSessionResultNormal):
             return
 
         self.handle_study_result(result)
-        if isinstance(result, RewireSessionResultSuccess):
-            self.buffer.sft_store.put(
-                SFTSample(
-                    task=study_task.task, messages=result.qra.to_tinker_messages()
-                )
-            )
+
         if self.metric_manager.should_study_log():
             self.study_task_queue.save_visualization(
                 self.cfg.experiment_setting.log_root() / "task_net.html"
@@ -455,12 +460,12 @@ class UniRLState:
         return all(r == rewards[0] for r in rewards)
 
 
-async def study_task_manager_from_state_handle(
+async def task_manager_from_state_handle(
     state: ActorHandle[UniRLState],
-) -> StudyTaskContext:
-    ret = await state.get_next_study_task.remote()
-    register = state.register_study_result.remote
-    return StudyTaskContext(
+) -> TaskContext:
+    ret = await state.get_next_task.remote()
+    register = state.register_task_result.remote
+    return TaskContext(
         task=ret,
         register=register,
     )
