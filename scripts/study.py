@@ -40,6 +40,7 @@ class StudyActor:
     rust_doc_analyzer: RustDocAnalyzer
     summarizer_model: AgentsSDKModel
     vis_path: Path
+    json_path: Path
 
     async def run(self):
         while True:
@@ -56,13 +57,16 @@ class StudyActor:
         try:
             qra = await slicer.slice(current.task.knowledge.knowledge)
             current.register_result(current.task.complete(qra))
+            self.task_network.save_json(self.json_path)
         except Exception as e:
             print(f"Slicing failed: {e}")
             current.register_result(current.task.complete(None))
+            self.task_network.save_json(self.json_path)
 
     async def study(self, current: TaskResultContext[StudyTask, StudyTaskCompleted]):
         knowledge_summarizer = KnowledgeSummarizer(model=self.summarizer_model)
         self.task_network.save_visualization(self.vis_path)
+        self.task_network.save_json(self.json_path)
 
         task = current.task
         knowledges_str = None
@@ -95,6 +99,7 @@ class StudyActor:
 
         if not task.is_generation or not isinstance(ret, RewireSessionResultFailure):
             current.register_result(task.complete(ret))
+            self.task_network.save_json(self.json_path)
             return
 
         try:
@@ -112,7 +117,8 @@ class StudyActor:
             current.register_result(task.complete(ret, new_task=subtask))
 
             self.task_network.save_visualization(self.vis_path)
-            print(f"TaskNetwork Visualized at {self.vis_path}")
+            self.task_network.save_json(self.json_path)
+            print(f"TaskNetwork Visualized at {self.vis_path} and {self.json_path}")
             return
         except Exception as e:
             current.register_result(task.complete(ret, new_task=None))
@@ -148,8 +154,9 @@ async def main():
     task_network = TaskNetwork(tasks_pool=tasks[:1])
 
     vis_path = Path("data/graphviz/task_net.html")
+    json_path = Path("graphvis/public/data.json")
     launch_interval = 5
-    num_workers = 50
+    num_workers = 10
 
     tasks = []
     for i in range(num_workers):
@@ -161,6 +168,7 @@ async def main():
             rust_doc_analyzer=rust_doc_analyzer,
             summarizer_model=verifier_model,
             vis_path=vis_path,
+            json_path=json_path,
         )
         tasks.append(asyncio.create_task(study_actor.run()))
         if i < num_workers - 1:

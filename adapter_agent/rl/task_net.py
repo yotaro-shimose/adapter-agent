@@ -140,6 +140,34 @@ class SlicingTaskCompleted(SlicingTask):
     slice: QRA | None
 
 
+class GraphNodeMetadata(BaseModel):
+    instruction: str
+    success_count: int
+    total_count: int
+    is_solved: bool
+    is_executing: bool
+    slice_count: int
+    gen_count: int
+    slices: list[dict[str, str]] = Field(default_factory=list)
+
+
+class GraphExportNode(BaseModel):
+    id: str
+    label: str
+    metadata: GraphNodeMetadata
+
+
+class GraphExportEdge(BaseModel):
+    id: str
+    source: str
+    target: str
+
+
+class GraphExportData(BaseModel):
+    nodes: list[GraphExportNode]
+    edges: list[GraphExportEdge]
+
+
 class NormalizedKnowledge(Entity):
     task_id: str
     knowledge: str
@@ -517,6 +545,67 @@ class TaskNetwork:
                 if node_ids is None or (parent_id in node_ids and child_id in node_ids):
                     net.add_edge(parent_id, child_id)
         return net
+
+    def to_dict(self):
+        nodes_exported = []
+        for node in self.nodes.values():
+            success_count = sum(
+                1 for c in node.sft_conclusions if c.result.is_successful()
+            )
+            total_count = len(node.sft_conclusions)
+            slice_count = sum(len(k.slices) for k in node.knowledges.values())
+            gen_count = self.executing_generations.get(node.item.id, 0)
+            is_executing = node.item.id in self.executing_tasks
+
+            slices_data = []
+            for k in node.knowledges.values():
+                for s in k.slices:
+                    slices_data.append(
+                        {
+                            "question": s.question,
+                            "answer": s.answer,
+                            "reasoning": s.reasoning,
+                        }
+                    )
+
+            metadata = GraphNodeMetadata(
+                instruction=node.item.instruction,
+                success_count=success_count,
+                total_count=total_count,
+                is_solved=node.is_sft_solved,
+                is_executing=is_executing,
+                slice_count=slice_count,
+                gen_count=gen_count,
+                slices=slices_data,
+            )
+
+            nodes_exported.append(
+                GraphExportNode(
+                    id=node.item.id,
+                    label=node.item.instruction,
+                    metadata=metadata,
+                )
+            )
+
+        edges_exported = []
+        for parent_id, children in self.children_map.items():
+            for child_id in children:
+                edges_exported.append(
+                    GraphExportEdge(
+                        id=f"{parent_id}-{child_id}",
+                        source=parent_id,
+                        target=child_id,
+                    )
+                )
+
+        return GraphExportData(nodes=nodes_exported, edges=edges_exported).model_dump()
+
+    def save_json(self, path: Path):
+        import json
+
+        data = self.to_dict()
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
 
     def recent_graph(self, n: int = 10):
         # Collect all attempts with their task IDs and timestamps
