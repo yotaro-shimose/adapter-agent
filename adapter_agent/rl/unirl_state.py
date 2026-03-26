@@ -3,6 +3,7 @@ import logging
 import random
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal, Mapping, Self, Sequence
 
 import ray
@@ -99,6 +100,7 @@ class UniRLConfig(BaseModel):
     practice_rollout_params: PracticeRolloutParams
     train_params: UniRLTrainParams
     log_freq: int
+    vis_json_path: Path | None = None
 
 
 class TinkerBatch(BaseModel):
@@ -339,9 +341,8 @@ class UniRLState:
         self.handle_study_result(result)
 
         if self.metric_manager.should_study_log():
-            self.study_task_queue.save_visualization(
-                self.cfg.experiment_setting.log_root() / "task_net.html"
-            )
+            if self.cfg.vis_json_path:
+                self.study_task_queue.save_json(self.cfg.vis_json_path)
 
     def handle_study_result(self, result: RewireSessionResultNormal):
         metrics = conclusion_to_metrics(result.conclusion)

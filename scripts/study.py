@@ -65,7 +65,6 @@ class StudyActor:
 
     async def study(self, current: TaskResultContext[StudyTask, StudyTaskCompleted]):
         knowledge_summarizer = KnowledgeSummarizer(model=self.summarizer_model)
-        self.task_network.save_visualization(self.vis_path)
         self.task_network.save_json(self.json_path)
 
         task = current.task
@@ -116,9 +115,8 @@ class StudyActor:
             # if verification_result.output_type == "valid":
             current.register_result(task.complete(ret, new_task=subtask))
 
-            self.task_network.save_visualization(self.vis_path)
             self.task_network.save_json(self.json_path)
-            print(f"TaskNetwork Visualized at {self.vis_path} and {self.json_path}")
+            print(f"TaskNetwork Visualized at {self.json_path}")
             return
         except Exception as e:
             current.register_result(task.complete(ret, new_task=None))
@@ -143,7 +141,9 @@ async def main():
 
     service_client = tinker.ServiceClient()
     model, _tokenizer, _renderer = setup_tinkermodel(
-        service_client=service_client, model_name="Qwen/Qwen3-8B"
+        service_client=service_client,
+        model_name="Qwen/Qwen3-8B",
+        # path="tinker://3e320229-9d95-5b1a-b989-702de6f3fa88:train:0/sampler_weights/step_550",
     )
 
     rust_doc_analyzer = RustDocAnalyzer.from_libdir(Path("repositories/numrs"))
@@ -151,7 +151,7 @@ async def main():
     verifier_model = get_gemini()
     tasks = load_gh_archive()
 
-    task_network = TaskNetwork(tasks_pool=tasks[:1])
+    task_network = TaskNetwork(tasks_pool=tasks[30:40])
 
     vis_path = Path("data/graphviz/task_net.html")
     json_path = Path("graphvis/public/data.json")

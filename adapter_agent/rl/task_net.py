@@ -651,13 +651,27 @@ class TaskNetwork:
     def get_knowledge_to_slice(self) -> NormalizedKnowledge | None:
         for node_id in self.nodes:
             node = self.nodes[node_id]
-            for knowledge in node.knowledges.values():
-                if len(knowledge.slices) + self.executing_slicing.get(
-                    knowledge.id, 0
-                ) < self.slice_base * min(
-                    (node.failure_attempt_count + 1), self.max_slice_per_node
-                ):
-                    return knowledge
+            if not node.knowledges:
+                continue
+
+            limit = self.slice_base * min(
+                (node.failure_attempt_count + 1), self.max_slice_per_node
+            )
+
+            total_slices = sum(len(k.slices) for k in node.knowledges.values())
+            total_executing = sum(
+                self.executing_slicing.get(k.id, 0) for k in node.knowledges.values()
+            )
+
+            if total_slices + total_executing >= limit:
+                continue
+
+            # Pick the knowledge with the fewest slices (including in-flight)
+            knowledge = min(
+                node.knowledges.values(),
+                key=lambda k: len(k.slices) + self.executing_slicing.get(k.id, 0),
+            )
+            return knowledge
         return None
 
 

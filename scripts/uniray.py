@@ -405,6 +405,7 @@ async def main():
         ),
         num_study_workers=20,
         log_freq=20,
+        vis_json_path=Path("graphvis/public/data.json"),
     )
 
     setup_rollout_logging()
