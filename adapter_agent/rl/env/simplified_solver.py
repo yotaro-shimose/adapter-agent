@@ -1,14 +1,19 @@
 import asyncio
 import json
+import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Self, TypedDict, cast
 
 import tinker
+from agents import RunContextWrapper, StopAtTools, function_tool
 from coder_mcp.runtime import (
     CoderMCPRuntimeError,
     Runtime,
 )
+from oai_utils import AgentsSDKModel
+from oai_utils.agent import AgentWrapper
+from pydantic import BaseModel
 from tinker_cookbook.completers import StopCondition
 from tinker_cookbook.renderers import Renderer
 from tinker_cookbook.renderers.base import Message as TinkerMessage
@@ -23,15 +28,20 @@ from tinker_cookbook.tool_use.tools import handle_tool_call
 from tinker_cookbook.tool_use.types import Tool, ToolInput, ToolResult
 from typing_extensions import AsyncGenerator
 
-from adapter_agent.hierarchical.agent.simplified_solver import CARGO_INIT_MAIN_RS
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.types import Task
+from adapter_agent.library.knowledge_db import KnowledgeDB
 from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
 from adapter_agent.rl.env.conclusion import SSConclusion
 from adapter_agent.rl.env.injection import _inject_tools_into_prompt
 from adapter_agent.rl.env.reward import LLMAsAJudgeSingleTurn
 from adapter_agent.util.exception import CodingEnvironmentError
-from adapter_agent.util.parsing import extract_rust_code
+
+CARGO_INIT_MAIN_RS = """\
+fn main() {
+    println!("Hello, world!");
+}
+"""
 
 
 @dataclass
@@ -41,7 +51,6 @@ class SimplifiedSolverEnvState:
     prethink: str | None
     messages: list[TinkerMessage]
     qwen_no_think: bool = False
-    knowledge: str | None = None
 
     @classmethod
     def numrs2(
@@ -49,7 +58,6 @@ class SimplifiedSolverEnvState:
         task: Task,
         prethink: str | None = None,
         qwen_no_think: bool = False,
-        knowledge: str | None = None,
     ) -> Self:
         return cls(
             task=task,
@@ -57,7 +65,6 @@ class SimplifiedSolverEnvState:
             prethink=prethink,
             messages=[],
             qwen_no_think=qwen_no_think,
-            knowledge=knowledge,
         )
 
     def with_messages(self, messages: list[TinkerMessage]) -> Self:
@@ -66,6 +73,7 @@ class SimplifiedSolverEnvState:
             library_name=self.library_name,
             prethink=self.prethink,
             messages=messages,
+            qwen_no_think=self.qwen_no_think,
         )
 
 
@@ -74,9 +82,22 @@ class SimplifiedSolverMutableState:
     remaining_turns: int
 
 
+class AgenticSearchContext(BaseModel):
+    final_answer: str | None = None
+
+
 class SearchTool(Tool):
-    def __init__(self, analyzer: RustDocAnalyzer):
+    def __init__(
+        self,
+        search_model: AgentsSDKModel,
+        analyzer: RustDocAnalyzer,
+        knowledge_db: KnowledgeDB,
+        mutable_state: SimplifiedSolverMutableState,
+    ):
+        self.search_model = search_model
         self.analyzer = analyzer
+        self.knowledge_db = knowledge_db
+        self.mutable_state = mutable_state
 
     @property
     def name(self) -> str:
@@ -84,78 +105,124 @@ class SearchTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Search the Rust documentation for both symbols and concepts. It searches BOTH the name of the item and its explanation text."
+        return (
+            "Search the Rust documentation returning analyzed knowledge about target."
+        )
 
     @property
     def parameters_schema(self) -> dict[str, Any]:
         return {
             "type": "object",
             "properties": {
-                "query": {"type": "string"},
+                "query": {
+                    "type": "string",
+                    "description": "The exact concept, function or error code to query.",
+                },
             },
             "required": ["query"],
         }
 
     async def run(self, input: ToolInput) -> ToolResult:
         query = input.arguments.get("query", "")
-        results = self.analyzer.search(query, limit=10)
-        output = json.dumps([r.model_dump() for r in results])
-        assert input.call_id is not None
-        msg = TinkerMessage(
-            role="tool",
-            content=output if output != "[]" else "No results found.",
-            tool_call_id=input.call_id,
-        )
-        return ToolResult(messages=[msg])
 
+        ctx = AgenticSearchContext()
 
-class ReplaceAndRunTool(Tool):
-    def __init__(
-        self,
-        runtime: Runtime,
-        mutable_state: SimplifiedSolverMutableState,
-    ):
-        self.runtime = runtime
-        self.mutable_state = mutable_state
+        # Step 1: Direct Search Execution (KnowledgeDB -> Fallback to RustDocs)
+        db_results = await self.knowledge_db.search(query, limit=3)
 
-    @property
-    def name(self) -> str:
-        return "replace_and_run"
+        if db_results:
+            # Flow A: Knowledge DB (Select and return as-is)
+            numbered_results = {i: res for i, res in enumerate(db_results)}
 
-    @property
-    def description(self) -> str:
-        return "Edit src/main.rs by finding and replacing an exact string. If successful, runs cargo run."
+            @function_tool
+            def select_knowledge(
+                wrapper: RunContextWrapper[AgenticSearchContext], index: int
+            ) -> None:
+                """Select the most relevant knowledge snippet by its integer index."""
+                if index in numbered_results:
+                    wrapper.context.final_answer = numbered_results[index]["content"]
+                else:
+                    wrapper.context.final_answer = "Invalid knowledge index selected."
 
-    @property
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "old_str": {"type": "string"},
-                "new_str": {"type": "string"},
-            },
-            "required": ["old_str", "new_str"],
-        }
+            agent = AgentWrapper[str].create(
+                name="KnowledgeSelector",
+                instructions=(
+                    "You are a knowledge selection assistant.\\n"
+                    f"The user searched for: '{query}'.\\n"
+                    "Below are previously learned knowledge snippets indexed from 0. "
+                    "Read them carefully, select the single most relevant snippet for solving the user's issue, "
+                    "and use the `select_knowledge` tool to choose it. You only need to output the index."
+                ),
+                model=self.search_model,
+                tools=[select_knowledge],
+                tool_use_behavior=StopAtTools(stop_at_tool_names=["select_knowledge"]),
+            )
 
-    async def run(self, input: ToolInput) -> ToolResult:
-        old_str = input.arguments.get("old_str", "")
-        new_str = input.arguments.get("new_str", "")
+            input_list = [
+                {"index": i, "learned_query": r["query"], "content": r["content"]}
+                for i, r in numbered_results.items()
+            ]
+            input_prompt = f"<KnowledgeSnippets>\\n{json.dumps(input_list, indent=2)}\\n</KnowledgeSnippets>"
 
-        replace_ret, replace_success = await self.runtime.str_replace(old_str, new_str)
-        if not replace_success:
-            content = replace_ret
+            await agent.run(input_prompt, context=ctx)
+            final_ans = ctx.final_answer or "Failed to select knowledge."
+
         else:
-            self.mutable_state.remaining_turns -= 1
-            run_ret, run_success = await self.runtime.run_cargo()
-            content = f"<TextReplacementPerformed>\n{replace_ret}\n</TextReplacementPerformed>\n<CargoRunResult>\n{run_ret}\n</CargoRunResult>\n<RemainingTurns>\n{self.mutable_state.remaining_turns}\n</RemainingTurns>"
+            # Flow B: Rust Documentation (Synthesize and Summarize)
+            docs = self.analyzer.search(query, limit=5)
+            raw_results = [d.model_dump() for d in docs]
+
+            if not raw_results:
+                final_ans = (
+                    "No results found in either Knowledge DB or standard documentation."
+                )
+            else:
+
+                @function_tool
+                def report_summary(
+                    wrapper: RunContextWrapper[AgenticSearchContext], summary: str
+                ) -> None:
+                    """Report your comprehensive technical summary back to the user."""
+                    wrapper.context.final_answer = summary
+
+                agent = AgentWrapper[str].create(
+                    name="RustDocSummarizer",
+                    instructions=(
+                        "You are an expert technical summarizer.\\n"
+                        f"The user searched for: '{query}'. Source: Official Rust Documentation.\\n"
+                        "Below are the raw search results. Your task is to:\\n"
+                        "1. Determine the EXACTLY ONE most relevant document from the results.\\n"
+                        "2. Summarize its contents comprehensively. Do NOT lose any technical details, Rust code signatures, or logic patterns.\\n"
+                        "3. Do not formulate the response entirely as a citation ID; instead, provide the raw summary.\\n"
+                        "4. Use the `report_summary` tool to submit."
+                    ),
+                    model=self.search_model,
+                    tools=[report_summary],
+                    tool_use_behavior=StopAtTools(
+                        stop_at_tool_names=["report_summary"]
+                    ),
+                )
+
+                input_prompt = (
+                    f"<SearchResults>\\n{json.dumps(raw_results, indent=2)}\\n</SearchResults>\\n\\n"
+                    "Select the single best document from the list above and provide a detailed summary using `report_summary`."
+                )
+
+                await agent.run(input_prompt, context=ctx)
+                final_ans = ctx.final_answer or "Failed to summarize the document."
+
+        output = f"{final_ans}"
 
         assert input.call_id is not None
         msg = TinkerMessage(
             role="tool",
-            content=content,
+            content=output,
             tool_call_id=input.call_id,
         )
         return ToolResult(messages=[msg])
+
+
+# ReplaceAndRunTool has been replaced by XML tag parsing in the step method.
 
 
 class SSMetrics(TypedDict):
@@ -204,6 +271,8 @@ class SSStepResult(MessageStepResult):
 class SimplifiedSolverEnv(MessageEnv):
     initial_state: SimplifiedSolverEnvState
     rust_env: Runtime
+    search_model: Any
+    knowledge_db: KnowledgeDB
     rust_doc_analyzer: RustDocAnalyzer
     initial_messages: list[TinkerMessage]
     reward_fn: LLMAsAJudgeSingleTurn
@@ -211,11 +280,14 @@ class SimplifiedSolverEnv(MessageEnv):
     history: list[TinkerMessage] = field(default_factory=list)
 
     def __post_init__(self):
-        search_tool = SearchTool(self.rust_doc_analyzer)
-        replace_tool = ReplaceAndRunTool(self.rust_env, self.mutable_state)
+        search_tool = SearchTool(
+            self.search_model,
+            self.rust_doc_analyzer,
+            self.knowledge_db,
+            self.mutable_state,
+        )
         self.tools = {
             search_tool.name: search_tool,
-            replace_tool.name: replace_tool,
         }
 
     async def initial_observation(self) -> list[TinkerMessage]:
@@ -262,11 +334,40 @@ class SimplifiedSolverEnv(MessageEnv):
                         if part["type"] == "text"
                     )
 
-                code = extract_rust_code(text_content)
-                if not code:
+                # Check for XML code test submission
+                write_match = re.search(
+                    r"<write_and_run>(.*?)</write_and_run>", text_content, re.DOTALL
+                )
+                if write_match:
+                    code_to_test = write_match.group(1).strip()
+                    await self.rust_env.set_content("src/main.rs", code_to_test)
+
+                    run_ret, run_success = await self.rust_env.run_cargo()
+                    content = f"<FileWritten>\\nsrc/main.rs has been updated.\\n</FileWritten>\\n<CargoRunResult>\\n{run_ret}\\n</CargoRunResult>\\n<RemainingTurns>\\n{self.mutable_state.remaining_turns}\\n</RemainingTurns>"
+
+                    new_message = TinkerMessage(role="user", content=content)
+                    self.history.append(new_message)
+
+                    if self.mutable_state.remaining_turns <= 0:
+                        return SSStepResult(
+                            reward=0.0,
+                            episode_done=True,
+                            next_messages=self.history,
+                            conclusion="max_turns_exceeded",
+                        )
+                    return SSStepResult(
+                        reward=0.0,
+                        episode_done=False,
+                        next_messages=self.history,
+                        conclusion="not_finished",
+                    )
+
+                # Check for Final Answer Submission
+                submit_match = re.search(r"<submit>(.*?)</submit>", text_content, re.DOTALL)
+                if not submit_match:
                     new_message = TinkerMessage(
                         role="user",
-                        content="No code found in the message. Make sure you wrap the final valid runnable code in ```rust ... ```.",
+                        content="No code found in the message. Make sure you use `<write_and_run>...</write_and_run>` to test, or wrap the final valid runnable code in `<submit>...</submit>` to submit.",
                     )
                     self.history.append(new_message)
 
@@ -284,6 +385,7 @@ class SimplifiedSolverEnv(MessageEnv):
                         conclusion="no_code_found",
                     )
 
+                code = submit_match.group(1).strip()
                 await self.rust_env.set_content("src/main.rs", code)
 
                 reward, conclusion = await self.reward_fn(self.history)
@@ -321,25 +423,29 @@ Note `{env_state.library_name}` is a new library you should be unfamilier with.
 
 <HowTo>
 You have a simplified coding environment with the following tools:
-- `search`: Use this to search both symbol names and documentation for functionality, concepts, or how-to guides.
-- `replace_and_run`: Edit src/main.rs by finding and replacing an exact string. The target file is always src/main.rs. If replacement is successful, runs `cargo run` and returns the output.
+- `search`: A JSON tool. Use this to search both symbol names and documentation for functionality, concepts, or how-to guides.
 
-First search the necessary information using search tool, and then use replace_and_run tool to replace the content and run the code.
-Unverified answer gets automatically rejected. You should confirm your work by running the code and verifying the output.
-Once you confirmed that the solution works, you must output your final answer as a complete, fully functioning source code enclosed in a ```rust ... ``` block. You can also provide any necessary explanation.
-Note you MUST submit your answer after running the code and verifying the output. Code which does not work will be automatically rejected.
+To TEST your code implementation without ending the task, simply output your Rust code inside plain XML tags like this (do NOT use JSON!):
+<write_and_run>
+fn main() {{
+    // your test code here
+}}
+</write_and_run>
+The system will automatically extract the code, write it to `src/main.rs`, run `cargo run`, and give you the output to help you iterate.
+
+Once you confirmed that the solution works, you must output your FINAL answer as a complete, fully functioning source code enclosed in a `<submit> ... </submit>` block. You can also provide any necessary explanation.
+Note: Outputting a `<submit> ... </submit>` block will IMMEDIATELY SUBMIT your answer and run the final verification, which will END the task.
 </HowTo>
 """
 
     guidelines = """\
 Verification: Once again, you MUST verify your answer. You should make your best efforts to avoid hallucination and make sure your answer is correct.
 Self-contained: Note your solution has to be fully self-contained including both fully functioning source code and explanation.
-Code block inclusion: Your final answer must include exactly one ```rust\n<your_code_here>\n``` block. It's content will be pasted to main.rs and executed for verification.
-Simple Search Keyword: When using the `search` tool, it is highly recommended to use only one keyword such as "array" or "conv2d" otherwise the search tool does not return anything.
-Error Reflection: If replace_and_run fails, analyze the error carefully. WHen you find your understanding about the library is wrong, use search tool again.
+Testing Code: Before submitting the final answer, use the `<write_and_run>...</write_and_run>` tags to test code and see outputs. Avoid JSON syntax errors.
+Code block inclusion: Your final answer MUST include exactly one `<submit>\\n<your_code_here>\\n</submit>` block. Its content will be pasted to main.rs and executed for final verification to END the task.
+Simple Search Keyword: When using the `search` tool, try asking full questions or simple keywords to best determine library logic.
+Error Reflection: If `<write_and_run>` test fails, analyze the compiler error carefully. When you find your understanding about the library is wrong, use the `search` tool again.
 """
-    if env_state.knowledge is not None:
-        guidelines += "Knowledge: You will also be provided with some knowledge about the library which may help you to solve the problem. You can use or not to use it."
     PROMPT += f"\n<Guidelines>\n{guidelines}\n</Guidelines>"
 
     initial_message = f"""<Task>
@@ -354,9 +460,6 @@ Error Reflection: If replace_and_run fails, analyze the error carefully. WHen yo
 {CARGO_INIT_MAIN_RS}
 </Current src/main.rs>
 """
-
-    if env_state.knowledge is not None:
-        initial_message += f"\n\n<Knowledge>\n{env_state.knowledge}\n</Knowledge>"
 
     if env_state.qwen_no_think:
         initial_message = "/no_think " + initial_message
@@ -455,6 +558,8 @@ async def build_simplified_solver_env(
     verifier: Verifier,
     rust_doc_analyzer: RustDocAnalyzer,
     runtime: Runtime,
+    search_model: Any,
+    knowledge_db: KnowledgeDB,
     max_trajectory_tokens: int = 32 * 1024,
     max_turns: int = 10,
 ) -> AsyncGenerator[SimplifiedSolverTokenEnv, None]:
@@ -463,13 +568,14 @@ async def build_simplified_solver_env(
 
     mutable_state = SimplifiedSolverMutableState(remaining_turns=max_turns)
     tools_list = [
-        SearchTool(rust_doc_analyzer),
-        ReplaceAndRunTool(runtime, mutable_state),
+        SearchTool(search_model, rust_doc_analyzer, knowledge_db, mutable_state),
     ]
 
     msg_env = SimplifiedSolverEnv(
         initial_state=env_state,
         rust_env=runtime,
+        search_model=search_model,
+        knowledge_db=knowledge_db,
         rust_doc_analyzer=rust_doc_analyzer,
         initial_messages=get_simplified_solver_initial_messages(
             env_state=env_state,

@@ -21,6 +21,7 @@ from adapter_agent.hierarchical.process.rewire_session import (
     RewireSessionResultSuccess,
 )
 from adapter_agent.hierarchical.types import Task
+from adapter_agent.library.knowledge_db import KnowledgeDB
 from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
 from adapter_agent.rl.completer import TinkerMessageCompleter
 from adapter_agent.rl.env.reward import LLMAsAJudge
@@ -177,12 +178,12 @@ async def ss_solve_verify(
     task: Task,
     max_turns: int,
     runtime_settings: RuntimeSettings,
+    knowledge_db: KnowledgeDB,
     qwen_no_think: bool = False,
-    knowledges: str | None = None,
 ) -> RewireSessionResult:
     verifier = Verifier(model=verifier_model, rust_doc_analyzer=rust_doc_analyzer)
     ss_state = SimplifiedSolverEnvState.numrs2(
-        task=task, qwen_no_think=qwen_no_think, knowledge=knowledges
+        task=task, qwen_no_think=qwen_no_think
     )
     try:
         async with runtime_settings.build_runtime() as runtime:
@@ -191,6 +192,8 @@ async def ss_solve_verify(
                 renderer=solver_model.renderer,
                 verifier=verifier,
                 rust_doc_analyzer=verifier.rust_doc_analyzer,
+                search_model=verifier_model,
+                knowledge_db=knowledge_db,
                 max_turns=max_turns,
                 runtime=runtime,
             ) as env:
@@ -265,6 +268,9 @@ async def ss_solve_verify(
                             conclusion="verification_failed",
                             trajectory=trajectory,
                         )
+
+                    logger.info("Problem solved, recording verified knowledge to KnowledgeDB")
+                    await knowledge_db.add_knowledge(task.instruction, normalized_knowledge)
 
                     return RewireSessionResultSuccess(
                         task=task,

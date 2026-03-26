@@ -35,6 +35,7 @@ dependencies = [
     "pyvis>=0.3.2",
     "networkx>=3.6.1",
     "streamlit>=1.55.0",
+    "elasticsearch<9.0.0",
 ]
 
 [build-system]
