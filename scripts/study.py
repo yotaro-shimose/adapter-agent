@@ -10,10 +10,10 @@ from adapter_agent.hierarchical.agent.analyzer import Analyzer
 from adapter_agent.hierarchical.agent.knowledge_slicer import KnowledgeSlicer
 from adapter_agent.hierarchical.agent.knowledge_summarizer import KnowledgeSummarizer
 from adapter_agent.hierarchical.process.rewire import ss_solve_verify
-from adapter_agent.hierarchical.process.rewire_session import (
+from adapter_agent.hierarchical.agent.rewirer import log_trajectory
+from adapter_agent.rl.env.session_result import (
     RewireSessionResultFailure,
     RewireSessionResultNormal,
-    log_trajectory,
 )
 from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
 from adapter_agent.model_helper import get_gemini

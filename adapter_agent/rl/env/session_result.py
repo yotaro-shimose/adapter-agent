@@ -1,4 +1,3 @@
-import logging
 from dataclasses import dataclass, field
 
 from tinker_cookbook.renderers.base import Message as TinkerMessage
@@ -6,27 +5,6 @@ from tinker_cookbook.rl.types import Trajectory
 
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.rl.env.conclusion import SSConclusion
-
-logger = logging.getLogger(__name__)
-
-
-type FloatMetrics = dict[str, float]
-
-
-def _log_trajectory_debug(transcript: str) -> None:
-    """Helper function to log the trajectory using rich if debugging is enabled."""
-    from rich.console import Console
-    from rich.markdown import Markdown
-    from rich.panel import Panel
-
-    console = Console()
-    console.print(
-        Panel(
-            Markdown(transcript),
-            title="Acquired Trajectory",
-            border_style="blue",
-        )
-    )
 
 
 @dataclass(kw_only=True)

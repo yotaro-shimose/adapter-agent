@@ -8,13 +8,11 @@ from tinker_cookbook.rl.types import (
 )
 
 from adapter_agent.hierarchical.agent.verifier import Verifier
-from adapter_agent.hierarchical.process.rewire_session import (
-    get_total_reward,
-)
 from adapter_agent.rl.completer import TinkerTokenCompleter
 from adapter_agent.rl.env.conclusion import SSConclusion
 from adapter_agent.rl.env.reward import LLMAsAJudge
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
+from adapter_agent.rl.env.session_result import get_total_reward
 from adapter_agent.rl.env.single_turn import (
     SingleTurnEnvState,
     build_single_turn_env,

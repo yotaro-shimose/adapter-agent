@@ -32,7 +32,7 @@ from adapter_agent.hierarchical.agent.task_verifier import TaskVerifier
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.gh import Library
 from adapter_agent.hierarchical.process.rewire import ss_solve_verify
-from adapter_agent.hierarchical.process.rewire_session import (
+from adapter_agent.rl.env.session_result import (
     RewireSessionResultFailure,
 )
 from adapter_agent.hierarchical.process.rewire_session_single_turn import (

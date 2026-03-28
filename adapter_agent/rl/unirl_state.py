@@ -21,7 +21,7 @@ from tinker_cookbook.utils import ml_log
 from tinker_cookbook.utils.ml_log import Logger as MLLogger
 
 from adapter_agent.hierarchical.agent.task_verifier import TaskVerifier
-from adapter_agent.hierarchical.process.rewire_session import RewireSessionResultNormal
+from adapter_agent.rl.env.session_result import RewireSessionResultNormal
 from adapter_agent.hierarchical.process.rewire_session_single_turn import (
     SolveVerifyTinkerSingleTurnResult,
 )

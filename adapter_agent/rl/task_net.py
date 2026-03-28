@@ -13,7 +13,7 @@ from pyvis.network import Network
 from typing_extensions import TypeIs
 
 from adapter_agent.data import QRA
-from adapter_agent.hierarchical.process.rewire_session import (
+from adapter_agent.rl.env.session_result import (
     RewireSessionResult,
     RewireSessionResultNormal,
     RewireSessionResultSuccess,

@@ -91,25 +91,24 @@ def format_trajectory_transcript(
     return transcript
 
 
-def _log_rewire_result_debug(original_transcript: str, rewired_transcript: str) -> None:
-    """Helper function to log the rewire result using rich if debugging is enabled."""
-
+def _log_trajectory_debug(transcript: str) -> None:
+    """Helper function to log the trajectory using rich if debugging is enabled."""
     from rich.console import Console
+    from rich.markdown import Markdown
     from rich.panel import Panel
-    from rich.text import Text
 
     console = Console()
     console.print(
         Panel(
-            Text(original_transcript, style="dim white"),
-            title="Original Trajectory",
-            border_style="yellow",
+            Markdown(transcript),
+            title="Acquired Trajectory",
+            border_style="blue",
         )
     )
-    console.print(
-        Panel(
-            Text(rewired_transcript, style="bold green"),
-            title="Rewired Trajectory (Trimmed)",
-            border_style="green",
-        )
+
+
+def log_trajectory(messages: list[TinkerMessage], flip_tag: bool = False) -> None:
+    transcript = format_trajectory_transcript(
+        messages, use_thinking=True, flip_tag=flip_tag
     )
+    _log_trajectory_debug(transcript)

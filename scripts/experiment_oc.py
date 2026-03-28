@@ -5,10 +5,10 @@ import tinker
 from oai_utils.tinker import setup_tinkermodel
 
 from adapter_agent.hierarchical.process.rewire import ss_solve_verify
-from adapter_agent.hierarchical.process.rewire_session import (
+from adapter_agent.hierarchical.agent.rewirer import log_trajectory
+from adapter_agent.rl.env.session_result import (
     RewireSessionResultNormal,
     RewireSessionResultSuccess,
-    log_trajectory,
 )
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.library.knowledge_db import KnowledgeDB
