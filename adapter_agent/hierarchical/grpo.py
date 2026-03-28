@@ -1,6 +1,6 @@
 import logging
-import tinker
 
+import tinker
 from tinker_cookbook.rl.data_processing import (
     assemble_training_data,
     compute_advantages,

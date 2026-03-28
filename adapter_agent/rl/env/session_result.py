@@ -1,3 +1,4 @@
+from typing import Any
 from dataclasses import dataclass, field
 
 from tinker_cookbook.renderers.base import Message as TinkerMessage
@@ -48,6 +49,17 @@ class RewireSessionResultError:
 type RewireSessionResult = (
     RewireSessionResultSuccess | RewireSessionResultFailure | RewireSessionResultError
 )
+
+
+@dataclass(kw_only=True)
+class SolveVerifyTinkerSingleTurnResult:
+    trajectory: Trajectory
+    env_state: Any  # Avoid circular import, or use a more general type
+    reward: float
+    conclusion: SSConclusion
+
+    def is_successful(self) -> bool:
+        return self.reward > 0.0
 
 
 def get_total_reward(trajectory: Trajectory) -> float:

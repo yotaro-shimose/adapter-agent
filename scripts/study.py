@@ -9,15 +9,15 @@ from oai_utils.tinker import TinkerModel, setup_tinkermodel
 from adapter_agent.hierarchical.agent.analyzer import Analyzer
 from adapter_agent.hierarchical.agent.knowledge_slicer import KnowledgeSlicer
 from adapter_agent.hierarchical.agent.knowledge_summarizer import KnowledgeSummarizer
-from adapter_agent.hierarchical.process.rewire import ss_solve_verify
 from adapter_agent.hierarchical.agent.rewirer import log_trajectory
+from adapter_agent.hierarchical.process.rewire import ss_solve_verify
+from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
+from adapter_agent.model_helper import get_gemini
+from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.rl.env.session_result import (
     RewireSessionResultFailure,
     RewireSessionResultNormal,
 )
-from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
-from adapter_agent.model_helper import get_gemini
-from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.rl.task_net import (
     SlicingTask,
     SlicingTaskCompleted,
@@ -37,7 +37,7 @@ class StudyActor:
     task_network: TaskNetwork
     solver_model: TinkerModel
     verifier_model: AgentsSDKModel
-    rust_doc_analyzer: RustDocAnalyzer
+    rust_doc_analyzer: AsyncRustDocAnalyzer
     summarizer_model: AgentsSDKModel
     vis_path: Path
     json_path: Path

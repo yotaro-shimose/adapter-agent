@@ -27,7 +27,7 @@ from adapter_agent.hierarchical.process.rewire_session_single_turn import (
 )
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.rl.config import EnvParams, ExperimentSettings, ModelLoadingSettings
-from adapter_agent.rl.env.simplified_solver import conclusion_to_metrics
+from adapter_agent.rl.env.conclusion import conclusion_to_metrics
 from adapter_agent.rl.shared_sampling_client import SharedSamplingClient
 from adapter_agent.rl.task_net import (
     SlicingTaskCompleted,

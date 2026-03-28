@@ -32,17 +32,16 @@ from adapter_agent.hierarchical.agent.task_verifier import TaskVerifier
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.gh import Library
 from adapter_agent.hierarchical.process.rewire import ss_solve_verify
-from adapter_agent.rl.env.session_result import (
-    RewireSessionResultFailure,
-)
 from adapter_agent.hierarchical.process.rewire_session_single_turn import (
     solve_verify_tinker_single_turn,
 )
 from adapter_agent.hierarchical.types import Task
-from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
 from adapter_agent.model_helper import get_gemini
 from adapter_agent.rl.config import EnvParams, ExperimentSettings, ModelLoadingSettings
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
+from adapter_agent.rl.env.session_result import (
+    RewireSessionResultFailure,
+)
 from adapter_agent.rl.env.single_turn import SingleTurnEnvState
 from adapter_agent.rl.shared_sampling_client import SharedSamplingClient
 from adapter_agent.rl.task_net import (

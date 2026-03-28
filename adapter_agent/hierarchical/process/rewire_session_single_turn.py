@@ -1,5 +1,4 @@
 import logging
-from dataclasses import dataclass
 
 from oai_utils.tinker import TinkerModel
 from tinker_cookbook.rl.types import (
@@ -9,27 +8,17 @@ from tinker_cookbook.rl.types import (
 
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.rl.completer import TinkerTokenCompleter
-from adapter_agent.rl.env.conclusion import SSConclusion
-from adapter_agent.rl.env.reward import LLMAsAJudge
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
-from adapter_agent.rl.env.session_result import get_total_reward
+from adapter_agent.rl.env.session_result import (
+    SolveVerifyTinkerSingleTurnResult,
+    get_total_reward,
+)
 from adapter_agent.rl.env.single_turn import (
     SingleTurnEnvState,
     build_single_turn_env,
 )
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class SolveVerifyTinkerSingleTurnResult:
-    trajectory: Trajectory
-    env_state: SingleTurnEnvState
-    reward: float
-    conclusion: SSConclusion
-
-    def is_success(self) -> bool:
-        return LLMAsAJudge.is_successful_reward(self.reward)
 
 
 async def solve_verify_tinker_single_turn(
