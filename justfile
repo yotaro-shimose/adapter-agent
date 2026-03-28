@@ -3,7 +3,7 @@ default:
 
 
 stop-docker:
-    docker ps -q | xargs -r docker stop
+    docker ps | grep "coder-mcp" | awk '{print $1}' | xargs -r docker stop
 
 clean-tmp:
     rm -rf /tmp/*
