@@ -3,7 +3,7 @@ from typing import List
 import pydantic
 from agents import RunContextWrapper, function_tool
 
-from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer, SearchResult
+from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer, SearchResult
 
 
 class WithRustDocAnalyzer(pydantic.BaseModel):
@@ -13,11 +13,11 @@ class WithRustDocAnalyzer(pydantic.BaseModel):
     """
 
     model_config = pydantic.ConfigDict(arbitrary_types_allowed=True)
-    rust_doc_analyzer: RustDocAnalyzer
+    rust_doc_analyzer: AsyncRustDocAnalyzer
 
 
 @function_tool
-def search_docs(
+async def search_docs(
     wrapper: RunContextWrapper[WithRustDocAnalyzer], query: str, limit: int = 10
 ) -> List[SearchResult]:
     """
@@ -28,7 +28,7 @@ def search_docs(
     that might appear in the explanation of the code, rather than just the names of types or functions.
 
     Args:
-        wrapper: The execution context containing the RustDocAnalyzer instance.
+        wrapper: The execution context containing the AsyncRustDocAnalyzer instance.
         query: The string to search for within the documentation text. Case-insensitive.
         limit: The maximum number of results to return. Defaults to 10.
 
@@ -37,10 +37,10 @@ def search_docs(
 
     Example Usage:
         # To find functions or structs related to matrix multiplication described in text
-        results = search_docs(context, "matrix multiplication")
+        results = await search_docs(context, "matrix multiplication")
 
         # To find where "eigenvectors" are mentioned
-        results = search_docs(context, "eigenvectors")
+        results = await search_docs(context, "eigenvectors")
 
     Example Output:
         [
@@ -48,16 +48,16 @@ def search_docs(
                 name="numrs2::matrix::Matrix::dot",
                 kind="fn",
                 score=3,
-                snippet="...computes the matrix multiplication of two matrices..."
+                snippet="..."
             ),
             ...
         ]
     """
-    return wrapper.context.rust_doc_analyzer.search_docs(query, limit)
+    return await wrapper.context.rust_doc_analyzer.search_docs(query, limit)
 
 
 @function_tool
-def search_symbol(
+async def search_symbol(
     wrapper: RunContextWrapper[WithRustDocAnalyzer], query: str, limit: int = 10
 ) -> List[SearchResult]:
     """
@@ -68,7 +68,7 @@ def search_symbol(
     Use this tool when you know the name (or part of the name) of the type or function you are looking for.
 
     Args:
-        wrapper: The execution context containing the RustDocAnalyzer instance.
+        wrapper: The execution context containing the AsyncRustDocAnalyzer instance.
         query: The name (or partial name) of the symbol to search for. Case-insensitive.
         limit: The maximum number of results to return. Defaults to 10.
 
@@ -77,10 +77,10 @@ def search_symbol(
 
     Example Usage:
         # To find the 'Matrix' struct
-        results = search_symbol(context, "Matrix")
+        results = await search_symbol(context, "Matrix")
 
         # To find functions starting with 'new'
-        results = search_symbol(context, "new_")
+        results = await search_symbol(context, "new_")
 
     Example Output:
         [
@@ -88,21 +88,15 @@ def search_symbol(
                 name="numrs2::matrix::Matrix",
                 kind="struct",
                 score=100,
-                snippet="A generic N-dimensional matrix."
-            ),
-            SearchResult(
-                name="numrs2::matrix::MatrixDecomposition",
-                kind="trait",
-                score=50,
                 snippet="..."
             )
         ]
     """
-    return wrapper.context.rust_doc_analyzer.search_symbol(query, limit)
+    return await wrapper.context.rust_doc_analyzer.search_symbol(query, limit)
 
 
 @function_tool
-def search(
+async def search(
     wrapper: RunContextWrapper[WithRustDocAnalyzer], query: str, limit: int = 10
 ) -> List[SearchResult]:
     """
@@ -114,7 +108,7 @@ def search(
     over matches in the description. Multiple words separated by spaces perform an AND search.
 
     Args:
-        wrapper: The execution context containing the RustDocAnalyzer instance.
+        wrapper: The execution context containing the AsyncRustDocAnalyzer instance.
         query: The string to search for within the documentation text or symbol name. Case-insensitive.
         limit: The maximum number of results to return. Defaults to 10.
 
@@ -123,9 +117,9 @@ def search(
 
     Example Usage:
         # To find functions or structs related to sorting either by name or description
-        results = search(context, "sort")
+        results = await search(context, "sort")
     """
-    return wrapper.context.rust_doc_analyzer.search(query, limit)
+    return await wrapper.context.rust_doc_analyzer.search(query, limit)
 
 
 @function_tool
@@ -141,7 +135,7 @@ def get_crate_overview(wrapper: RunContextWrapper[WithRustDocAnalyzer]) -> str:
     what top-level modules are available, and where to look for specific functionality.
 
     Args:
-        wrapper: The execution context containing the RustDocAnalyzer instance.
+        wrapper: The execution context containing the AsyncRustDocAnalyzer instance.
 
     Returns:
         str: A markdown string containing the crate description and module tree.

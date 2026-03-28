@@ -12,7 +12,7 @@ from adapter_agent.hierarchical.process.rewire_session import (
 )
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.library.knowledge_db import KnowledgeDB
-from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
+from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
 from adapter_agent.model_helper import get_gemini
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 
@@ -25,7 +25,7 @@ async def main():
     )
 
     # 1. Initialize Tools and Verifier
-    rust_doc_analyzer = RustDocAnalyzer.from_libdir(Path("repositories/numrs"))
+    rust_doc_analyzer = await AsyncRustDocAnalyzer.create_from_libdir(Path("repositories/numrs"))
     verifier_model = get_gemini()
     
     # 2. Initialize KnowledgeDB and explicitly clear it for this experiment
@@ -83,14 +83,25 @@ async def main():
                     console.print()
                     console.print(
                         Panel(
-                            Markdown(ret1.knowledge),
+                            Markdown(ret1.knowledge or "No knowledge extracted."),
                             title="🧠 Acquired Knowledge",
                             border_style="magenta",
                             expand=False
                         )
                     )
+
+                    if ret1.oc_trials:
+                        print("\n-- OC-Converted (Closed Book) Trajectory Log --")
+                        log_trajectory(ret1.oc_trials, flip_tag=True)
+                        with open(f"trajectory_oc_initial_{run_idx}.txt", "w") as f:
+                            for trial in ret1.oc_trials:
+                                f.write(str(trial) + "\n")
+                        print(f"📄 OC trajectory saved to trajectory_oc_initial_{run_idx}.txt")
             else:
-                print("🔄 Initial run failed. Retrying...")
+                print(f"🔄 Initial run failed (Conclusion: {ret1.conclusion}).")
+                if ret1.reasoning:
+                    print(f"🧐 Reasoning: {ret1.reasoning}")
+                print("Retrying...")
                 run_idx += 1
                 await knowledge_db.clear()
                 await knowledge_db.initialize()
@@ -120,12 +131,22 @@ async def main():
 
         if isinstance(ret2, RewireSessionResultNormal):
             print(f"✅ Followup Run {i} Conclusion: {ret2.conclusion}")
+            if ret2.reasoning:
+                print(f"🧐 Reasoning: {ret2.reasoning}")
             print("\\n-- Trajectory Log --")
             log_trajectory(ret2.trials, flip_tag=True)
             # 軌跡ログの保存
             with open(f"trajectory_followup_{i}.txt", "w") as f:
                 for trial in ret2.trials:
-                    f.write(str(trial) + "\\n")
+                    f.write(str(trial) + "\n")
+            
+            if isinstance(ret2, RewireSessionResultSuccess) and ret2.oc_trials:
+                print("\n-- OC-Converted (Closed Book) Trajectory Log --")
+                log_trajectory(ret2.oc_trials, flip_tag=True)
+                with open(f"trajectory_oc_followup_{i}.txt", "w") as f:
+                    for trial in ret2.oc_trials:
+                        f.write(str(trial) + "\n")
+                print(f"📄 OC trajectory saved to trajectory_oc_followup_{i}.txt")
         else:
             print(f"❌ Followup Run {i} Error Log: {ret2}")
 

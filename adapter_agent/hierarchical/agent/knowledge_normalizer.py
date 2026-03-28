@@ -32,26 +32,30 @@ class KnowledgeNormalizer[T: AgentsSDKModel](BaseAgent[T]):
             raise ValueError("Trajectory cannot be empty")
 
         PROMPT = """\
-You are a Senior Technical Writer and Knowledge Engineer.
-Your goal is to extract "Normalized Knowledge" from a trajectory log of an AI agent solving a complex Rust coding task.
+You are a Senior Technical Writer and Knowledge Engineer responsible for distilling "Normalized Knowledge" from an AI agent's trajectory.
 
-Normalized Knowledge MUST be a comprehensive, article-style explanatory text (in Markdown format) that thoroughly documents the technical insights, patterns, and solutions discovered during the trial. It should NOT just be a source code snippet with comments.
+The goal is to produce a high-quality, standalone technical article (Markdown) that allows other agents to solve similar tasks without performing any search.
 
-It should serve as a complete reference that contains all the information needed to:
-1. Reconstruct the final correct solution.
-2. Understand the underlying logic and reasoning behind the solution.
-3. Identify relevant library patterns, common pitfalls, and specific symbol usages.
+### Content Structure
+Your article must cover the following sections:
 
-Guidelines:
-- You MUST preserve all valuable technical details, API signatures, parameter descriptions, trait constraints, and caveats that the agent discovered via search tools during the trajectory. Do NOT over-summarize or discard technical depth.
-- Write a highly detailed, article-style technical documentation (using Markdown headings `###`, bullet points, etc.) that clearly explains the library usage, concepts, and key API signatures.
-- For every key function or struct used, document its purpose, function signature, parameters, and trait constraints clearly, just like official documentation.
-- If the agent encountered errors and solved them, detail the exact problem and the technical reasoning behind the solution.
-- Ensure the normalized knowledge includes exactly one ```rust ... ``` code block containing a final, complete, and runnable solution that demonstrates the learned knowledge. This code block should serve as a concrete use-case example at the end of the article.
-- Do NOT just return a Rust code block. The comprehensive text explanation is the most important part of the knowledge base.
+1. **Overview & Logic**: Explain the technical problem, the discovered solution logic, and any architectural patterns or reasoning used.
+2. **Technical Reference (API)**: Document every key struct, function, or trait used. 
+   - Provide the **exact function signatures** found in the search results (e.g., `pub fn crate::mod::function(...)`).
+   - Describe each parameter and trait bound (like `T: Clone`).
+   - Treat this section as a formal API reference.
+3. **Execution Insights**: Explain any issues encountered (compilation errors, runtime panics) and the exact steps taken to resolve them.
+4. **Verified Usage Example**: Provide exactly one code block containing the final, complete, and runnable solution that was verified in the trajectory.
+   - Use the standard ```rust ... ``` block.
+   - This code MUST be self-contained and ready to be compiled to verify the knowledge.
 
-OUTPUT FORMAT:
-Provide your reasoning, and then output the normalized knowledge base inside a <knowledge></knowledge> xml block.
+### Rules for Code Blocks
+- **Distinguish between Reference and Example**: Function signatures (e.g., `pub fn numrs2::...`) must be part of the text but NOT included inside the final runnable code block.
+- **Runnable Example**: The final code block should be equivalent to what a human would write in `main.rs` to demonstrate the feature.
+
+### Output Format
+1. Write your brief reasoning for the extraction.
+2. Output the finalized article inside `<knowledge>` XML tags.
 """
         agent = AgentWrapper[str].create(
             name="KnowledgeNormalizer",

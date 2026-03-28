@@ -30,8 +30,8 @@ from typing_extensions import AsyncGenerator
 
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.types import Task
+from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
 from adapter_agent.library.knowledge_db import KnowledgeDB
-from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
 from adapter_agent.rl.env.conclusion import SSConclusion
 from adapter_agent.rl.env.injection import _inject_tools_into_prompt
 from adapter_agent.rl.env.reward import LLMAsAJudgeSingleTurn
@@ -84,13 +84,14 @@ class SimplifiedSolverMutableState:
 
 class AgenticSearchContext(BaseModel):
     final_answer: str | None = None
+    knowledge_id: str | None = None
 
 
 class SearchTool(Tool):
     def __init__(
         self,
         search_model: AgentsSDKModel,
-        analyzer: RustDocAnalyzer,
+        analyzer: AsyncRustDocAnalyzer,
         knowledge_db: KnowledgeDB,
         mutable_state: SimplifiedSolverMutableState,
     ):
@@ -129,6 +130,7 @@ class SearchTool(Tool):
 
         # Step 1: Direct Search Execution (KnowledgeDB -> Fallback to RustDocs)
         db_results = await self.knowledge_db.search(query, limit=3)
+        final_ans: str | None = None
 
         if db_results:
             # Flow A: Knowledge DB (Select and return as-is)
@@ -136,40 +138,50 @@ class SearchTool(Tool):
 
             @function_tool
             def select_knowledge(
-                wrapper: RunContextWrapper[AgenticSearchContext], index: int
+                wrapper: RunContextWrapper[AgenticSearchContext], index: int | None
             ) -> None:
-                """Select the most relevant knowledge snippet by its integer index."""
-                if index in numbered_results:
+                """Select the most relevant knowledge snippet by its integer index. If none of the snippets are relevant, pass `None`."""
+                if index is not None and index in numbered_results:
                     wrapper.context.final_answer = numbered_results[index]["content"]
+                    wrapper.context.knowledge_id = numbered_results[index]["id"]
                 else:
-                    wrapper.context.final_answer = "Invalid knowledge index selected."
+                    wrapper.context.final_answer = None
 
             agent = AgentWrapper[str].create(
                 name="KnowledgeSelector",
                 instructions=(
-                    "You are a knowledge selection assistant.\\n"
-                    f"The user searched for: '{query}'.\\n"
+                    "You are a knowledge selection assistant.\n"
+                    f"The user searched for: '{query}'.\n"
                     "Below are previously learned knowledge snippets indexed from 0. "
-                    "Read them carefully, select the single most relevant snippet for solving the user's issue, "
-                    "and use the `select_knowledge` tool to choose it. You only need to output the index."
+                    "Read them carefully and decide if ANY of them are truly relevant for solving the user's issue.\n"
+                    f"1. If a snippet is highly relevant, use the `{select_knowledge.name}` tool to choose it by its index.\n"
+                    f"2. If NONE of the snippets are relevant or helpful, call `{select_knowledge.name}` with `index=None` to signal a fallback to standard documentation search.\n"
+                    "You only need to output the tool call."
                 ),
                 model=self.search_model,
                 tools=[select_knowledge],
-                tool_use_behavior=StopAtTools(stop_at_tool_names=["select_knowledge"]),
+                tool_use_behavior=StopAtTools(
+                    stop_at_tool_names=[select_knowledge.name]
+                ),
             )
 
             input_list = [
-                {"index": i, "learned_query": r["query"], "content": r["content"]}
+                {
+                    "index": i,
+                    "learned_query": r["query"],
+                    "content": r["content"],
+                    "id": r["id"],
+                }
                 for i, r in numbered_results.items()
             ]
-            input_prompt = f"<KnowledgeSnippets>\\n{json.dumps(input_list, indent=2)}\\n</KnowledgeSnippets>"
+            input_prompt = f"<KnowledgeSnippets>\n{json.dumps(input_list, indent=2)}\n</KnowledgeSnippets>"
 
             await agent.run(input_prompt, context=ctx)
-            final_ans = ctx.final_answer or "Failed to select knowledge."
+            final_ans = ctx.final_answer
 
-        else:
+        if not final_ans:
             # Flow B: Rust Documentation (Synthesize and Summarize)
-            docs = self.analyzer.search(query, limit=5)
+            docs = await self.analyzer.search(query, limit=5)
             raw_results = [d.model_dump() for d in docs]
 
             if not raw_results:
@@ -219,6 +231,8 @@ class SearchTool(Tool):
             content=output,
             tool_call_id=input.call_id,
         )
+        # Adding knowledge_id as a dynamic attribute to track citation
+        cast(dict[str, Any], msg)["knowledge_id"] = ctx.knowledge_id
         return ToolResult(messages=[msg])
 
 
@@ -273,7 +287,7 @@ class SimplifiedSolverEnv(MessageEnv):
     rust_env: Runtime
     search_model: Any
     knowledge_db: KnowledgeDB
-    rust_doc_analyzer: RustDocAnalyzer
+    rust_doc_analyzer: AsyncRustDocAnalyzer
     initial_messages: list[TinkerMessage]
     reward_fn: LLMAsAJudgeSingleTurn
     mutable_state: SimplifiedSolverMutableState
@@ -363,7 +377,9 @@ class SimplifiedSolverEnv(MessageEnv):
                     )
 
                 # Check for Final Answer Submission
-                submit_match = re.search(r"<submit>(.*?)</submit>", text_content, re.DOTALL)
+                submit_match = re.search(
+                    r"<submit>(.*?)</submit>", text_content, re.DOTALL
+                )
                 if not submit_match:
                     new_message = TinkerMessage(
                         role="user",
@@ -499,7 +515,9 @@ class SimplifiedSolverTokenEnv(EnvFromMessageEnv):
             messages, prefill=prefill
         ), self._base_stop_condition
 
-    async def step(self, action: types.Action) -> types.StepResult:
+    async def step(
+        self, action: types.Action, *, extra: types.ActionExtra | None = None
+    ) -> types.StepResult:
         assistant_message, parse_success = self.renderer.parse_response(action)
 
         if not parse_success:
@@ -556,7 +574,7 @@ async def build_simplified_solver_env(
     env_state: SimplifiedSolverEnvState,
     renderer: Renderer,
     verifier: Verifier,
-    rust_doc_analyzer: RustDocAnalyzer,
+    rust_doc_analyzer: AsyncRustDocAnalyzer,
     runtime: Runtime,
     search_model: Any,
     knowledge_db: KnowledgeDB,

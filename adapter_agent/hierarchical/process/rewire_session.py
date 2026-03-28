@@ -54,12 +54,14 @@ class RewireSessionResultNormal:
     conclusion: SSConclusion
     trajectory: Trajectory
     reward: float
+    knowledge: str | None = None
+    reasoning: str | None = None
 
 
 @dataclass(kw_only=True)
 class RewireSessionResultSuccess(RewireSessionResultNormal):
     conclusion: SSConclusion = field(default="success", init=False)
-    knowledge: str
+    oc_trials: list[TinkerMessage] | None = None
     reward: float = 1.0
 
     def is_successful(self) -> bool:

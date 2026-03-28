@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from adapter_agent.data import QA
 from adapter_agent.hierarchical.agent.base import BaseAgent
-from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
+from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +55,7 @@ def report_failure(
 
 @dataclass(kw_only=True)
 class Verifier[T: AgentsSDKModel](BaseAgent[T]):
-    rust_doc_analyzer: RustDocAnalyzer
+    rust_doc_analyzer: AsyncRustDocAnalyzer
 
     async def verify(
         self,

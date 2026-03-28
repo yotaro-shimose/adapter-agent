@@ -71,13 +71,13 @@ def format_trajectory_transcript(
     # Pre-render XML code blocks into beautiful markdown before flip_tag breaks the brackets
     transcript = re.sub(
         r"<write_and_run>(.*?)</write_and_run>",
-        r"**[TEST RUN]**\n```rust\n\1\n```",
+        r"[write_and_run]\n```rust\n\1\n```\n[/write_and_run]",
         transcript,
         flags=re.DOTALL,
     )
     transcript = re.sub(
         r"<submit>(.*?)</submit>",
-        r"**[FINAL SUBMISSION]**\n```rust\n\1\n```",
+        r"[submit]\n```rust\n\1\n```\n[/submit]",
         transcript,
         flags=re.DOTALL,
     )

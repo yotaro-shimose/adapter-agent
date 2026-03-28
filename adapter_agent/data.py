@@ -145,6 +145,8 @@ class PydanticTinkerBaseMessage(BaseModel):
     trainable: bool | None = Field(default=None)
     tool_call_id: str | None = Field(default=None)
     name: str | None = Field(default=None)
+    knowledge_id: str | None = Field(default=None)
+    cited_turn: int | None = Field(default=None)
 
     def to_tinker_message(self) -> TinkerMessage:
         input_dict = self.model_dump()

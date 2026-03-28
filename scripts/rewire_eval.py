@@ -10,7 +10,7 @@ from oai_utils.async_utils import gather_with_semaphore
 from adapter_agent.hierarchical.gh import Library
 from adapter_agent.hierarchical.process.rewire import ss_solve_verify
 from adapter_agent.hierarchical.types import Task
-from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
+from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
 from adapter_agent.rl.config import (
     EnvParams,
     ExperimentSettings,
@@ -111,7 +111,7 @@ async def main():
     service_client = tinker.ServiceClient()
 
     # Setup agents
-    rust_doc_analyzer = RustDocAnalyzer.from_libdir(cfg.env_params.library.local_path)
+    rust_doc_analyzer = await AsyncRustDocAnalyzer.create_from_libdir(cfg.env_params.library.local_path)
     model, verifier = setup_agents(
         service_client,
         cfg.model_loading_settings,

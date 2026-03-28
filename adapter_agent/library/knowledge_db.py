@@ -1,13 +1,15 @@
 import logging
-from typing import TypedDict
+from typing import TypedDict, cast
 
 from elasticsearch import AsyncElasticsearch
 
 logger = logging.getLogger(__name__)
 
 class KnowledgeDoc(TypedDict):
+    id: str
     query: str
     content: str
+
 
 class KnowledgeDB:
     def __init__(self, host: str = "http://localhost:9200", index_name: str = "knowledge_box"):
@@ -54,7 +56,18 @@ class KnowledgeDB:
         # Refresh the index to make the new document immediately searchable
         await self.client.indices.refresh(index=self.index_name)
         return res["_id"]
-        
+
+    async def get_knowledge_by_id(self, doc_id: str) -> KnowledgeDoc | None:
+        """Retrieve a specific knowledge entry by its document ID."""
+        try:
+            res = await self.client.get(index=self.index_name, id=doc_id)
+            doc = cast(KnowledgeDoc, res["_source"])
+            doc["id"] = res["_id"]
+            return doc
+        except Exception as e:
+            logger.error(f"Failed to get knowledge by id {doc_id}: {e}")
+            return None
+
     async def search(self, query: str, limit: int = 5) -> list[KnowledgeDoc]:
         """Search the knowledge base using BM25 across query and content fields."""
         if not await self.client.indices.exists(index=self.index_name):
@@ -75,7 +88,9 @@ class KnowledgeDB:
         
         results = []
         for hit in response["hits"]["hits"]:
-            results.append(hit["_source"])
+            doc = cast(KnowledgeDoc, hit["_source"])
+            doc["id"] = hit["_id"]
+            results.append(doc)
             
         return results
 

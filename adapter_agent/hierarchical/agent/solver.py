@@ -19,7 +19,7 @@ from tinker_cookbook.rl.types import Trajectory
 from adapter_agent.data import QA
 from adapter_agent.hierarchical.agent.base import BaseAgent
 from adapter_agent.hierarchical.types import Task
-from adapter_agent.library.rust_doc_analyzer import RustDocAnalyzer
+from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
 from adapter_agent.library.rust_doc_tools import (
     WithRustDocAnalyzer,
     search_docs,
@@ -96,7 +96,7 @@ You are evaluated on your efficiency.
 
 @dataclass(kw_only=True)
 class Solver[T: AgentsSDKModel](BaseAgent[T]):
-    rust_doc_analyzer: RustDocAnalyzer
+    rust_doc_analyzer: AsyncRustDocAnalyzer
 
     async def try_solve(
         self,
