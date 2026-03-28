@@ -2,7 +2,7 @@ import tinker
 from tinker_cookbook.completers import StopCondition
 from tinker_cookbook.renderers import Renderer
 from tinker_cookbook.renderers.base import TextPart, ThinkingPart
-from tinker_cookbook.rl import types
+from tinker_cookbook.rl import ActionExtra, types
 from tinker_cookbook.tool_use import AgentToolMessageEnv
 
 
@@ -42,7 +42,9 @@ class PrefillableMessageEnv(types.Env):
             self._base_stop_condition,
         )
 
-    async def step(self, action: types.Action) -> types.StepResult:
+    async def step(
+        self, action: types.Action, *, extra: ActionExtra | None = None
+    ) -> types.StepResult:
         """Parse tokens to a message, delegate to MessageEnv, and render response."""
         assistant_message, parse_success = self.renderer.parse_response(action)
 
