@@ -7,11 +7,10 @@ from oai_utils import AgentsSDKModel
 from oai_utils.tinker import TinkerModel, setup_tinkermodel
 
 from adapter_agent.hierarchical.agent.analyzer import Analyzer
-from adapter_agent.hierarchical.agent.knowledge_slicer import KnowledgeSlicer
-from adapter_agent.hierarchical.agent.knowledge_summarizer import KnowledgeSummarizer
 from adapter_agent.hierarchical.agent.rewirer import log_trajectory
 from adapter_agent.hierarchical.process.rewire import ss_solve_verify
 from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
+from adapter_agent.library.knowledge_db import KnowledgeDB
 from adapter_agent.model_helper import get_gemini
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.rl.env.session_result import (
@@ -19,16 +18,14 @@ from adapter_agent.rl.env.session_result import (
     RewireSessionResultNormal,
 )
 from adapter_agent.rl.task_net import (
-    SlicingTask,
-    SlicingTaskCompleted,
     StudyTask,
     StudyTaskCompleted,
     TaskContext,
     TaskNetwork,
     TaskResultContext,
-    is_slice,
     is_study,
 )
+from adapter_agent.util.exception import AllTasksCompleted
 from scripts.uniray import load_gh_archive
 
 
@@ -38,45 +35,29 @@ class StudyActor:
     solver_model: TinkerModel
     verifier_model: AgentsSDKModel
     rust_doc_analyzer: AsyncRustDocAnalyzer
-    summarizer_model: AgentsSDKModel
+    knowledge_db: KnowledgeDB
     vis_path: Path
     json_path: Path
 
     async def run(self):
         while True:
-            async with TaskContext.next_task_from_network(self.task_network) as current:
-                if is_study(current):
-                    await self.study(current)
-                elif is_slice(current):
-                    await self.slice(current)
-
-    async def slice(
-        self, current: TaskResultContext[SlicingTask, SlicingTaskCompleted]
-    ):
-        slicer = KnowledgeSlicer(model=self.summarizer_model)
-        try:
-            qra = await slicer.slice(current.task.knowledge.knowledge)
-            current.register_result(current.task.complete(qra))
-            self.task_network.save_json(self.json_path)
-        except Exception as e:
-            print(f"Slicing failed: {e}")
-            current.register_result(current.task.complete(None))
-            self.task_network.save_json(self.json_path)
+            try:
+                async with TaskContext.next_task_from_network(
+                    self.task_network
+                ) as current:
+                    if is_study(current):
+                        await self.study(current)
+                    else:
+                        # SlicingTask is now disabled in TaskNetwork,
+                        # but we keep this as a no-op just in case.
+                        pass
+            except AllTasksCompleted:
+                print("All tasks completed. Worker exiting.")
+                break
 
     async def study(self, current: TaskResultContext[StudyTask, StudyTaskCompleted]):
-        knowledge_summarizer = KnowledgeSummarizer(model=self.summarizer_model)
-        self.task_network.save_json(self.json_path)
-
+        await self.task_network.save_json(self.json_path)
         task = current.task
-        knowledges_str = None
-        if task.knowledges:
-            print(
-                f"Summarizing {len(task.knowledges)} knowledges for task: {task.task.instruction}"
-            )
-            knowledges_str = await knowledge_summarizer.summarize(
-                task.knowledges, task_instruction=task.task.instruction
-            )
-            print(f"Summary generated: {knowledges_str}")
 
         ret = await ss_solve_verify(
             solver_model=self.solver_model,
@@ -89,7 +70,7 @@ class StudyActor:
                 type="docker",
                 image_uri="coder-mcp-numrs2:latest",
             ),
-            knowledges=knowledges_str,
+            knowledge_db=self.knowledge_db,
         )
 
         if isinstance(ret, RewireSessionResultNormal):
@@ -98,7 +79,7 @@ class StudyActor:
 
         if not task.is_generation or not isinstance(ret, RewireSessionResultFailure):
             current.register_result(task.complete(ret))
-            self.task_network.save_json(self.json_path)
+            await self.task_network.save_json(self.json_path)
             return
 
         try:
@@ -115,7 +96,7 @@ class StudyActor:
             # if verification_result.output_type == "valid":
             current.register_result(task.complete(ret, new_task=subtask))
 
-            self.task_network.save_json(self.json_path)
+            await self.task_network.save_json(self.json_path)
             print(f"TaskNetwork Visualized at {self.json_path}")
             return
         except Exception as e:
@@ -146,7 +127,15 @@ async def main():
         # path="tinker://3e320229-9d95-5b1a-b989-702de6f3fa88:train:0/sampler_weights/step_550",
     )
 
-    rust_doc_analyzer = RustDocAnalyzer.from_libdir(Path("repositories/numrs"))
+    rust_doc_analyzer = await AsyncRustDocAnalyzer.create_from_libdir(
+        Path("repositories/numrs")
+    )
+
+    # Initialize KnowledgeDB once
+    knowledge_db = KnowledgeDB()
+    await knowledge_db.initialize()
+    await knowledge_db.clear()
+    await knowledge_db.initialize()
 
     verifier_model = get_gemini()
     tasks = load_gh_archive()
@@ -156,7 +145,7 @@ async def main():
     vis_path = Path("data/graphviz/task_net.html")
     json_path = Path("graphvis/public/data.json")
     launch_interval = 5
-    num_workers = 10
+    num_workers = 20
 
     tasks = []
     for i in range(num_workers):
@@ -166,7 +155,7 @@ async def main():
             solver_model=model,
             verifier_model=verifier_model,
             rust_doc_analyzer=rust_doc_analyzer,
-            summarizer_model=verifier_model,
+            knowledge_db=knowledge_db,
             vis_path=vis_path,
             json_path=json_path,
         )

@@ -26,12 +26,12 @@ from ray.actor import ActorHandle
 from tinker import AdamParams
 
 from adapter_agent.hierarchical.agent.analyzer import Analyzer
-from adapter_agent.hierarchical.agent.knowledge_slicer import KnowledgeSlicer
-from adapter_agent.hierarchical.agent.knowledge_summarizer import KnowledgeSummarizer
 from adapter_agent.hierarchical.agent.task_verifier import TaskVerifier
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.gh import Library
 from adapter_agent.hierarchical.process.rewire import ss_solve_verify
+from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
+from adapter_agent.library.knowledge_db import KnowledgeDB
 from adapter_agent.hierarchical.process.rewire_session_single_turn import (
     solve_verify_tinker_single_turn,
 )
@@ -46,7 +46,6 @@ from adapter_agent.rl.env.single_turn import SingleTurnEnvState
 from adapter_agent.rl.shared_sampling_client import SharedSamplingClient
 from adapter_agent.rl.task_net import (
     TaskNetwork,
-    is_slice,
 )
 from adapter_agent.rl.unirl_state import (
     HybridReplayBuffer,
@@ -68,7 +67,8 @@ class StudyActor:
     process_id: int
     state: ActorHandle[UniRLState]
     verifier_model: AgentsSDKModel
-    rust_doc_analyzer: RustDocAnalyzer
+    rust_doc_analyzer: AsyncRustDocAnalyzer
+    knowledge_db: KnowledgeDB
     env_params: EnvParams
     num_workers: int
 
@@ -92,31 +92,14 @@ class StudyActor:
         logger.info(f"Study worker {worker_id} started.")
         initial_model: TinkerModel = await self.state.get_latest_model.remote()
         initial_model.register_tinkerllm_to_litellm()
-        knowledge_summarizer = KnowledgeSummarizer(model=get_gemini())
-        knowledge_slicer = KnowledgeSlicer(model=get_gemini())
 
         while True:
             latest_model = await self.state.get_latest_model.remote()
             task_manager = await task_manager_from_state_handle(self.state)
 
             async with task_manager as current:
-                if is_slice(current):
-                    try:
-                        qra = await knowledge_slicer.slice(
-                            current.task.knowledge.knowledge
-                        )
-                        current.register_result(current.task.complete(qra))
-                    except Exception as e:
-                        logger.error(f"Slicing failed: {e}")
-                        current.register_result(current.task.complete(None))
-                elif is_study(current):
+                if is_study(current):
                     task = current.task
-                    knowledges_str = None
-                    if task.knowledges:
-                        knowledges_str = await knowledge_summarizer.summarize(
-                            task.knowledges, task_instruction=task.task.instruction
-                        )
-
                     ret = await ss_solve_verify(
                         solver_model=latest_model,
                         verifier_model=self.verifier_model,
@@ -125,7 +108,7 @@ class StudyActor:
                         max_turns=self.env_params.max_turns,
                         qwen_no_think=self.env_params.qwen_no_think,
                         runtime_settings=self.env_params.runtime_settings,
-                        knowledges=knowledges_str,
+                        knowledge_db=self.knowledge_db,
                     )
 
                     if not task.is_generation or not isinstance(
@@ -413,7 +396,14 @@ async def main():
     study_queue = TaskNetwork(tasks[:30])
     practice_queue = TaskQueue.create(order="FIFO", maxsize=0)
 
-    rust_doc_analyzer = RustDocAnalyzer.from_libdir(cfg.env_params.library.local_path)
+    rust_doc_analyzer = await AsyncRustDocAnalyzer.create_from_libdir(cfg.env_params.library.local_path)
+
+    # Initialize KnowledgeDB
+    knowledge_db = KnowledgeDB()
+    await knowledge_db.initialize()
+    await knowledge_db.clear()
+    await knowledge_db.initialize()
+
     service_client = tinker.ServiceClient()
     model, tokenizer, renderer = setup_tinkermodel(
         cfg.model_loading_settings.model_name,
@@ -482,6 +472,7 @@ async def main():
                     state,
                     verifier_model,
                     rust_doc_analyzer,
+                    knowledge_db,
                     cfg.env_params,
                     cfg.study_rollout_params.rollouts_per_actor,
                 ),

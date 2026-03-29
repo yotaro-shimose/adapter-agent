@@ -4,7 +4,8 @@ from dataclasses import dataclass
 
 from agents import ModelSettings, RunConfig, StopAtTools
 from coder_mcp.runtime import Runtime
-from oai_utils.agent import AgentsSDKModel, AgentWrapper
+from litellm import InternalServerError
+from oai_utils.agent import AgentRunFailure, AgentsSDKModel, AgentWrapper
 from tinker_cookbook.renderers.base import Message as TinkerMessage
 
 from adapter_agent.hierarchical.agent.base import BaseAgent
@@ -15,6 +16,7 @@ from adapter_agent.hierarchical.agent.verifier import (
     report_failure,
     report_success,
 )
+from adapter_agent.rl.env.session_result import Knowledge
 from adapter_agent.util.parsing import extract_rust_code
 
 logger = logging.getLogger(__name__)
@@ -22,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(kw_only=True)
 class KnowledgeNormalizer[T: AgentsSDKModel](BaseAgent[T]):
-    async def normalize(self, trajectory: list[TinkerMessage]) -> str:
+    async def normalize(self, trajectory: list[TinkerMessage]) -> Knowledge:
         """
         Extracts "normalized knowledge" from an agent's trajectory log.
         This knowledge is a compact, necessary, and sufficient technical summary of the findings,
@@ -55,7 +57,8 @@ Your article must cover the following sections:
 
 ### Output Format
 1. Write your brief reasoning for the extraction.
-2. Output the finalized article inside `<knowledge>` XML tags.
+2. Output a concise, descriptive title for the knowledge base entry (5-10 words) inside `<title>` XML tags.
+3. Output the finalized technical article inside `<knowledge>` XML tags.
 """
         agent = AgentWrapper[str].create(
             name="KnowledgeNormalizer",
@@ -65,25 +68,39 @@ Your article must cover the following sections:
 
         transcript = format_trajectory_transcript(trajectory)
 
-        result = await agent.run(
-            f"""\
+        try:
+            result = await agent.run(
+                f"""\
 Extract normalized knowledge from the following trajectory:
 <Trajectory>
 {transcript}
 </Trajectory>
 """,
-            run_config=RunConfig(tracing_disabled=True),
-        )
+                run_config=RunConfig(tracing_disabled=True),
+            )
+        except AgentRunFailure as e:
+            msg = f"Knowledge extraction failed due to agent run failure: {e.cause}. Original error: {e}"
+            logger.error(msg)
+            return Knowledge(title="Extraction Failed", content=msg)
+        except InternalServerError as e:
+            msg = f"Knowledge extraction failed due to internal server error: {e}"
+            logger.error(msg)
+            return Knowledge(title="Extraction Failed", content=msg)
 
         response_text = result.final_output()
-        match = re.search(r"<knowledge>(.*?)</knowledge>", response_text, re.DOTALL)
-        if not match:
-            logger.warning(
-                "Could not find <knowledge> block in KnowledgeNormalizer response."
-            )
-            return response_text.strip()
+        title_match = re.search(r"<title>(.*?)</title>", response_text, re.DOTALL)
+        knowledge_match = re.search(
+            r"<knowledge>(.*?)</knowledge>", response_text, re.DOTALL
+        )
 
-        return match.group(1).strip()
+        title = title_match.group(1).strip() if title_match else "Untitled Knowledge"
+        content = (
+            knowledge_match.group(1).strip()
+            if knowledge_match
+            else response_text.strip()
+        )
+
+        return Knowledge(title=title, content=content)
 
 
 async def verify_normalized_knowledge(

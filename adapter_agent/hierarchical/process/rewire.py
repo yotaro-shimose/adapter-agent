@@ -1,8 +1,9 @@
 import logging
-from typing import cast
+from typing import Any, cast
 
 from coder_mcp.runtime import CoderMCPRuntimeError
 from oai_utils.tinker import TinkerModel
+from adapter_agent.rl.env.session_result import Knowledge
 from tinker_cookbook.renderers.base import Message as TinkerMessage
 from tinker_cookbook.rl.types import Trajectory, Transition
 
@@ -11,20 +12,23 @@ from adapter_agent.hierarchical.agent.knowledge_normalizer import (
     KnowledgeNormalizer,
     verify_normalized_knowledge,
 )
-from adapter_agent.hierarchical.agent.oc_rewriter import OCRewriter
-from adapter_agent.hierarchical.agent.verifier import Verifier
-from adapter_agent.rl.env.session_result import (
-    RewireSessionResult,
-    RewireSessionResultError,
-    RewireSessionResultFailure,
-    RewireSessionResultSuccess,
+from adapter_agent.hierarchical.agent.uniqueness_checker import (
+    KnowledgeUniquenessChecker,
 )
+from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
 from adapter_agent.library.knowledge_db import KnowledgeDB
 from adapter_agent.rl.completer import TinkerMessageCompleter
 from adapter_agent.rl.env.reward import LLMAsAJudge
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
+from adapter_agent.rl.env.session_result import (
+    Citation,
+    RewireSessionResult,
+    RewireSessionResultError,
+    RewireSessionResultFailure,
+    RewireSessionResultSuccess,
+)
 from adapter_agent.rl.env.simplified_solver import (
     SimplifiedSolverEnv,
     SimplifiedSolverEnvState,
@@ -114,15 +118,32 @@ async def ss_solve_verify(
                     final_ob=solver_model.renderer.build_generation_prompt(ob),
                 )
 
-                # Always attempt to extract normalized knowledge from the trials
-                logger.info("Extracting normalized knowledge from trajectory...")
-                normalizer = KnowledgeNormalizer(model=verifier_model)
-                normalized_knowledge = await normalizer.normalize(ob)
+                knowledge_obj: Knowledge | None = None
+
+                # Extract citations from the trials
+                citations = []
+                for turn_idx, msg in enumerate(ob):
+                    msg_dict = cast(dict[str, Any], msg)
+                    knowledge_id = msg_dict.get("knowledge_id")
+                    if knowledge_id:
+                        citations.append(
+                            Citation(
+                                knowledge_id=cast(str, knowledge_id),
+                                turn_index=turn_idx,
+                                content=msg_dict.get("knowledge_content"),
+                                title=msg_dict.get("knowledge_title"),
+                            )
+                        )
 
                 if LLMAsAJudge.is_successful_reward(step_result.reward):
+                    # Only attempt to extract normalized knowledge from successful trials
+                    logger.info("Extracting normalized knowledge from trajectory...")
+                    normalizer = KnowledgeNormalizer(model=verifier_model)
+                    knowledge_obj = await normalizer.normalize(ob)
+
                     verification_result = await verify_normalized_knowledge(
                         runtime=runtime,
-                        normalized_knowledge=normalized_knowledge,
+                        normalized_knowledge=knowledge_obj.content,
                         model=verifier_model,
                     )
 
@@ -136,35 +157,40 @@ async def ss_solve_verify(
                             conclusion="verification_failed",
                             trajectory=trajectory,
                             reasoning=verification_result.reasoning,
-                            knowledge=normalized_knowledge,
+                            knowledge=knowledge_obj,
                         )
 
-                    logger.info(
-                        "Problem solved, recording verified knowledge to KnowledgeDB"
+                    logger.info("Checking for knowledge uniqueness...")
+                    uniqueness_checker = KnowledgeUniquenessChecker(
+                        model=verifier_model
                     )
-                    await knowledge_db.add_knowledge(
-                        task.instruction, normalized_knowledge
+                    is_unique, uniqueness_reasoning = (
+                        await uniqueness_checker.check_uniqueness(
+                            new_knowledge=knowledge_obj.content,
+                            task=task,
+                            knowledge_db=knowledge_db,
+                        )
                     )
 
-                    # Perform OC Conversion
-                    logger.info(
-                        "Performing Open-to-Close (OC) Conversion on successful trajectory..."
-                    )
-                    try:
-                        oc_trials = await oc_convert_trajectory(
-                            ob, model=verifier_model, knowledge_db=knowledge_db
+                    if is_unique:
+                        logger.info(
+                            f"Knowledge is unique, recording to KnowledgeDB. Reasoning: {uniqueness_reasoning}"
                         )
-                    except Exception as e:
-                        logger.error(f"Failed OC Conversion: {e}")
-                        oc_trials = None
+                        await knowledge_db.add_knowledge(
+                            task.instruction, knowledge_obj.title, knowledge_obj.content
+                        )
+                    else:
+                        logger.info(
+                            f"Skipping redundant knowledge. Reasoning: {uniqueness_reasoning}"
+                        )
 
                     return RewireSessionResultSuccess(
                         task=task,
                         trials=ob,
-                        oc_trials=oc_trials,
-                        knowledge=normalized_knowledge,
+                        knowledge=knowledge_obj,
                         trajectory=trajectory,
                         reasoning=verification_result.reasoning,
+                        citations=citations,
                     )
                 else:
                     return RewireSessionResultFailure(
@@ -172,7 +198,8 @@ async def ss_solve_verify(
                         trials=ob,
                         conclusion=step_result.conclusion,
                         trajectory=trajectory,
-                        knowledge=normalized_knowledge,
+                        knowledge=knowledge_obj,
+                        citations=citations,
                     )
     except (CodingEnvironmentError, CoderMCPRuntimeError) as e:
         logger.error(f"Environment error: {e}")
@@ -180,56 +207,3 @@ async def ss_solve_verify(
             task=task,
             conclusion="environment_error",
         )
-
-
-async def oc_convert_trajectory(
-    messages: list[TinkerMessage],
-    model: AgentsSDKModel,
-    knowledge_db: KnowledgeDB,
-) -> list[TinkerMessage]:
-    """
-    Scans a trajectory for knowledge retrieval turns and rewrites them using OCRewriter.
-    This effectively converts an "Open Book" (search-based) trajectory into a
-    "Closed Book" (recall-based) trajectory for SFT.
-    """
-    rewriter = OCRewriter(model=model)
-    new_trajectory = list(messages)
-
-    # 1. Identify roles and citation turns
-    # We find tool results that have a knowledge_id.
-    # The citation_turn_idx is the index of the assistant turn that called that tool (generally i-1).
-    retrieval_indices = []
-    for i, msg in enumerate(messages):
-        # A TinkerMessage is a dict, and we added knowledge_id in SimplifiedSolverEnv.step (via ToolResult)
-        if msg.get("role") == "tool" and msg.get("knowledge_id"):
-            # O_i is msg, so A_i is i-1
-            # We assume the turn before the tool result is the one that triggered the search.
-            retrieval_indices.append(i - 1)
-
-    # 2. Rewrite each identified triplet (Ai, Oi, Ai+1)
-    # We iterate BACKWARDS to keep citation indices stable since we are shrinking the list
-    # (replacing 3 messages with 1).
-    for citation_turn_idx in sorted(retrieval_indices, reverse=True):
-        # Get the knowledge_id from Oi
-        Oi = new_trajectory[citation_turn_idx + 1]
-        knowledge_id = cast(str, Oi.get("knowledge_id"))
-
-        # Retrieve the actual knowledge content from DB
-        knowledge_doc = await knowledge_db.get_knowledge_by_id(knowledge_id)
-        if not knowledge_doc:
-            logger.warning(
-                f"Knowledge content not found for ID: {knowledge_id}. Skipping rewrite."
-            )
-            continue
-
-        knowledge_content = knowledge_doc["content"]
-
-        # Perform the rewrite which merges [Ai, Oi, Ai+1] into [Ai']
-        new_trajectory = await rewriter.rewrite_trajectory(
-            trajectory=new_trajectory,
-            knowledge_id=knowledge_id,
-            knowledge_content=knowledge_content,
-            citation_turn_idx=citation_turn_idx,
-        )
-
-    return new_trajectory

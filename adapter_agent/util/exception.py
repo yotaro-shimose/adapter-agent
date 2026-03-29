@@ -4,3 +4,7 @@ class MaximumContextExceeded(Exception):
 
 class CodingEnvironmentError(Exception):
     pass
+
+
+class AllTasksCompleted(Exception):
+    pass

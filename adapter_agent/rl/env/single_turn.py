@@ -161,7 +161,7 @@ class SingleTurnEnv(Env):
                 conclusion="code_did_not_compile",
             )
         try:
-            reward, reward_metrics = await self.reward_fn(self.history)
+            reward, reward_metrics, final_obs = await self.reward_fn(self.history)
         except Exception as e:
             raise CodingEnvironmentError(
                 f"Environment error during single turn reward calculation: {e}"

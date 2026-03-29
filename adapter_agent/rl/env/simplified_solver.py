@@ -202,7 +202,9 @@ class SimplifiedSolverEnv(MessageEnv):
                 code = submit_match.group(1).strip()
                 await self.rust_env.set_content("src/main.rs", code)
 
-                reward, conclusion = await self.reward_fn(self.history)
+                reward, conclusion, final_obs = await self.reward_fn(self.history)
+                new_message = TinkerMessage(role="user", content=final_obs)
+                self.history.append(new_message)
 
                 return SSStepResult(
                     reward=reward,
@@ -382,7 +384,9 @@ async def build_simplified_solver_env(
     exclude = ["target", ".git"]
     tree_structure = await runtime.tree(".", exclude=exclude, truncate=20)
 
-    mutable_state = SimplifiedSolverMutableState(remaining_turns=max_turns)
+    mutable_state = SimplifiedSolverMutableState(
+        remaining_turns=max_turns, total_turns=max_turns
+    )
     tools_list = [
         SearchTool(search_model, rust_doc_analyzer, knowledge_db, mutable_state),
     ]

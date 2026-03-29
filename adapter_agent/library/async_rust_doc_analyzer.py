@@ -600,5 +600,13 @@ class AsyncRustDocAnalyzer:
         print_node(self.data.root, is_root=True)
         return "\n".join(lines)
 
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
+
     async def close(self):
-        await self.es_client.close()
+        if self.es_client:
+            await self.es_client.close()
+            self.es_client = None # type: ignore

@@ -11,22 +11,30 @@ interface GraphNodeMetadata {
   is_executing: boolean;
   slice_count: number;
   gen_count: number;
+  citations: { knowledge_id: string, turn_index: number, content?: string | null, title?: string | null }[];
   slices: { question: string, answer: string, reasoning: string }[];
+  knowledge_content?: string | null;
+  knowledge_title?: string | null;
 }
 
 interface CustomNode extends NodeObject {
+  id: string;
   metadata: GraphNodeMetadata;
   color: string;
+  type: 'task' | 'knowledge';
+  label: string;
 }
 
 interface CustomLink extends LinkObject {
   source: string | CustomNode;
   target: string | CustomNode;
+  type: 'decomposition' | 'citation' | 'generation';
 }
 
 interface GraphExportNode {
   id: string;
   label: string;
+  type?: string;
   metadata: GraphNodeMetadata;
 }
 
@@ -36,6 +44,38 @@ interface GraphExportEdge {
   target: string;
 }
 
+interface ContentPart {
+  type: string;
+  text?: string;
+  thinking?: string;
+}
+
+interface TrajectoryTurn {
+  role: 'assistant' | 'user' | 'tool' | 'system';
+  content: string | ContentPart[];
+  tool_calls?: any[];
+  unparsed_tool_calls?: any[];
+  metadata?: {
+    thought?: string;
+    tool_calls?: any[];
+    is_error?: boolean;
+    knowledge_id?: string;
+  };
+}
+
+interface TrajectoryData {
+  id: number;
+  taskId: string;
+  instruction: string;
+  conclusion: string;
+  reward: number;
+  trials: TrajectoryTurn[];
+  citations: { knowledge_id: string, content: string, turn_index: number }[];
+  final_knowledge?: string | null;
+  final_knowledge_title?: string | null;
+  created_at: string;
+}
+
 interface GraphExportData {
   nodes: GraphExportNode[];
   edges: GraphExportEdge[];
@@ -43,73 +83,375 @@ interface GraphExportData {
 
 export const GraphCanvasComponent: React.FC = () => {
   const [data, setData] = useState<{ nodes: CustomNode[], links: CustomLink[] } | null>(null);
+  const [displayData, setDisplayData] = useState<{ nodes: CustomNode[], links: CustomLink[] } | null>(null);
+  const [viewMode, setViewMode] = useState<'global' | 'local'>('global');
+  const [focusNodeId, setFocusNodeId] = useState<string | null>(null);
+  const [focusDepth, setFocusDepth] = useState<number>(2);
+
+  const [showKnowledge, setShowKnowledge] = useState<boolean>(true);
   const [selectedNode, setSelectedNode] = useState<CustomNode | null>(null);
+  const [trajectories, setTrajectories] = useState<TrajectoryData[]>([]);
+  const [selectedAttemptIndex, setSelectedAttemptIndex] = useState<number>(0);
+  const [loadingTraj, setLoadingTraj] = useState<boolean>(false);
   const fgRef = useRef<ForceGraphMethods | undefined>(undefined);
+  
+  const handleNodeSelect = useCallback((node: CustomNode) => {
+    setSelectedNode(node);
+    setTrajectories([]);
+    setSelectedAttemptIndex(0);
+    if (fgRef.current && node.x !== undefined && node.y !== undefined) {
+      fgRef.current.centerAt(node.x, node.y, 600);
+      fgRef.current.zoom(2.5, 600);
+    }
+  }, []);
 
   const loadData = useCallback(async () => {
     try {
-      const response = await fetch('/data.json');
+      // Prefer the API server if available, fallback to static file
+      let response;
+      try {
+        response = await fetch('http://localhost:8000/api/graph');
+      } catch (e) {
+        console.warn("API server not reachable, falling back to static data.json");
+        response = await fetch('/data.json');
+      }
+      
       const json: GraphExportData = await response.json();
 
-      const nodes: CustomNode[] = json.nodes.map(n => ({
+      const taskNodes: CustomNode[] = json.nodes.map(n => ({
         id: n.id,
+        label: n.id,
         name: n.metadata.instruction,
         val: 5,
-        metadata: n.metadata,
-        color: n.metadata.is_solved ? '#28a745' : n.metadata.is_executing ? '#f1c40f' : '#555'
+        metadata: {
+          ...n.metadata,
+          citations: n.metadata.citations || []
+        },
+        color: n.id === 'pseudo_root' ? '#e67e22' : (n.type === 'knowledge' ? '#9b59b6' : (n.metadata.is_solved ? '#28a745' : n.metadata.is_executing ? '#f1c40f' : '#555')),
+        type: (n.type as any) || 'task'
       }));
 
-      const links: CustomLink[] = json.edges.map(e => ({
+      const knowledge_ids = new Set<string>();
+      taskNodes.forEach(tn => {
+        tn.metadata.citations.forEach(c => knowledge_ids.add(c.knowledge_id));
+      });
+
+      const taskNodeMap = new Map<string, CustomNode>();
+      taskNodes.forEach(n => taskNodeMap.set(n.id, n));
+
+      const knowledgeNodes: CustomNode[] = Array.from(knowledge_ids).map(kid => {
+        const sourceTask = taskNodeMap.get(kid);
+        
+        // Find any citation that has the content for this knowledge ID
+        let capturedContent: string | null = null;
+        let capturedTitle: string | null = null;
+        json.nodes.forEach(n => {
+          n.metadata.citations.forEach(c => {
+            if (c.knowledge_id === kid) {
+              if (c.content) capturedContent = c.content;
+              if (c.title) capturedTitle = c.title;
+            }
+          });
+        });
+
+        const knowledge_title = sourceTask?.metadata.knowledge_title || capturedTitle || `Knowledge ${kid}`;
+
+        return {
+          id: kid,
+          label: kid,
+          name: knowledge_title,
+          val: 10,
+          metadata: {
+            instruction: `Knowledge ID: ${kid}`,
+            success_count: 0,
+            total_count: 0,
+            is_solved: true,
+            is_executing: false,
+            slice_count: 0,
+            gen_count: 0,
+            citations: [],
+            slices: [],
+            knowledge_content: sourceTask?.metadata.knowledge_content || capturedContent,
+            knowledge_title: knowledge_title
+          },
+          color: '#9b59b6', // Purple
+          type: 'knowledge'
+        };
+      });
+
+      const decompositionLinks: CustomLink[] = json.edges.map(e => ({
+        id: e.id,
         source: e.source,
-        target: e.target
+        target: e.target,
+        type: 'decomposition'
       }));
 
-      setData({ nodes, links });
+      const citationLinks: CustomLink[] = [];
+      taskNodes.forEach(tn => {
+        tn.metadata.citations.forEach(c => {
+          const isGeneration = tn.id === c.knowledge_id;
+          citationLinks.push({
+            id: `cit-${tn.id}-${c.knowledge_id}-${c.turn_index}`,
+            source: tn.id,
+            target: c.knowledge_id,
+            type: isGeneration ? 'generation' : 'citation'
+          });
+        });
+      });
+
+      setData({ 
+        nodes: [...taskNodes, ...knowledgeNodes], 
+        links: [...decompositionLinks, ...citationLinks] 
+      });
     } catch (error) {
       console.error('Failed to load graph data:', error);
     }
   }, []);
 
   useEffect(() => {
+    if (fgRef.current) {
+      // Increase link distance to spread nodes more
+      const linkForce = fgRef.current.d3Force('link');
+      if (linkForce) (linkForce as any).distance(60);
+      
+      // Increase repulsion (charge)
+      const chargeForce = fgRef.current.d3Force('charge');
+      if (chargeForce) (chargeForce as any).strength(-120);
+    }
+  }, [fgRef.current, data]);
+
+  useEffect(() => {
     loadData();
   }, [loadData]);
 
-  // Configure forces when engine starts
   useEffect(() => {
-    if (fgRef.current) {
-      fgRef.current.d3Force('charge')?.strength(-300);
-      fgRef.current.d3Force('link')?.distance(100);
-      fgRef.current.d3Force('center')?.strength(0.1);
+    if (!data) return;
+
+    let neighborhood: Set<string>;
+    if (viewMode === 'global' || !focusNodeId) {
+      // In global mode, start with all node IDs
+      neighborhood = new Set(data.nodes.map(n => n.id));
+    } else {
+      // In local mode, BFS to find neighborhood
+      neighborhood = new Set<string>();
+      neighborhood.add(focusNodeId);
+
+      let currentLevel = [focusNodeId];
+      for (let i = 0; i < focusDepth; i++) {
+        const nextLevel: string[] = [];
+        data.links.forEach(link => {
+          const sourceId = typeof link.source === 'string' ? link.source : (link.source as any).id;
+          const targetId = typeof link.target === 'string' ? link.target : (link.target as any).id;
+
+          if (currentLevel.includes(sourceId) && !neighborhood.has(targetId)) {
+            neighborhood.add(targetId);
+            nextLevel.push(targetId);
+          } else if (currentLevel.includes(targetId) && !neighborhood.has(sourceId)) {
+            neighborhood.add(sourceId);
+            nextLevel.push(sourceId);
+          }
+        });
+        currentLevel = nextLevel;
+      }
     }
-  }, [data]);
+
+    let filteredNodes = data.nodes.filter(n => neighborhood.has(n.id));
+    
+    // Hide knowledge nodes if requested
+    if (!showKnowledge) {
+      filteredNodes = filteredNodes.filter(n => n.type !== 'knowledge');
+    }
+
+    const filteredLinks = data.links.filter(l => {
+      const sId = typeof l.source === 'string' ? l.source : (l.source as any).id;
+      const tId = typeof l.target === 'string' ? l.target : (l.target as any).id;
+      return neighborhood.has(sId) && neighborhood.has(tId) && filteredNodes.find(n => n.id === sId) && filteredNodes.find(n => n.id === tId);
+    });
+
+    setDisplayData({ nodes: filteredNodes, links: filteredLinks });
+  }, [data, viewMode, focusNodeId, focusDepth, showKnowledge]);
+
+  useEffect(() => {
+    if (selectedNode && selectedNode.type === 'task') {
+      setLoadingTraj(true);
+      fetch(`http://localhost:8000/api/trajectory/${selectedNode.id}`)
+        .then(res => res.json())
+        .then(data => {
+          // data is now an array of trajectories
+          setTrajectories(Array.isArray(data) ? data : []);
+          setSelectedAttemptIndex((data && data.length > 0) ? data.length - 1 : 0); // Default to latest
+          setLoadingTraj(false);
+        })
+        .catch(err => {
+          console.error("Failed to fetch trajectory:", err);
+          setLoadingTraj(false);
+          setTrajectories([]);
+        });
+    } else {
+      setTrajectories([]);
+    }
+  }, [selectedNode]);
 
   if (!data) {
     return <div style={{ color: 'white', padding: '20px' }}>Loading graph data...</div>;
   }
 
+  const renderTrajectory = () => {
+    if (loadingTraj) return <div style={{ color: '#888', fontStyle: 'italic', padding: '20px' }}>Loading trajectory...</div>;
+    if (!trajectories || trajectories.length === 0) return null;
+
+    const trajectory = trajectories[selectedAttemptIndex];
+    if (!trajectory || !trajectory.trials) return null;
+
+    return (
+      <div style={{ marginTop: '30px', borderTop: '1px solid #333', paddingTop: '20px' }}>
+        {/* Attempt Selector */}
+        <div style={{ marginBottom: '20px' }}>
+          <div style={{ fontSize: '11px', color: '#888', textTransform: 'uppercase', marginBottom: '8px', fontWeight: 'bold' }}>
+            Attempts ({trajectories.length})
+          </div>
+          <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+            {trajectories.map((t, idx) => (
+              <button
+                key={t.id}
+                onClick={() => setSelectedAttemptIndex(idx)}
+                style={{
+                  padding: '6px 12px',
+                  borderRadius: '6px',
+                  fontSize: '12px',
+                  background: selectedAttemptIndex === idx ? 'rgba(97, 218, 251, 0.2)' : 'rgba(255,255,255,0.05)',
+                  color: selectedAttemptIndex === idx ? '#61dafb' : '#ccc',
+                  border: `1px solid ${selectedAttemptIndex === idx ? '#61dafb' : '#444'}`,
+                  cursor: 'pointer',
+                  transition: 'all 0.2s'
+                }}
+              >
+                #{idx + 1} {t.reward > 0 ? '✅' : '❌'} ({new Date(t.created_at).toLocaleTimeString()})
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div style={{ fontSize: '11px', color: '#888', textTransform: 'uppercase', marginBottom: '15px', fontWeight: 'bold' }}>
+          Reasoning Trace ({trajectory.trials.length} turns)
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+          {trajectory.trials.map((turn, i) => {
+            const contentStr = typeof turn.content === 'string' 
+              ? turn.content 
+              : Array.isArray(turn.content) 
+                ? turn.content.map((p: any) => 
+                    p.type === 'thinking' ? `<think>${p.thinking}</think>` : (p.text || '')
+                  ).join('')
+                : String(turn.content || '');
+
+            const isThought = turn.role === 'assistant' && contentStr.includes('<think>');
+            const thoughtMatch = contentStr.match(/<think>([\s\S]*?)<\/think>/);
+            const restContent = contentStr.replace(/<think>[\s\S]*?<\/think>/, '').trim();
+
+            return (
+              <div key={i} style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                {isThought && thoughtMatch && (
+                  <div style={{ 
+                    background: 'rgba(97, 218, 251, 0.05)', 
+                    borderLeft: '2px solid #61dafb', 
+                    padding: '12px', 
+                    fontSize: '13px', 
+                    color: '#a0e4f1', 
+                    fontStyle: 'italic',
+                    borderRadius: '0 8px 8px 0',
+                    textAlign: 'left'
+                  }}>
+                    <div style={{ fontSize: '10px', opacity: 0.6, marginBottom: '4px', textTransform: 'uppercase' }}>Thought</div>
+                    <ReactMarkdown>{thoughtMatch[1].trim()}</ReactMarkdown>
+                  </div>
+                )}
+                {(turn.role === 'assistant' && (restContent || (turn.tool_calls && turn.tool_calls.length > 0) || (turn.unparsed_tool_calls && turn.unparsed_tool_calls.length > 0))) && (
+                  <div style={{ background: 'rgba(255,255,255,0.03)', padding: '12px', borderRadius: '8px', border: '1px solid #333', textAlign: 'left' }}>
+                    <div style={{ fontSize: '10px', opacity: 0.6, marginBottom: '4px', textTransform: 'uppercase' }}>Assistant</div>
+                    {restContent && <ReactMarkdown>{restContent}</ReactMarkdown>}
+                    
+                    {turn.tool_calls && turn.tool_calls.length > 0 && (
+                      <div style={{ marginTop: restContent ? '12px' : '0', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                        {turn.tool_calls.map((tc, idx) => (
+                          <div key={idx} style={{ background: 'rgba(97, 218, 251, 0.1)', padding: '8px', borderRadius: '6px', border: '1px solid rgba(97, 218, 251, 0.2)' }}>
+                            <div style={{ fontSize: '10px', color: '#61dafb', fontWeight: 'bold', marginBottom: '4px' }}>🛠 CALL: {tc.function?.name}</div>
+                            <pre style={{ fontSize: '11px', margin: 0, whiteSpace: 'pre-wrap', color: '#ddd' }}>{typeof tc.function?.arguments === 'string' ? tc.function.arguments : JSON.stringify(tc.function?.arguments, null, 2)}</pre>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    {turn.unparsed_tool_calls && turn.unparsed_tool_calls.length > 0 && (
+                      <div style={{ marginTop: (restContent || (turn.tool_calls && turn.tool_calls.length > 0)) ? '12px' : '0', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                        {turn.unparsed_tool_calls.map((utc, idx) => (
+                          <div key={idx} style={{ background: 'rgba(231, 76, 60, 0.1)', padding: '8px', borderRadius: '6px', border: '1px solid rgba(231, 76, 60, 0.2)' }}>
+                            <div style={{ fontSize: '10px', color: '#e74c3c', fontWeight: 'bold', marginBottom: '4px' }}>⚠️ UNPARSED CALL</div>
+                            <pre style={{ fontSize: '11px', margin: 0, whiteSpace: 'pre-wrap', color: '#ddd' }}>{utc.arguments || JSON.stringify(utc)}</pre>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+                {turn.role === 'tool' && (() => {
+                  const cit = trajectory.citations.find(c => c.turn_index === i);
+                  return (
+                    <div style={{ background: 'rgba(40, 167, 69, 0.05)', borderLeft: '2px solid #28a745', padding: '12px', borderRadius: '0 8px 8px 0', textAlign: 'left' }}>
+                      <div style={{ fontSize: '10px', opacity: 0.6, marginBottom: '4px', textTransform: 'uppercase', color: '#28a745' }}>
+                        {cit ? `Knowledge Acquired (#${cit.knowledge_id})` : 'Tool Result'}
+                      </div>
+                      {cit ? (
+                        <div style={{ fontSize: '13px', color: '#eee' }}>
+                          <ReactMarkdown>{cit.content}</ReactMarkdown>
+                        </div>
+                      ) : (
+                        <pre style={{ fontSize: '12px', whiteSpace: 'pre-wrap', color: '#ccc', margin: 0, overflowX: 'auto' }}>{contentStr}</pre>
+                      )}
+                    </div>
+                  );
+                })()}
+                {(turn.role === 'user' || turn.role === 'system') && (
+                  <div style={{ background: 'rgba(255,255,255,0.05)', padding: '12px', borderRadius: '8px', border: '1px solid #444', textAlign: 'left' }}>
+                    <div style={{ fontSize: '10px', opacity: 0.6, marginBottom: '4px', textTransform: 'uppercase' }}>{turn.role === 'system' ? 'System' : 'User'}</div>
+                    <ReactMarkdown>{contentStr}</ReactMarkdown>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  };
+
   const renderDetailPanel = () => {
     if (!selectedNode) return null;
     const m = selectedNode.metadata;
-    
+    const isKnowledge = selectedNode.type === 'knowledge';
+
     return (
-      <div style={{
-        position: 'fixed',
-        top: '80px',
-        right: '25px',
-        width: '500px',
-        maxHeight: 'calc(100vh - 120px)',
-        background: 'rgba(20, 20, 20, 0.95)',
-        color: 'white',
-        padding: '24px',
-        borderRadius: '16px',
-        border: '1px solid #444',
-        boxShadow: '0 20px 50px rgba(0,0,0,0.7)',
-        zIndex: 3000,
-        overflowY: 'auto',
-        fontFamily: 'system-ui, -apple-system, sans-serif',
-        backdropFilter: 'blur(15px)',
-        transition: 'all 0.3s ease',
-      }} className="detail-scroll">
+      <div
+        style={{
+          position: 'fixed',
+          top: '80px',
+          right: '25px',
+          width: '500px',
+          maxHeight: 'calc(100vh - 120px)',
+          background: 'rgba(20, 20, 20, 0.95)',
+          color: 'white',
+          padding: '24px',
+          borderRadius: '16px',
+          border: '1px solid #444',
+          boxShadow: '0 20px 50px rgba(0,0,0,0.7)',
+          zIndex: 3000,
+          overflowY: 'auto',
+          fontFamily: 'system-ui, -apple-system, sans-serif',
+          backdropFilter: 'blur(15px)',
+          transition: 'all 0.3s ease',
+        }}
+        className="detail-scroll"
+      >
         <style>
           {`
             .detail-scroll::-webkit-scrollbar { width: 6px; }
@@ -125,25 +467,45 @@ export const GraphCanvasComponent: React.FC = () => {
             .markdown-content ul, .markdown-content ol { padding-left: 20px; margin: 8px 0; }
           `}
         </style>
-        
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px', borderBottom: '1px solid #333', paddingBottom: '12px' }}>
-          <div>
-            <div style={{ fontWeight: 'bold', color: '#61dafb', fontSize: '20px', letterSpacing: '0.5px' }}>Task Analysis</div>
+
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px', borderBottom: '1px solid #333', paddingBottom: '12px', gap: '10px' }}>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 'bold', color: '#61dafb', fontSize: '20px', letterSpacing: '0.5px' }}>
+              {isKnowledge ? 'Verified Knowledge' : 'Task Analysis'}
+            </div>
           </div>
-          <button 
+          <button
+            onClick={() => {
+              setFocusNodeId(selectedNode.id);
+              setViewMode('local');
+            }}
+            style={{
+              padding: '6px 12px',
+              background: 'rgba(97, 218, 251, 0.2)',
+              color: '#61dafb',
+              border: '1px solid #61dafb',
+              borderRadius: '6px',
+              fontSize: '12px',
+              cursor: 'pointer',
+              fontWeight: 'bold'
+            }}
+          >
+            Focus
+          </button>
+          <button
             onClick={() => setSelectedNode(null)}
-            style={{ 
-              background: 'rgba(255,255,255,0.1)', 
-              border: 'none', 
-              color: 'white', 
-              cursor: 'pointer', 
-              width: '32px', 
-              height: '32px', 
+            style={{
+              background: 'rgba(255,255,255,0.1)',
+              border: 'none',
+              color: 'white',
+              cursor: 'pointer',
+              width: '32px',
+              height: '32px',
               borderRadius: '50%',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
-              fontSize: '18px'
+              fontSize: '18px',
             }}
           >
             ×
@@ -151,32 +513,105 @@ export const GraphCanvasComponent: React.FC = () => {
         </div>
 
         <div className="markdown-content" style={{ fontSize: '15px', lineHeight: '1.6', marginBottom: '24px', color: '#fff', background: 'rgba(97, 218, 251, 0.1)', padding: '16px', borderRadius: '12px', border: '1px solid rgba(97, 218, 251, 0.2)' }}>
-          <ReactMarkdown>{m.instruction}</ReactMarkdown>
+          {isKnowledge && m.knowledge_title && (
+            <div style={{ fontWeight: 'bold', fontSize: '18px', marginBottom: '10px', color: '#61dafb', borderBottom: '1px solid rgba(97, 218, 251, 0.3)', paddingBottom: '8px' }}>
+              {m.knowledge_title}
+            </div>
+          )}
+          <ReactMarkdown>{isKnowledge && m.knowledge_content ? m.knowledge_content : m.instruction}</ReactMarkdown>
         </div>
 
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '15px', marginBottom: '25px' }}>
-          <div style={{ background: 'rgba(40, 167, 69, 0.15)', padding: '12px', borderRadius: '10px', borderLeft: '4px solid #28a745' }}>
-            <div style={{ fontSize: '11px', color: '#aaa', textTransform: 'uppercase', fontWeight: 'bold' }}>Success Rate</div>
-            <div style={{ fontSize: '20px', fontWeight: 'bold', color: '#28a745', marginTop: '4px' }}>{m.success_count}/{m.total_count}</div>
+        {!isKnowledge && (
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '15px', marginBottom: '25px' }}>
+            <div style={{ background: 'rgba(40, 167, 69, 0.15)', padding: '12px', borderRadius: '10px', borderLeft: '4px solid #28a745' }}>
+              <div style={{ fontSize: '11px', color: '#aaa', textTransform: 'uppercase', fontWeight: 'bold' }}>Success Rate</div>
+              <div style={{ fontSize: '20px', fontWeight: 'bold', color: '#28a745', marginTop: '4px' }}>{m.success_count}/{m.total_count}</div>
+            </div>
+            <div style={{ background: 'rgba(241, 196, 15, 0.15)', padding: '12px', borderRadius: '10px', borderLeft: '4px solid #f1c40f' }}>
+              <div style={{ fontSize: '11px', color: '#aaa', textTransform: 'uppercase', fontWeight: 'bold' }}>Status</div>
+              <div style={{ fontSize: '16px', fontWeight: 'bold', color: '#f1c40f', marginTop: '4px' }}>{m.is_solved ? '✅ Solved' : m.is_executing ? '⚡ Active' : '⏳ Queued'}</div>
+            </div>
           </div>
-          <div style={{ background: 'rgba(241, 196, 15, 0.15)', padding: '12px', borderRadius: '10px', borderLeft: '4px solid #f1c40f' }}>
-            <div style={{ fontSize: '11px', color: '#aaa', textTransform: 'uppercase', fontWeight: 'bold' }}>Status</div>
-            <div style={{ fontSize: '16px', fontWeight: 'bold', color: '#f1c40f', marginTop: '4px' }}>{m.is_solved ? '✅ Solved' : m.is_executing ? '⚡ Active' : '⏳ Queued'}</div>
-          </div>
-        </div>
+        )}
 
-        <div style={{ marginBottom: '24px', background: 'rgba(255,255,255,0.03)', padding: '15px', borderRadius: '10px' }}>
-          <div style={{ fontSize: '11px', color: '#888', textTransform: 'uppercase', marginBottom: '10px', fontWeight: 'bold' }}>Simulation Stats</div>
-          <div style={{ display: 'flex', gap: '20px', fontSize: '14px' }}>
-            <div><span style={{ color: '#888' }}>Tree:</span> <span style={{ color: '#fff' }}>{m.gen_count} nodes</span></div>
-            <div><span style={{ color: '#888' }}>Slices:</span> <span style={{ color: '#fff' }}>{m.slice_count}</span></div>
+        {renderTrajectory()}
+
+        {(() => {
+          const trajectory = trajectories[selectedAttemptIndex];
+          if (!trajectory || !trajectory.citations || trajectory.citations.length === 0) return null;
+
+          // Deduplicate by knowledge_id
+          const uniqueCitations = Array.from(
+            new Map(trajectory.citations.map(c => [c.knowledge_id, c])).values()
+          );
+
+          return (
+            <div style={{ marginBottom: '24px' }}>
+              <div style={{ fontSize: '11px', color: '#888', textTransform: 'uppercase', marginBottom: '12px', fontWeight: 'bold' }}>
+                Used Knowledge in this attempt ({uniqueCitations.length})
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+                {uniqueCitations.map((c, i) => (
+                  <div key={i} style={{
+                    background: 'rgba(155, 89, 182, 0.2)',
+                    border: '1px solid rgba(155, 89, 182, 0.4)',
+                    padding: '6px 12px',
+                    borderRadius: '16px',
+                    fontSize: '12px',
+                  }}>
+                    <span style={{ color: '#9b59b6', fontWeight: 'bold' }}>#{c.turn_index}</span>: {c.knowledge_id}
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        })()}
+
+        {isKnowledge && data && (
+          <div style={{ marginBottom: '24px' }}>
+            <div style={{ fontSize: '11px', color: '#888', textTransform: 'uppercase', marginBottom: '12px', fontWeight: 'bold' }}>
+              Impacted Tasks
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              {data.links
+                .filter(l => (typeof l.target === 'string' ? l.target : (l.target as any).id) === selectedNode.id)
+                .map((l, i) => {
+                  const sourceId = typeof l.source === 'string' ? l.source : (l.source as any).id;
+                  const sourceNode = data.nodes.find(n => n.id === sourceId);
+                  return (
+                    <div 
+                      key={i} 
+                      onClick={() => sourceNode && handleNodeSelect(sourceNode)}
+                      style={{
+                        background: 'rgba(255, 255, 255, 0.05)',
+                        padding: '10px',
+                        borderRadius: '8px',
+                        fontSize: '13px',
+                        borderLeft: '3px solid #61dafb',
+                        display: '-webkit-box',
+                        WebkitLineClamp: 2,
+                        WebkitBoxOrient: 'vertical',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        lineHeight: '1.4',
+                        cursor: sourceNode ? 'pointer' : 'default',
+                        transition: 'background 0.2s'
+                      }}
+                      onMouseOver={(e) => sourceNode && (e.currentTarget.style.background = 'rgba(255,255,255,0.1)')}
+                      onMouseOut={(e) => sourceNode && (e.currentTarget.style.background = 'rgba(255,255,255,0.05)')}
+                    >
+                      {sourceNode?.name || sourceId}
+                    </div>
+                  );
+                })}
+            </div>
           </div>
-        </div>
+        )}
 
         {m.slices.length > 0 && (
           <div>
             <div style={{ fontSize: '11px', color: '#888', textTransform: 'uppercase', marginBottom: '12px', fontWeight: 'bold' }}>
-              Knowledge Slices (${m.slices.length})
+              Knowledge Slices ({m.slices.length})
             </div>
             <div className="detail-scroll" style={{ maxHeight: '400px', overflowY: 'auto', paddingRight: '12px' }}>
               {m.slices.map((s, i) => (
@@ -185,7 +620,7 @@ export const GraphCanvasComponent: React.FC = () => {
                     <span style={{ color: '#61dafb', fontWeight: 'bold', marginRight: '8px' }}>Question:</span> {s.question}
                   </div>
                   <div className="markdown-content" style={{ fontSize: '13px', color: '#bbb', marginBottom: '8px', lineHeight: '1.4' }}>
-                    <span style={{ color: '#f1c40f', fontWeight: '600', marginRight: '8px' }}>Think:</span> 
+                    <span style={{ color: '#f1c40f', fontWeight: '600', marginRight: '8px' }}>Think:</span>
                     <ReactMarkdown>{s.reasoning}</ReactMarkdown>
                   </div>
                   <div className="markdown-content" style={{ fontSize: '13px', color: '#eee', lineHeight: '1.4', background: 'rgba(255,255,255,0.05)', padding: '10px', borderRadius: '6px' }}>
@@ -203,45 +638,110 @@ export const GraphCanvasComponent: React.FC = () => {
 
   return (
     <div style={{ position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh', background: '#000' }}>
-      <button 
-        onClick={loadData}
-        style={{
+      <div style={{
           position: 'fixed',
           top: '20px',
           left: '20px',
           zIndex: 2000,
-          padding: '12px 24px',
-          background: 'rgba(255,255,255,0.05)',
-          color: 'white',
-          border: '1px solid #444',
-          borderRadius: '8px',
-          cursor: 'pointer',
-          fontWeight: 'bold',
-          transition: 'all 0.2s',
-          backdropFilter: 'blur(5px)',
-        }}
-        onMouseOver={(e) => e.currentTarget.style.background = 'rgba(255,255,255,0.1)'}
-        onMouseOut={(e) => e.currentTarget.style.background = 'rgba(255,255,255,0.05)'}
-      >
-        Refresh Visualization
-      </button>
+          display: 'flex',
+          gap: '12px',
+          padding: '8px',
+          background: 'rgba(0,0,0,0.5)',
+          backdropFilter: 'blur(10px)',
+          borderRadius: '12px',
+          border: '1px solid #333'
+      }}>
+        <button 
+          onClick={loadData}
+          style={{
+            padding: '8px 16px',
+            background: 'rgba(255,255,255,0.05)',
+            color: 'white',
+            border: '1px solid #444',
+            borderRadius: '8px',
+            cursor: 'pointer',
+            fontWeight: 'bold',
+            transition: 'all 0.2s',
+          }}
+          onMouseOver={(e) => e.currentTarget.style.background = 'rgba(255,255,255,0.1)'}
+          onMouseOut={(e) => e.currentTarget.style.background = 'rgba(255,255,255,0.05)'}
+        >
+          Refresh
+        </button>
+
+        <button 
+          onClick={() => setShowKnowledge(!showKnowledge)}
+          style={{
+            padding: '8px 16px',
+            background: showKnowledge ? 'rgba(155, 89, 182, 0.2)' : 'rgba(255, 255, 255, 0.05)',
+            color: showKnowledge ? '#9b59b6' : '#888',
+            border: `1px solid ${showKnowledge ? '#9b59b6' : '#444'}`,
+            borderRadius: '8px',
+            cursor: 'pointer',
+            fontWeight: 'bold',
+            transition: 'all 0.2s',
+          }}
+        >
+          {showKnowledge ? 'Hide' : 'Show'} Knowledge
+        </button>
+
+        {viewMode === 'local' && (
+          <>
+            <button 
+              onClick={() => {
+                setViewMode('global');
+                setFocusNodeId(null);
+              }}
+              style={{
+                padding: '8px 16px',
+                background: 'rgba(231, 76, 60, 0.2)',
+                color: '#e74c3c',
+                border: '1px solid #e74c3c',
+                borderRadius: '8px',
+                cursor: 'pointer',
+                fontWeight: 'bold',
+              }}
+            >
+              Global View
+            </button>
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '10px',
+              padding: '0 10px',
+              color: '#888',
+              fontSize: '12px',
+              borderLeft: '1px solid #333'
+            }}>
+              <span>Depth: {focusDepth}</span>
+              <input 
+                type="range" 
+                min="1" 
+                max="5" 
+                value={focusDepth} 
+                onChange={(e) => setFocusDepth(parseInt(e.target.value))} 
+                style={{ width: '80px', cursor: 'pointer' }}
+              />
+            </div>
+          </>
+        )}
+      </div>
 
       {renderDetailPanel()}
 
       <ForceGraph2D
         ref={fgRef}
-        graphData={data}
-        onNodeClick={(node) => setSelectedNode(node as CustomNode)}
-        onNodeHover={(node) => {
-          if (node) setSelectedNode(node as CustomNode);
-        }}
+        graphData={displayData || { nodes: [], links: [] }}
+        onNodeClick={(node) => handleNodeSelect(node as CustomNode)}
+        nodeLabel="name"
         nodeCanvasObject={(node, ctx, globalScale) => {
           const n = node as CustomNode;
           const m = n.metadata;
-          const label = m.instruction;
-          const truncated = label.length > 25 ? label.substring(0, 25) + '...' : label;
+          const label = n.type === 'knowledge' ? (m.knowledge_title || n.id) : m.instruction;
+          const truncated = label.length > 30 ? label.substring(0, 30) + '...' : label;
           const fontSize = 12 / globalScale;
-          const radius = 8;
+          const isPseudoRoot = n.id === 'pseudo_root';
+          const radius = isPseudoRoot ? 16 : (n.type === 'knowledge' ? 12 : 8);
           
           ctx.font = `${fontSize}px system-ui`;
           
@@ -249,7 +749,7 @@ export const GraphCanvasComponent: React.FC = () => {
           if (selectedNode && selectedNode.id === n.id) {
             ctx.beginPath();
             ctx.arc(n.x!, n.y!, radius + 4, 0, 2 * Math.PI, false);
-            ctx.strokeStyle = '#61dafb';
+            ctx.strokeStyle = n.type === 'knowledge' ? '#9b59b6' : '#61dafb';
             ctx.lineWidth = 3 / globalScale;
             ctx.stroke();
           }
@@ -259,6 +759,18 @@ export const GraphCanvasComponent: React.FC = () => {
           ctx.arc(n.x!, n.y!, radius, 0, 2 * Math.PI, false);
           ctx.fillStyle = n.color;
           ctx.fill();
+
+          if (n.type === 'knowledge') {
+            ctx.font = `${fontSize * 1.5}px system-ui`;
+            ctx.fillText('📚', n.x! - radius/2, n.y! + radius/2);
+            ctx.font = `${fontSize}px system-ui`;
+          }
+
+          if (isPseudoRoot) {
+            ctx.font = `${fontSize * 1.8}px system-ui`;
+            ctx.fillText('🏠', n.x! - radius/2, n.y! + radius/2);
+            ctx.font = `${fontSize}px system-ui`;
+          }
 
           if (m.is_executing) {
             ctx.font = `${fontSize * 1.5}px system-ui`;
@@ -284,8 +796,22 @@ export const GraphCanvasComponent: React.FC = () => {
           ctx.arc(n.x!, n.y!, 14, 0, 2 * Math.PI, false);
           ctx.fill();
         }}
-        linkColor={() => '#333'}
-        linkWidth={1.5}
+        linkColor={(link) => {
+          const l = link as CustomLink;
+          if (l.type === 'generation') return 'rgba(155, 89, 182, 0.9)';
+          if (l.type === 'citation') return 'rgba(155, 89, 182, 0.3)';
+          return '#333';
+        }}
+        linkWidth={(link) => {
+          const l = link as CustomLink;
+          if (l.type === 'generation') return 2.5;
+          if (l.type === 'citation') return 1.5;
+          return 1.5;
+        }}
+        linkLineDash={(link) => (link as CustomLink).type === 'citation' ? [3, 3] : null}
+        linkDirectionalArrowLength={3}
+        linkDirectionalArrowRelPos={1}
+        linkCurvature={(link) => ['citation', 'generation'].includes((link as CustomLink).type) ? 0.2 : 0}
         backgroundColor="#000"
       />
     </div>

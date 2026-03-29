@@ -36,6 +36,9 @@ dependencies = [
     "networkx>=3.6.1",
     "streamlit>=1.55.0",
     "elasticsearch<9.0.0",
+    "fastapi>=0.135.2",
+    "uvicorn>=0.42.0",
+    "aiosqlite>=0.22.1",
 ]
 
 [build-system]

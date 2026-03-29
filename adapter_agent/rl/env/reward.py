@@ -147,7 +147,7 @@ class LLMAsAJudgeSingleTurn:
 
     async def __call__(
         self, history: list[TinkerMessage]
-    ) -> tuple[float, SSConclusion]:
+    ) -> tuple[float, SSConclusion, str]:
         if len(history) == 0:
             raise ValueError("History for LLMAsAJudge cannot be empty")
         try:
@@ -157,7 +157,7 @@ class LLMAsAJudgeSingleTurn:
                 f"Environment error during run_cargo: {e}"
             ) from e
         if not success:
-            return 0.0, "code_did_not_compile"
+            return 0.0, "code_did_not_compile", execution_output
         try:
             content = await self.rust_env.view_file("src/main.rs")
         except CoderMCPRuntimeError as e:
@@ -175,6 +175,7 @@ class LLMAsAJudgeSingleTurn:
                 part["text"]
                 for part in last_assistant_message["content"]
                 if part["type"] == "text"
+                and "text" in part
             )
         try:
             verification_result = await self.verifier.verify(
@@ -189,10 +190,12 @@ class LLMAsAJudgeSingleTurn:
         except Exception as e:
             raise CodingEnvironmentError(f"Environment error during verify: {e}") from e
 
+        final_observation = f"<CargoRunResult>\n{execution_output}\n</CargoRunResult>\n<VerificationReasoning>\n{verification_result.reasoning}\n</VerificationReasoning>"
+
         if verification_result.success:
-            return 1.0, "success"
+            return 1.0, "success", final_observation
         else:
-            return 0.0, "verification_failed"
+            return 0.0, "verification_failed", final_observation
 
     @classmethod
     def is_successful_reward(cls, reward: float) -> bool:

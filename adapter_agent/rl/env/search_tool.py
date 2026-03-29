@@ -1,5 +1,7 @@
 import json
-from dataclasses import dataclass
+import asyncio
+import litellm
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 from agents import RunContextWrapper, StopAtTools, function_tool
@@ -16,11 +18,15 @@ from adapter_agent.library.knowledge_db import KnowledgeDB
 class AgenticSearchContext(BaseModel):
     final_answer: str | None = None
     knowledge_id: str | None = None
+    knowledge_title: str | None = None
 
 
 @dataclass
 class SimplifiedSolverMutableState:
     remaining_turns: int
+    total_turns: int
+    search_count: int = 0
+    seen_knowledge_ids: set[str] = field(default_factory=set)
 
 
 class SearchTool(Tool):
@@ -60,17 +66,47 @@ class SearchTool(Tool):
         }
 
     async def run(self, input: ToolInput) -> ToolResult:
+        assert input.call_id is not None
+        search_limit = self.mutable_state.total_turns // 2
+        if self.mutable_state.search_count >= search_limit:
+            output = f"Search limit reached. You have already performed {self.mutable_state.search_count} searches. Please proceed with the information you have or submit your final answer using `<submit>...</submit>`."
+            return ToolResult(
+                messages=[
+                    TinkerMessage(
+                        role="tool",
+                        content=output,
+                        tool_call_id=input.call_id,
+                    )
+                ]
+            )
+
+        self.mutable_state.search_count += 1
         query = input.arguments.get("query", "")
 
         ctx = AgenticSearchContext()
 
         # Step 1: Direct Search Execution (KnowledgeDB -> Fallback to RustDocs)
-        db_results = await self.knowledge_db.search(query, limit=3)
+        # Fetch more to ensure we have enough even after filtering
+        db_results = await self.knowledge_db.search(query, limit=10)
+        
+        # Filter out seen knowledge pieces
+        unseen_results = [
+            res for res in db_results 
+            if res["id"] not in self.mutable_state.seen_knowledge_ids
+        ]
+        
+        # Take the top 3 unseen ones
+        selected_db_results = unseen_results[:3]
+        
+        # Mark them as seen because they will be shown to the selector agent
+        for res in selected_db_results:
+            self.mutable_state.seen_knowledge_ids.add(res["id"])
+
         final_ans: str | None = None
 
-        if db_results:
+        if selected_db_results:
             # Flow A: Knowledge DB (Select and return as-is)
-            numbered_results = {i: res for i, res in enumerate(db_results)}
+            numbered_results = {i: res for i, res in enumerate(selected_db_results)}
 
             @function_tool
             def select_knowledge(
@@ -80,19 +116,23 @@ class SearchTool(Tool):
                 if index is not None and index in numbered_results:
                     wrapper.context.final_answer = numbered_results[index]["content"]
                     wrapper.context.knowledge_id = numbered_results[index]["id"]
+                    wrapper.context.knowledge_title = numbered_results[index].get("title")
                 else:
                     wrapper.context.final_answer = None
 
             agent = AgentWrapper[str].create(
                 name="KnowledgeSelector",
                 instructions=(
-                    "You are a knowledge selection assistant.\n"
-                    f"The user searched for: '{query}'.\n"
-                    "Below are previously learned knowledge snippets indexed from 0. "
-                    "Read them carefully and decide if ANY of them are truly relevant for solving the user's issue.\n"
-                    f"1. If a snippet is highly relevant, use the `{select_knowledge.name}` tool to choose it by its index.\n"
-                    f"2. If NONE of the snippets are relevant or helpful, call `{select_knowledge.name}` with `index=None` to signal a fallback to standard documentation search.\n"
-                    "You only need to output the tool call."
+                    "You are a knowledge selection assistant specializing in high-precision retrieval.\n"
+                    f"User Query: '{query}'\n\n"
+                    "### Goal\n"
+                    "Evaluate the provided knowledge snippets and decide if one provides a direct, comprehensive solution. "
+                    "Accuracy is your highest priority. It is always preferable to return nothing (None) than to provide a snippet that is only partially relevant.\n\n"
+                    "### Selection Logic\n"
+                    "- **Return index**: Use this ONLY if a snippet is an exact 'bullseye'—it contains the precise code, API usage, or explanation requested.\n"
+                    "- **Return None**: Use this if snippets are merely related, incomplete, or if there is any ambiguity regarding their helpfulness.\n\n"
+                    "### Decision Rule\n"
+                    "When in doubt, default to `index=None`. This signals that a fresh search of the raw documentation is required for better accuracy."
                 ),
                 model=self.search_model,
                 tools=[select_knowledge],
@@ -112,7 +152,22 @@ class SearchTool(Tool):
             ]
             input_prompt = f"<KnowledgeSnippets>\n{json.dumps(input_list, indent=2)}\n</KnowledgeSnippets>"
 
-            await agent.run(input_prompt, context=ctx)
+            # Retry loop for KnowledgeSelector
+            for attempt in range(3):
+                try:
+                    await agent.run(input_prompt, context=ctx)
+                    break
+                except litellm.InternalServerError:
+                    if attempt == 2:
+                        # Fallback to Flow B if all retries fail
+                        ctx.final_answer = None
+                    else:
+                        await asyncio.sleep(2 ** attempt)
+                except Exception:
+                    # Fallback to Flow B for any other agent errors
+                    ctx.final_answer = None
+                    break
+
             final_ans = ctx.final_answer
 
         if not final_ans:
@@ -156,17 +211,31 @@ class SearchTool(Tool):
                     "Select the single best document from the list above and provide a detailed summary using `report_summary`."
                 )
 
-                await agent.run(input_prompt, context=ctx)
+                # Retry loop for RustDocSummarizer
+                for attempt in range(3):
+                    try:
+                        await agent.run(input_prompt, context=ctx)
+                        break
+                    except litellm.InternalServerError:
+                        if attempt == 2:
+                            ctx.final_answer = "Documentation search failed due to a transient model error. Please try again or refine your query."
+                        else:
+                            await asyncio.sleep(2 ** attempt)
+                    except Exception as e:
+                        ctx.final_answer = f"An unexpected error occurred during documentation search: {str(e)}"
+                        break
+
                 final_ans = ctx.final_answer or "Failed to summarize the document."
 
         output = f"{final_ans}"
 
-        assert input.call_id is not None
         msg = TinkerMessage(
             role="tool",
             content=output,
             tool_call_id=input.call_id,
         )
-        # Adding knowledge_id as a dynamic attribute to track citation
+        # Adding knowledge_id and content as dynamic attributes to track citations
         cast(dict[str, Any], msg)["knowledge_id"] = ctx.knowledge_id
+        cast(dict[str, Any], msg)["knowledge_title"] = ctx.knowledge_title
+        cast(dict[str, Any], msg)["knowledge_content"] = ctx.final_answer
         return ToolResult(messages=[msg])

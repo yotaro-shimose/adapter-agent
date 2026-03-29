@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import random
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -12,13 +13,16 @@ from pydantic.fields import Field
 from pyvis.network import Network
 from typing_extensions import TypeIs
 
-from adapter_agent.data import QRA
+from adapter_agent.data import QRA, PydanticTinkerBaseMessage
 from adapter_agent.rl.env.session_result import (
     RewireSessionResult,
     RewireSessionResultNormal,
     RewireSessionResultSuccess,
+    Citation,
 )
+from adapter_agent.rl.env.sqlite_logger import SqliteLogger
 from adapter_agent.hierarchical.types import Entity, Task
+from adapter_agent.util.exception import AllTasksCompleted
 
 
 @dataclass
@@ -32,6 +36,7 @@ class TaskWithMeta:
     item: Task
     sft_conclusions: list[Attempt] = field(default_factory=list)
     knowledges: dict[str, NormalizedKnowledge] = field(default_factory=dict)
+    citations: list[Citation] = field(default_factory=list)
     PSEUDO_ROOT_ID: ClassVar[str] = "pseudo_root"
 
     def register_study_result(self, result: RewireSessionResult):
@@ -42,9 +47,14 @@ class TaskWithMeta:
                     timestamp=datetime.now(),
                 )
             )
-        if isinstance(result, RewireSessionResultSuccess):
+        if isinstance(result, RewireSessionResultNormal):
+            self.citations.extend(result.citations)
+
+        if isinstance(result, RewireSessionResultSuccess) and result.knowledge:
             knowledge = NormalizedKnowledge(
-                task_id=self.item.id, knowledge=result.knowledge
+                task_id=self.item.id, 
+                knowledge=result.knowledge.content,
+                title=result.knowledge.title
             )
             self.knowledges[knowledge.id] = knowledge
 
@@ -148,12 +158,16 @@ class GraphNodeMetadata(BaseModel):
     is_executing: bool
     slice_count: int
     gen_count: int
+    citations: list[dict[str, Any]] = Field(default_factory=list)
     slices: list[dict[str, str]] = Field(default_factory=list)
+    knowledge_content: str | None = None
+    knowledge_title: str | None = None
 
 
 class GraphExportNode(BaseModel):
     id: str
     label: str
+    type: str = "task"
     metadata: GraphNodeMetadata
 
 
@@ -171,6 +185,7 @@ class GraphExportData(BaseModel):
 class NormalizedKnowledge(Entity):
     task_id: str
     knowledge: str
+    title: str = "Untitled Knowledge"
     slices: list[QRA] = Field(default_factory=list)
 
 
@@ -203,6 +218,8 @@ class TaskNetwork:
         pseudo_root = TaskWithMeta.pseudo_root()
         self.nodes[pseudo_root.item.id] = pseudo_root
         self.root_id = pseudo_root.item.id
+        self.logger = SqliteLogger()
+        self._lock = asyncio.Lock()
 
     def add_branch_root(self) -> Task | None:
         if not self.tasks_pool:
@@ -220,12 +237,12 @@ class TaskNetwork:
         self._add_edge(parent_id, child.item.id)
 
     def get_next_task(self) -> TaskNetworkTask:
-        knowledge_to_slice = self.get_knowledge_to_slice()
-        if knowledge_to_slice:
-            return SlicingTask(
-                task_id=knowledge_to_slice.task_id,
-                knowledge=knowledge_to_slice,
-            )
+        # knowledge_to_slice = self.get_knowledge_to_slice()
+        # if knowledge_to_slice:
+        #     return SlicingTask(
+        #         task_id=knowledge_to_slice.task_id,
+        #         knowledge=knowledge_to_slice,
+        #     )
         return self.get_next_study_task()
 
     def get_next_study_task(self) -> StudyTask:
@@ -258,7 +275,7 @@ class TaskNetwork:
                 if node.is_pseudo_root():
                     new_task = self.add_branch_root()
                     if new_task is None:
-                        raise ValueError("No more tasks in the pool.")
+                        raise AllTasksCompleted("No more tasks in the pool.")
                     study_task = StudyTask(
                         task=new_task,
                         knowledges=[],
@@ -289,7 +306,7 @@ class TaskNetwork:
                 if node.is_pseudo_root():
                     new_task = self.add_branch_root()
                     if new_task is None:
-                        raise ValueError("No more tasks in the pool.")
+                        raise AllTasksCompleted("No more tasks in the pool.")
                     study_task = StudyTask(
                         task=new_task,
                         knowledges=[],
@@ -319,13 +336,14 @@ class TaskNetwork:
             raise ValueError(f"Unknown task type: {type(task)}")
         return task
 
-    def task_teardown(self, completed: TaskNetworkCompleted):
-        if isinstance(completed, SlicingTaskCompleted):
-            self.slicing_task_teardown(completed)
-        elif isinstance(completed, StudyTaskCompleted):
-            self.study_task_teardown(completed)
-        else:
-            raise ValueError(f"Unknown task type: {type(completed)}")
+    async def task_teardown(self, completed: TaskNetworkCompleted):
+        async with self._lock:
+            if isinstance(completed, SlicingTaskCompleted):
+                self.slicing_task_teardown(completed)
+            elif isinstance(completed, StudyTaskCompleted):
+                await self.study_task_teardown(completed)
+            else:
+                raise ValueError(f"Unknown task type: {type(completed)}")
 
     def slicing_task_setup(self, slicing_task: SlicingTask):
         self.executing_slicing[slicing_task.knowledge.id] = (
@@ -348,7 +366,40 @@ class TaskNetwork:
     def study_task_setup(self, study_task: StudyTask):
         self._execution_countup(study_task)
 
-    def study_task_teardown(self, completed: StudyTaskCompleted):
+    async def study_task_teardown(self, completed: StudyTaskCompleted):
+        # Log to SQLite
+        res = completed.result
+        if isinstance(res, RewireSessionResultNormal):
+            # Convert TinkerMessages to Pydantic for JSON serialization
+            trials_data = []
+            for t in res.trials:
+                p_msg = PydanticTinkerBaseMessage.model_validate(t)
+                trials_data.append(p_msg.model_dump(mode='json', exclude_none=True))
+            
+            citations_data = [
+                {
+                    "knowledge_id": c.knowledge_id,
+                    "turn_index": c.turn_index,
+                    "content": c.content,
+                    "title": c.title
+                }
+                for c in res.citations
+            ]
+
+            # Ensure DB is initialized (idempotent)
+            await self.logger.initialize()
+            
+            await self.logger.save_trajectory(
+                task_id=completed.id,
+                instruction=completed.task.instruction,
+                conclusion=res.conclusion,
+                reward=res.reward,
+                trials=trials_data,
+                final_knowledge=res.knowledge.content if res.knowledge else None,
+                final_knowledge_title=res.knowledge.title if res.knowledge else None,
+                citations=citations_data
+            )
+
         self._execution_countdown(completed)
         self._process_study_task_result(completed)
 
@@ -448,11 +499,15 @@ class TaskNetwork:
             if len(successful_attempts) > 0:
                 attempt = random.choice(successful_attempts)
                 assert isinstance(attempt.result, RewireSessionResultSuccess)
-                knowledges.append(attempt.result.knowledge)
+                if attempt.result.knowledge:
+                    knowledges.append(attempt.result.knowledge.content)
 
             for attempt in child_node.sft_conclusions:
-                if isinstance(attempt.result, RewireSessionResultSuccess):
-                    knowledges.append(attempt.result.knowledge)
+                if (
+                    isinstance(attempt.result, RewireSessionResultSuccess)
+                    and attempt.result.knowledge
+                ):
+                    knowledges.append(attempt.result.knowledge.content)
         return knowledges
 
     def to_pyvis(
@@ -568,6 +623,14 @@ class TaskNetwork:
                         }
                     )
 
+            knowledge_content = None
+            knowledge_title = None
+            if node.is_sft_solved:
+                for k in node.knowledges.values():
+                    knowledge_content = k.knowledge
+                    knowledge_title = k.title
+                    break
+
             metadata = GraphNodeMetadata(
                 instruction=node.item.instruction,
                 success_count=success_count,
@@ -576,13 +639,25 @@ class TaskNetwork:
                 is_executing=is_executing,
                 slice_count=slice_count,
                 gen_count=gen_count,
+                citations=[
+                    {
+                        "knowledge_id": c.knowledge_id,
+                        "turn_index": c.turn_index,
+                        "content": c.content,
+                        "title": c.title,
+                    }
+                    for c in node.citations
+                ],
                 slices=slices_data,
+                knowledge_content=knowledge_content,
+                knowledge_title=knowledge_title,
             )
 
             nodes_exported.append(
                 GraphExportNode(
                     id=node.item.id,
                     label=node.item.instruction,
+                    type="task",
                     metadata=metadata,
                 )
             )
@@ -600,12 +675,17 @@ class TaskNetwork:
 
         return GraphExportData(nodes=nodes_exported, edges=edges_exported).model_dump()
 
-    def save_json(self, path: Path):
+    async def save_json(self, path: Path):
         import json
 
-        data = self.to_dict()
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
+        async with self._lock:
+            data = self.to_dict()
+
+            def _write():
+                with open(path, "w") as f:
+                    json.dump(data, f, indent=2)
+
+            await asyncio.to_thread(_write)
 
     def recent_graph(self, n: int = 10):
         # Collect all attempts with their task IDs and timestamps
@@ -685,11 +765,13 @@ class TaskResultContext[T, R]:
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.completed is None:
-            raise ValueError("No result registered for task.")
-        ret = self.register(self.completed)
-        if isawaitable(ret):
-            await ret
+        if exc_type is None and self.completed is None:
+            raise ValueError("No result registered for task (and no exception occurred).")
+        
+        if self.completed is not None:
+            ret = self.register(self.completed)
+            if isawaitable(ret):
+                await ret
 
     def register_result(self, completed: R):
         self.completed = completed

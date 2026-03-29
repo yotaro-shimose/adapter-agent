@@ -8,6 +8,7 @@ logger = logging.getLogger(__name__)
 class KnowledgeDoc(TypedDict):
     id: str
     query: str
+    title: str
     content: str
 
 
@@ -37,19 +38,21 @@ class KnowledgeDB:
                     "mappings": {
                         "properties": {
                             "query": {"type": "text", "similarity": "BM25"},
+                            "title": {"type": "text", "similarity": "BM25"},
                             "content": {"type": "text", "similarity": "BM25"},
                         }
                     }
                 }
             )
 
-    async def add_knowledge(self, query: str, content: str) -> str:
+    async def add_knowledge(self, query: str, title: str, content: str) -> str:
         """Add a new knowledge entry and return the document ID."""
-        logger.info(f"Adding knowledge to '{self.index_name}' (query: {query})")
+        logger.info(f"Adding knowledge to '{self.index_name}' (title: {title}, query: {query})")
         res = await self.client.index(
             index=self.index_name,
             document={
                 "query": query,
+                "title": title,
                 "content": content,
             }
         )
@@ -79,7 +82,7 @@ class KnowledgeDB:
                 "query": {
                     "multi_match": {
                         "query": query,
-                        "fields": ["query^2", "content"] # Give more weight to query field matching
+                        "fields": ["title^3", "query^2", "content"] # Give more weight to title and query field matching
                     }
                 },
                 "size": limit
@@ -100,5 +103,16 @@ class KnowledgeDB:
             logger.info(f"Deleting Elasticsearch index '{self.index_name}'...")
             await self.client.indices.delete(index=self.index_name)
             
+        
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
+
     async def close(self) -> None:
-        await self.client.close()
+        if self.client:
+            await self.client.close()
+            # Mark it as closed/None if possible, though AsyncElasticsearch doesn't 
+            # strictly require it if we don't reuse it.
+            self.client = None # type: ignore

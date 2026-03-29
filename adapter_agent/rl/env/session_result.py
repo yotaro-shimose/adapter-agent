@@ -8,6 +8,20 @@ from adapter_agent.hierarchical.types import Task
 from adapter_agent.rl.env.conclusion import SSConclusion
 
 
+@dataclass
+class Knowledge:
+    title: str
+    content: str
+
+
+@dataclass
+class Citation:
+    knowledge_id: str
+    turn_index: int
+    content: str | None = None
+    title: str | None = None
+
+
 @dataclass(kw_only=True)
 class RewireSessionResultNormal:
     task: Task
@@ -15,8 +29,9 @@ class RewireSessionResultNormal:
     conclusion: SSConclusion
     trajectory: Trajectory
     reward: float
-    knowledge: str | None = None
+    knowledge: Knowledge | None = None
     reasoning: str | None = None
+    citations: list[Citation] = field(default_factory=list)
 
 
 @dataclass(kw_only=True)
