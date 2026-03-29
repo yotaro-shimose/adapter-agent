@@ -1,0 +1,55 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider             = "prisma-client-py"
+  recursive_type_depth = -1
+}
+
+model Experiment {
+  id              Int          @id @default(autoincrement())
+  experiment_name String       @unique
+  graph_json      Json?        @default("{}")
+  created_at      DateTime     @default(now())
+  trajectories    Trajectory[]
+
+  @@map("experiments")
+}
+
+model Trajectory {
+  id                    Int        @id @default(autoincrement())
+  experiment            Experiment @relation(fields: [experiment_id], references: [id], onDelete: Cascade)
+  experiment_id         Int
+  task_id               String
+  knowledge_id          String?
+  instruction          String?
+  conclusion           String?
+  reward               Float?
+  trials_json          Json?
+  final_knowledge      String?
+  final_knowledge_title String?
+  is_sft_candidate     Boolean    @default(false)
+  usage_count          Int        @default(0)
+  last_used_at         DateTime   @default(now())
+  created_at           DateTime   @default(now())
+  citations            Citation[]
+
+  @@map("trajectories")
+  @@index([task_id])
+  @@index([experiment_id])
+}
+
+model Citation {
+  id             Int        @id @default(autoincrement())
+  trajectory     Trajectory @relation(fields: [trajectory_id], references: [id], onDelete: Cascade)
+  trajectory_id  Int
+  knowledge_id   String
+  content        String?
+  title          String?
+  turn_index     Int        @default(0)
+  created_at     DateTime   @default(now())
+
+  @@map("citations")
+}

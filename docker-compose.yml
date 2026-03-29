@@ -1,4 +1,3 @@
-version: '3.8'
 
 services:
   elasticsearch:
@@ -13,5 +12,18 @@ services:
     volumes:
       - es_data:/usr/share/elasticsearch/data
 
+  postgres:
+    image: postgres:16-alpine
+    container_name: adapter_agent_db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: adapter_agent
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
 volumes:
   es_data:
+  postgres_data:

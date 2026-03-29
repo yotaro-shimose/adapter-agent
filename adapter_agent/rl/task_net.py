@@ -13,14 +13,13 @@ from pydantic.fields import Field
 from pyvis.network import Network
 from typing_extensions import TypeIs
 
-from adapter_agent.data import QRA, PydanticTinkerBaseMessage
+from adapter_agent.data import QRA
 from adapter_agent.rl.env.session_result import (
     RewireSessionResult,
     RewireSessionResultNormal,
     RewireSessionResultSuccess,
     Citation,
 )
-from adapter_agent.rl.env.sqlite_logger import SqliteLogger
 from adapter_agent.hierarchical.types import Entity, Task
 from adapter_agent.util.exception import AllTasksCompleted
 
@@ -218,7 +217,6 @@ class TaskNetwork:
         pseudo_root = TaskWithMeta.pseudo_root()
         self.nodes[pseudo_root.item.id] = pseudo_root
         self.root_id = pseudo_root.item.id
-        self.logger = SqliteLogger()
         self._lock = asyncio.Lock()
 
     def add_branch_root(self) -> Task | None:
@@ -367,39 +365,7 @@ class TaskNetwork:
         self._execution_countup(study_task)
 
     async def study_task_teardown(self, completed: StudyTaskCompleted):
-        # Log to SQLite
-        res = completed.result
-        if isinstance(res, RewireSessionResultNormal):
-            # Convert TinkerMessages to Pydantic for JSON serialization
-            trials_data = []
-            for t in res.trials:
-                p_msg = PydanticTinkerBaseMessage.model_validate(t)
-                trials_data.append(p_msg.model_dump(mode='json', exclude_none=True))
-            
-            citations_data = [
-                {
-                    "knowledge_id": c.knowledge_id,
-                    "turn_index": c.turn_index,
-                    "content": c.content,
-                    "title": c.title
-                }
-                for c in res.citations
-            ]
-
-            # Ensure DB is initialized (idempotent)
-            await self.logger.initialize()
-            
-            await self.logger.save_trajectory(
-                task_id=completed.id,
-                instruction=completed.task.instruction,
-                conclusion=res.conclusion,
-                reward=res.reward,
-                trials=trials_data,
-                final_knowledge=res.knowledge.content if res.knowledge else None,
-                final_knowledge_title=res.knowledge.title if res.knowledge else None,
-                citations=citations_data
-            )
-
+        # Note: SQLite logging removed in favor of unified PostgreSQL logging in UniRLState.
         self._execution_countdown(completed)
         self._process_study_task_result(completed)
 
@@ -673,17 +639,19 @@ class TaskNetwork:
                     )
                 )
 
-        return GraphExportData(nodes=nodes_exported, edges=edges_exported).model_dump()
+        return GraphExportData(nodes=nodes_exported, edges=edges_exported).model_dump(mode='json')
 
-    async def save_json(self, path: Path):
+    def save_json_sync(self, path: Path):
         import json
 
-        async with self._lock:
-            data = self.to_dict()
+        data = self.to_dict()
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
 
+    async def save_json(self, path: Path):
+        async with self._lock:
             def _write():
-                with open(path, "w") as f:
-                    json.dump(data, f, indent=2)
+                self.save_json_sync(path)
 
             await asyncio.to_thread(_write)
 

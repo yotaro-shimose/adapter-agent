@@ -93,6 +93,13 @@ export const GraphCanvasComponent: React.FC = () => {
   const [trajectories, setTrajectories] = useState<TrajectoryData[]>([]);
   const [selectedAttemptIndex, setSelectedAttemptIndex] = useState<number>(0);
   const [loadingTraj, setLoadingTraj] = useState<boolean>(false);
+  const [trajError, setTrajError] = useState<string | null>(null);
+  
+  const [experiments, setExperiments] = useState<string[]>([]);
+  const [selectedExperiment, setSelectedExperiment] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [isInitializing, setIsInitializing] = useState<boolean>(true);
+  
   const fgRef = useRef<ForceGraphMethods | undefined>(undefined);
   
   const handleNodeSelect = useCallback((node: CustomNode) => {
@@ -106,14 +113,13 @@ export const GraphCanvasComponent: React.FC = () => {
   }, []);
 
   const loadData = useCallback(async () => {
+    if (!selectedExperiment) return;
+    setError(null);
     try {
-      // Prefer the API server if available, fallback to static file
-      let response;
-      try {
-        response = await fetch('http://localhost:8000/api/graph');
-      } catch (e) {
-        console.warn("API server not reachable, falling back to static data.json");
-        response = await fetch('/data.json');
+      const response = await fetch(`http://localhost:8000/api/${encodeURIComponent(selectedExperiment)}/graph`);
+      
+      if (!response.ok) {
+        throw new Error(`Server responded with ${response.status}: ${await response.text()}`);
       }
       
       const json: GraphExportData = await response.json();
@@ -203,10 +209,14 @@ export const GraphCanvasComponent: React.FC = () => {
         nodes: [...taskNodes, ...knowledgeNodes], 
         links: [...decompositionLinks, ...citationLinks] 
       });
-    } catch (error) {
-      console.error('Failed to load graph data:', error);
+      setIsInitializing(false);
+    } catch (err: any) {
+      console.error('CRITICAL: Failed to load graph data:', err);
+      setError(err.message || String(err));
+      setData({ nodes: [], links: [] });
+      setIsInitializing(false);
     }
-  }, []);
+  }, [selectedExperiment]);
 
   useEffect(() => {
     if (fgRef.current) {
@@ -221,8 +231,26 @@ export const GraphCanvasComponent: React.FC = () => {
   }, [fgRef.current, data]);
 
   useEffect(() => {
+    const fetchExps = () => {
+      fetch('http://localhost:8000/api/experiments')
+        .then(res => res.json())
+        .then(data => {
+          setExperiments(data);
+          if (data.length > 0 && !selectedExperiment) {
+            setSelectedExperiment(data[0]);
+          }
+        })
+        .catch(err => console.error("Failed to fetch experiments", err));
+    };
+
+    fetchExps();
+    const interval = setInterval(fetchExps, 5000); // Poll every 5 seconds
+    return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
     loadData();
-  }, [loadData]);
+  }, [loadData, selectedExperiment]);
 
   useEffect(() => {
     if (!data) return;
@@ -272,10 +300,16 @@ export const GraphCanvasComponent: React.FC = () => {
   }, [data, viewMode, focusNodeId, focusDepth, showKnowledge]);
 
   useEffect(() => {
-    if (selectedNode && selectedNode.type === 'task') {
+    if (selectedNode && selectedNode.type === 'task' && selectedExperiment) {
       setLoadingTraj(true);
-      fetch(`http://localhost:8000/api/trajectory/${selectedNode.id}`)
-        .then(res => res.json())
+      setTrajError(null);
+      fetch(`http://localhost:8000/api/${encodeURIComponent(selectedExperiment)}/trajectory/${encodeURIComponent(selectedNode.id)}`)
+        .then(async res => {
+          if (!res.ok) {
+            throw new Error(`Failed to fetch trajectories: ${res.status} ${await res.text()}`);
+          }
+          return res.json();
+        })
         .then(data => {
           // data is now an array of trajectories
           setTrajectories(Array.isArray(data) ? data : []);
@@ -284,21 +318,100 @@ export const GraphCanvasComponent: React.FC = () => {
         })
         .catch(err => {
           console.error("Failed to fetch trajectory:", err);
+          setTrajError(err.message || String(err));
           setLoadingTraj(false);
           setTrajectories([]);
         });
     } else {
       setTrajectories([]);
     }
-  }, [selectedNode]);
+  }, [selectedNode, selectedExperiment]);
 
-  if (!data) {
-    return <div style={{ color: 'white', padding: '20px' }}>Loading graph data...</div>;
+  if (experiments.length === 0) {
+    return <div style={{ color: 'white', padding: '20px', fontFamily: 'monospace' }}>
+      <div style={{ fontSize: '24px', fontWeight: 'bold', marginBottom: '10px' }}>Waiting for experiments to start...</div>
+      <div style={{ color: '#888' }}>Searching for directories in logs/Adapter_Agent/</div>
+    </div>;
+  }
+
+  if (error) {
+    return <div style={{ color: '#ff4d4d', padding: '20px', fontFamily: 'monospace', border: '1px solid #ff4d4d', margin: '20px', borderRadius: '4px', backgroundColor: 'rgba(255, 77, 77, 0.1)' }}>
+      <div style={{ fontSize: '20px', fontWeight: 'bold', marginBottom: '10px' }}>⚠️ Error Loading Graph</div>
+      <div style={{ wordBreak: 'break-all' }}>{error}</div>
+      <button 
+        onClick={() => loadData()} 
+        style={{ marginTop: '15px', padding: '8px 16px', cursor: 'pointer', background: '#444', color: 'white', border: 'none', borderRadius: '4px' }}
+      >
+        Retry Fetching
+      </button>
+    </div>;
+  }
+
+  if (!data && isInitializing) {
+    return <div style={{ color: 'white', padding: '20px', fontFamily: 'monospace' }}>
+      <div className="spinner" style={{ marginBottom: '10px' }}>Loading graph data...</div>
+      <div style={{ color: '#888', fontSize: '12px' }}>Requesting {selectedExperiment}...</div>
+    </div>;
   }
 
   const renderTrajectory = () => {
-    if (loadingTraj) return <div style={{ color: '#888', fontStyle: 'italic', padding: '20px' }}>Loading trajectory...</div>;
-    if (!trajectories || trajectories.length === 0) return null;
+    if (loadingTraj) return (
+      <div style={{ padding: '30px', textAlign: 'center' }}>
+        <div className="spinner-small" style={{ margin: '0 auto 10px auto' }}></div>
+        <div style={{ color: '#888', fontStyle: 'italic', fontSize: '13px' }}>Loading trajectories...</div>
+      </div>
+    );
+    
+    if (trajError) return (
+      <div style={{ 
+        margin: '20px 0', 
+        padding: '16px', 
+        background: 'rgba(231, 76, 60, 0.1)', 
+        border: '1px solid rgba(231, 76, 60, 0.3)', 
+        borderRadius: '8px',
+        color: '#e74c3c',
+        fontSize: '13px'
+      }}>
+        <div style={{ fontWeight: 'bold', marginBottom: '8px' }}>⚠️ Failed to load trajectories</div>
+        <div style={{ opacity: 0.8, marginBottom: '12px' }}>{trajError}</div>
+        <button 
+          onClick={() => {
+            // Trigger a re-fetch by toggling a state if needed, 
+            // but here we can just re-run the logic by forcing a re-render or re-calling the effect logic
+            // simplest for this UI is letting the user click Refresh or de-select/re-select
+          }}
+          style={{ 
+            background: '#e74c3c', 
+            color: 'white', 
+            border: 'none', 
+            padding: '4px 10px', 
+            borderRadius: '4px', 
+            cursor: 'not-allowed', // Implementation detail: retry not easily wired here without refactoring
+            fontSize: '11px',
+            opacity: 0.5
+          }}
+        >
+          Check Backend Logs
+        </button>
+      </div>
+    );
+
+    if (!trajectories || trajectories.length === 0) return (
+      <div style={{ 
+        padding: '40px 20px', 
+        textAlign: 'center', 
+        color: '#666', 
+        border: '1px dashed #333', 
+        borderRadius: '12px',
+        marginTop: '20px'
+      }}>
+        <div style={{ fontSize: '24px', marginBottom: '10px' }}>📁</div>
+        <div style={{ fontSize: '14px' }}>No trajectories found for this task</div>
+        <div style={{ fontSize: '11px', marginTop: '5px', opacity: 0.7 }}>
+          Trajectories are recorded when an agent finishes a trial and the result is verified.
+        </div>
+      </div>
+    );
 
     const trajectory = trajectories[selectedAttemptIndex];
     if (!trajectory || !trajectory.trials) return null;
@@ -649,8 +762,31 @@ export const GraphCanvasComponent: React.FC = () => {
           background: 'rgba(0,0,0,0.5)',
           backdropFilter: 'blur(10px)',
           borderRadius: '12px',
-          border: '1px solid #333'
+          border: '1px solid #333',
+          alignItems: 'center'
       }}>
+        {experiments.length > 0 && (
+          <select 
+            value={selectedExperiment || ''} 
+            onChange={(e) => setSelectedExperiment(e.target.value)}
+            style={{
+              padding: '8px 12px',
+              background: 'rgba(255,255,255,0.1)',
+              color: 'white',
+              border: '1px solid #444',
+              borderRadius: '8px',
+              cursor: 'pointer',
+              fontWeight: 'bold',
+              outline: 'none',
+              fontSize: '13px'
+            }}
+          >
+            {experiments.map(exp => (
+              <option key={exp} value={exp} style={{ background: '#222' }}>{exp}</option>
+            ))}
+          </select>
+        )}
+
         <button 
           onClick={loadData}
           style={{

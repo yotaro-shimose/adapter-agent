@@ -16,7 +16,31 @@ remove-checkpoints:
 delete-cloudrun pattern="coder-mcp-numrs2" region="europe-north1":
     just --justfile ../coder-mcp/justfile delete-cloudrun-services {{pattern}} {{region}}
 
-# Start concurrently the visualization API (port 8000) and the React frontend (port 5173)
+# Start the database specifically
+db:
+    @echo "Starting PostgreSQL (Docker: adapter_agent_db)..."
+    docker compose up -d postgres
+    @echo "Waiting for services to be ready..."
+    sleep 3
+    @echo "Generating Prisma Client..."
+    uv run prisma generate --schema=schema.prisma
+
+# Start the visualization dashboard (ES + DB + Backend + Frontend)
 vis:
+    @echo "Starting Infrastructure (ES, Postgres)..."
+    docker compose up -d
+    @echo "Waiting for services to be ready..."
+    sleep 3
+    @echo "Generating Prisma Client..."
+    uv run prisma generate --schema=schema.prisma
     @echo "Starting visualization backend (8000) and frontend (5173)..."
-    (cd graphvis && npm run dev) & uv run scripts/vis_server.py
+    npx -y concurrently -n "backend,frontend" -c "blue,green" "uv run scripts/vis_server.py" "cd graphvis && npm run dev"
+
+# View combined infrastructure logs (Postgres, ES)
+logs:
+    docker compose logs -f
+
+# Clean PostgreSQL database experiments data
+db-clean:
+    @echo "Cleaning PostgreSQL database..."
+    uv run scripts/db_clean.py

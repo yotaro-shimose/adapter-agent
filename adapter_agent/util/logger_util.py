@@ -62,7 +62,12 @@ def setup_base_loglevel():
     logging.getLogger("mcp.client.streamable_http").setLevel(logging.ERROR)
     logging.getLogger("weave").setLevel(logging.ERROR)
     logging.getLogger("coder_mcp").setLevel(logging.ERROR)
+    logging.getLogger("elastic_transport.transport").setLevel(logging.WARNING)
+    logging.getLogger("adapter_agent.hierarchical.process.rewire").setLevel(logging.WARNING)
     os.environ["WEAVE_LOG_LEVEL"] = "ERROR"
+
+    # Suppress the specific extension warning from tinker_cookbook
+    SuppressExtensionWarning.suppress_trainonwhat_warning()
 
     # Apply truncating filter to openai.agents
     agent_logger = logging.getLogger("openai.agents")

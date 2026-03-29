@@ -1,16 +1,6 @@
 import asyncio
 import logging
 import os
-
-from oai_utils import AgentsSDKModel
-
-from adapter_agent.rl.task_net import is_study
-from adapter_agent.rl.unirl_state import StudyRolloutParams
-
-# Silence Ray logs
-os.environ["RAY_DEDUP_LOGS"] = "0"
-os.environ["RAY_COLOR_PREFIX"] = "0"
-os.environ["OPENAI_AGENTS_DISABLE_TRACING"] = "1"
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +10,7 @@ import ray
 import tinker
 import tinker_cookbook.checkpoint_utils
 from dotenv import load_dotenv
+from oai_utils import AgentsSDKModel
 from oai_utils.litellm import litellm_concurrent_limit
 from oai_utils.tinker import TinkerModel, setup_tinkermodel
 from ray.actor import ActorHandle
@@ -27,37 +18,38 @@ from tinker import AdamParams
 
 from adapter_agent.hierarchical.agent.analyzer import Analyzer
 from adapter_agent.hierarchical.agent.task_verifier import TaskVerifier
-from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.gh import Library
 from adapter_agent.hierarchical.process.rewire import ss_solve_verify
+from adapter_agent.hierarchical.types import Task
 from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
 from adapter_agent.library.knowledge_db import KnowledgeDB
-from adapter_agent.hierarchical.process.rewire_session_single_turn import (
-    solve_verify_tinker_single_turn,
-)
-from adapter_agent.hierarchical.types import Task
 from adapter_agent.model_helper import get_gemini
 from adapter_agent.rl.config import EnvParams, ExperimentSettings, ModelLoadingSettings
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.rl.env.session_result import (
     RewireSessionResultFailure,
 )
-from adapter_agent.rl.env.single_turn import SingleTurnEnvState
+from adapter_agent.rl.postgres_db import get_db
 from adapter_agent.rl.shared_sampling_client import SharedSamplingClient
 from adapter_agent.rl.task_net import (
     TaskNetwork,
+    is_study,
 )
+from adapter_agent.rl.trajectory_db import create_trajectory_db
 from adapter_agent.rl.unirl_state import (
-    HybridReplayBuffer,
-    PracticeRolloutParams,
+    StudyRolloutParams,
+    TrajectoryReplayBuffer,
     UniRLConfig,
     UniRLState,
     UniRLTrainParams,
     task_manager_from_state_handle,
 )
-from adapter_agent.util.exception import CodingEnvironmentError
 from adapter_agent.util.logger_util import setup_base_loglevel
-from adapter_agent.util.task_queue import TaskQueue
+
+# Silence Ray logs
+os.environ["RAY_DEDUP_LOGS"] = "0"
+os.environ["RAY_COLOR_PREFIX"] = "0"
+os.environ["OPENAI_AGENTS_DISABLE_TRACING"] = "1"
 
 logger = logging.getLogger(__name__)
 
@@ -66,18 +58,29 @@ logger = logging.getLogger(__name__)
 class StudyActor:
     process_id: int
     state: ActorHandle[UniRLState]
-    verifier_model: AgentsSDKModel
-    rust_doc_analyzer: AsyncRustDocAnalyzer
-    knowledge_db: KnowledgeDB
     env_params: EnvParams
     num_workers: int
+    verifier_model: AgentsSDKModel = field(init=False, default=None)  # type: ignore
+    rust_doc_analyzer: AsyncRustDocAnalyzer = field(init=False, default=None)  # type: ignore
+    knowledge_db: KnowledgeDB = field(init=False, default=None)  # type: ignore
 
     def __post_init__(self):
         setup_base_loglevel()
         logging.basicConfig(level=logging.DEBUG)
 
+    async def setup(self):
+        logger.info(f"Study actor {self.process_id} setup started.")
+        self.verifier_model = get_gemini()
+        self.rust_doc_analyzer = await AsyncRustDocAnalyzer.create_from_libdir(
+            self.env_params.library.local_path
+        )
+        self.knowledge_db = KnowledgeDB()
+        await self.knowledge_db.initialize()
+        logger.info(f"Study actor {self.process_id} setup completed.")
+
     @ray.method
     async def run(self):
+        await self.setup()
         await asyncio.gather(
             *[
                 self.study_worker(f"{self.process_id}-{worker_id}")
@@ -131,73 +134,13 @@ class StudyActor:
                     raise ValueError(f"Unknown task type: {current}")
 
 
-@ray.remote
-def practice_rollout(
-    worker_id: int,
-    state: ActorHandle[UniRLState],
-    verifier: Verifier,
-    practice_rollout_params: PracticeRolloutParams,
-    env_params: EnvParams,
-):
-    setup_rollout_logging()
-    asyncio.run(
-        _practice_rollout(
-            worker_id,
-            state,
-            verifier,
-            practice_rollout_params,
-            env_params,
-        )
-    )
-
-
-async def _practice_rollout(
-    worker_id: int,
-    state: ActorHandle[UniRLState],
-    verifier: Verifier,
-    practice_rollout_params: PracticeRolloutParams,
-    env_params: EnvParams,
-):
-    logger.info(f"Practice worker {worker_id} started.")
-
-    while True:
-        task = await state.get_next_practice_task.remote()
-        logger.debug(f"Practice worker {worker_id} got a task.")
-        latest_model = await state.get_latest_model.remote()
-        env_state = SingleTurnEnvState.numrs2(task=task)
-        results = await asyncio.gather(
-            *[
-                solve_verify_tinker_single_turn(
-                    solver_model=latest_model,
-                    env_state=env_state,
-                    verifier=verifier,
-                    runtime_settings=env_params.runtime_settings,
-                )
-                for _ in range(practice_rollout_params.rollouts_per_task)
-            ],
-            return_exceptions=True,
-        )
-        rets = []
-        for r in results:
-            if isinstance(r, CodingEnvironmentError):
-                logger.warning(
-                    f"Practice worker {worker_id} encountered EnvironmentError: {r}. Excluding from results."
-                )
-            elif isinstance(r, BaseException):
-                raise r
-            else:
-                rets.append(r)
-
-        await state.register_practice_group.remote(worker_id, rets)
-
-
 @dataclass
 class TrainWorker:
     state: ActorHandle[UniRLState]
     params: UniRLTrainParams
     experiment_setting: ExperimentSettings
     model_loading_settings: ModelLoadingSettings
-    training_client: tinker.TrainingClient = field(init=False)
+    training_client: tinker.TrainingClient = field(init=False, default=None)  # type: ignore
 
     def __post_init__(self):
         logger.info("Train worker init.")
@@ -206,13 +149,11 @@ class TrainWorker:
         self.training_client = setup_training_client(self.model_loading_settings)
 
     async def run(self):
-        logger.info("Train worker main loop started.")
+        await self.state.log_info.remote("Train worker main loop started.")
         step = 0
-        tasks_to_practice: dict[str, Task] = dict()
         pending_fwd_bwd_future = None
         pending_optim_future = None
         while not await self.state.is_finished.remote():
-            # get_batch is now sync on the actor
             batch = await self.state.get_batch.remote()
 
             if batch is None:
@@ -220,7 +161,9 @@ class TrainWorker:
                 continue
             step += 1
 
-            logger.info(f"Train worker step: {step}. ")
+            await self.state.log_info.remote(
+                f"Train worker step: {step}. Starting Forward-Backward..."
+            )
 
             fwd_bwd_future = await self.training_client.forward_backward_async(
                 batch.datum,
@@ -229,7 +172,12 @@ class TrainWorker:
             optim_future = await self.training_client.optim_step_async(
                 self.params.adam_params
             )
+
+            # Wait for previous step's results if pipelining
             if pending_fwd_bwd_future is not None and pending_optim_future is not None:
+                await self.state.log_info.remote(
+                    f"Awaiting results from step {step - 1}..."
+                )
                 fwd_bwd_result = await pending_fwd_bwd_future.result_async()
                 await pending_optim_future.result_async()
                 await self.state.log_train_metrics.remote(
@@ -237,20 +185,18 @@ class TrainWorker:
                         **fwd_bwd_result.metrics,
                     }
                 )
+                await self.state.log_info.remote(
+                    f"Results from step {step - 1} logged."
+                )
+
             pending_fwd_bwd_future = fwd_bwd_future
             pending_optim_future = optim_future
 
-            if batch.batch_type == "Study":
-                exhausted_tasks = {
-                    counted_item.item.id: counted_item.item
-                    for counted_item in batch.tasks.values()
-                    if counted_item.count == 0
-                }
-                tasks_to_practice.update(exhausted_tasks)
-
             # Save checkpoint
             if step % self.params.save_freq == 0:
-                logger.info(f"Saving checkpoint at train step {step}...")
+                await self.state.log_info.remote(
+                    f"Saving checkpoint at train step {step}..."
+                )
                 await tinker_cookbook.checkpoint_utils.save_checkpoint_async(
                     training_client=self.training_client,
                     name=f"step_{step}",
@@ -262,13 +208,17 @@ class TrainWorker:
 
             # Update latest model for sampling
             if step % self.params.update_freq == 0:
+                await self.state.log_info.remote(
+                    f"Updating sampling client weights (step {step})..."
+                )
                 new_client = await self.training_client.save_weights_and_get_sampling_client_async()
+                await self.state.log_info.remote(
+                    "Broadcasting new sampling client to UniRLState..."
+                )
                 await self.state.update_sampling_client.remote(new_client)
-
-                logger.info("Train Worker -> Latest sampling client updated.")
-                for task in tasks_to_practice.values():
-                    await self.state.add_to_practice_queue.remote(task)
-                tasks_to_practice.clear()
+                await self.state.log_info.remote(
+                    "Train Worker -> Latest sampling client updated."
+                )
 
 
 def setup_rollout_logging():
@@ -278,23 +228,6 @@ def setup_rollout_logging():
     logging.getLogger("adapter_agent.hierarchical.process.rewire").setLevel(
         logging.WARNING
     )
-    logging.getLogger(
-        "adapter_agent.hierarchical.process.rewire_session_single_turn"
-    ).setLevel(logging.INFO)
-
-
-# def load_tasks(cfg: UniRLConfig) -> list[Task]:
-#     # Load questions
-#     logger.info(f"Loading questions from {cfg.env_params.dataset_path}...")
-#     qas_data_raw = QASFTDataset.model_validate_json(
-#         cfg.env_params.dataset_path.read_text()
-#     )
-#     # Parse into QA objects
-#     qas_data = qas_data_raw.shuffled()
-#     logger.info(f"Loaded {len(qas_data)} questions.")
-#
-#     tasks = [Task.from_instruction(qa.question) for qa in qas_data]
-#     return tasks
 
 
 def load_gh_archive() -> list[Task]:
@@ -348,10 +281,6 @@ async def main():
             max_turns=10,
             library=Library(name="numrs2", local_path=Path("repositories/numrs")),
             dataset_path=Path("data/sft/gen_20260218_182450/sft_dataset.json"),
-            # runtime_settings=RuntimeSettings(
-            #     type="docker",
-            #     image_uri="coder-mcp-numrs2:latest",
-            # ),
             qwen_no_think=True,
             runtime_settings=RuntimeSettings(
                 type="cloudrun",
@@ -366,10 +295,6 @@ async def main():
             num_study_actor=10,
             rollouts_per_actor=8,
         ),
-        practice_rollout_params=PracticeRolloutParams(
-            rollouts_per_task=6,
-            num_practice_workers=0,
-        ),
         train_params=UniRLTrainParams(
             update_freq=1,
             save_freq=50,
@@ -379,30 +304,21 @@ async def main():
                 beta2=0.95,
                 eps=1e-12,
             ),
-            max_sft_reuse=15,  # TODO: tune
-            max_rl_reuse=5,
-            min_sft_batch_size=32,  # TODO: tune
+            max_sft_reuse=15,
+            min_sft_batch_size=4,
             max_sft_batch_size=128,
-            rl_group_size=32,
         ),
-        num_study_workers=20,
         log_freq=20,
         vis_json_path=Path("graphvis/public/data.json"),
     )
 
     setup_rollout_logging()
 
+    log_root = cfg.experiment_setting.log_root()
+    log_root.mkdir(parents=True, exist_ok=True)
+
     tasks = load_gh_archive()
     study_queue = TaskNetwork(tasks[:30])
-    practice_queue = TaskQueue.create(order="FIFO", maxsize=0)
-
-    rust_doc_analyzer = await AsyncRustDocAnalyzer.create_from_libdir(cfg.env_params.library.local_path)
-
-    # Initialize KnowledgeDB
-    knowledge_db = KnowledgeDB()
-    await knowledge_db.initialize()
-    await knowledge_db.clear()
-    await knowledge_db.initialize()
 
     service_client = tinker.ServiceClient()
     model, tokenizer, renderer = setup_tinkermodel(
@@ -410,17 +326,19 @@ async def main():
         cfg.model_loading_settings.resume_sampler_path,
         service_client,
     )
-    verifier_model = get_gemini()
     task_verifier = TaskVerifier(model=get_gemini())
 
     sampling_client_manager = SharedSamplingClient(model.sampling_client)
 
-    buffer = HybridReplayBuffer.create(
+    # Initialize Trajectory DB using PostgreSQL experiment registry
+    db = await get_db()
+    experiment_id = await db.register_experiment(cfg.experiment_setting.experiment_name)
+    trajectory_db = await create_trajectory_db(experiment_id)
+    buffer = TrajectoryReplayBuffer(
         min_sft_batch_size=cfg.train_params.min_sft_batch_size,
         max_sft_batch_size=cfg.train_params.max_sft_batch_size,
-        rl_group_size=cfg.train_params.rl_group_size,
         max_sft_reuse=cfg.train_params.max_sft_reuse,
-        max_rl_reuse=cfg.train_params.max_rl_reuse,
+        trajectory_db=trajectory_db,
         renderer=model.renderer,
     )
 
@@ -429,7 +347,6 @@ async def main():
         ActorHandle[UniRLState],
         UniRLStateActor.remote(
             study_task_queue=study_queue,
-            practice_task_queue=practice_queue,
             buffer=buffer,
             litellm_model_name=model.model,
             renderer=model.renderer,
@@ -437,8 +354,11 @@ async def main():
             task_verifier=task_verifier,
             library_name=cfg.env_params.library.name,
             cfg=cfg,
+            experiment_id=experiment_id,
         ),
     )
+    # Ensure initial graph is saved to DB for visualization
+    await state.setup_db.remote()
 
     TrainWorkerActorClass = ray.remote(TrainWorker)
     train_worker_actor: ActorHandle[TrainWorker] = cast(
@@ -453,8 +373,6 @@ async def main():
     async with litellm_concurrent_limit(
         cfg.study_rollout_params.num_study_actor
         * cfg.study_rollout_params.rollouts_per_actor
-        + cfg.practice_rollout_params.num_practice_workers
-        * cfg.practice_rollout_params.rollouts_per_task
         + 10
     ):
         train_task = train_worker_actor.run.remote()
@@ -462,7 +380,7 @@ async def main():
         study_workers = []
         StudyActorClass = ray.remote(StudyActor)
         for i in range(cfg.study_rollout_params.num_study_actor):
-            # ここで少し待つ (例: 10秒おきに1つずつ起動)ことによって初期起動スパイクをさける
+            # 初期起動スパイクをさける
             await asyncio.sleep(10.0)
 
             worker = cast(
@@ -470,9 +388,6 @@ async def main():
                 StudyActorClass.remote(
                     i,
                     state,
-                    verifier_model,
-                    rust_doc_analyzer,
-                    knowledge_db,
                     cfg.env_params,
                     cfg.study_rollout_params.rollouts_per_actor,
                 ),
@@ -482,18 +397,7 @@ async def main():
             study_workers.append(worker_task_ref)
             logger.info(f"Launched Study Worker {i}...")
 
-        # Practice Worker の起動
-        practice_workers = []
-        # for i in range(cfg.practice_rollout_params.num_practice_workers):
-        #     await asyncio.sleep(1.0)
-
-        #     worker = practice_rollout.remote(
-        #         i, state, verifier, cfg.practice_rollout_params, cfg.env_params
-        #     )
-        #     practice_workers.append(worker)
-        #     logger.info(f"Launched Practice Worker {i}...")
-
-        ray.get([train_task, *study_workers, *practice_workers])
+        ray.get([train_task, *study_workers])
 
 
 if __name__ == "__main__":
