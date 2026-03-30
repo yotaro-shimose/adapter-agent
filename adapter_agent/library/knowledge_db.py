@@ -17,6 +17,11 @@ class KnowledgeDB:
         self.client = AsyncElasticsearch(hosts=[host])
         self.index_name = index_name
 
+    @classmethod
+    def for_experiment(cls, experiment_id: int, host: str = "http://localhost:9200") -> "KnowledgeDB":
+        """Create a KnowledgeDB instance with an index name scoped to the experiment ID."""
+        return cls(host=host, index_name=f"knowledge_box_{experiment_id}")
+
     async def initialize(self) -> None:
         """Create the index with BM25 settings if it doesn't exist."""
         exists = await self.client.indices.exists(index=self.index_name)
@@ -45,11 +50,12 @@ class KnowledgeDB:
                 }
             )
 
-    async def add_knowledge(self, query: str, title: str, content: str) -> str:
-        """Add a new knowledge entry and return the document ID."""
-        logger.info(f"Adding knowledge to '{self.index_name}' (title: {title}, query: {query})")
+    async def add_knowledge(self, id: int, query: str, title: str, content: str) -> str:
+        """Add a new knowledge entry using a stable Postgres ID and return the ES document ID."""
+        logger.info(f"Adding knowledge to '{self.index_name}' (id: {id}, title: {title}, query: {query})")
         res = await self.client.index(
             index=self.index_name,
+            id=str(id), # Use Postgres ID as the stable ES document ID
             document={
                 "query": query,
                 "title": title,

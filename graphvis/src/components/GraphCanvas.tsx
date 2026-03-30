@@ -81,6 +81,10 @@ interface GraphExportData {
   edges: GraphExportEdge[];
 }
 
+const API_BASE = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' 
+  ? 'http://localhost:8000' 
+  : `http://${window.location.hostname}:8000`;
+
 export const GraphCanvasComponent: React.FC = () => {
   const [data, setData] = useState<{ nodes: CustomNode[], links: CustomLink[] } | null>(null);
   const [displayData, setDisplayData] = useState<{ nodes: CustomNode[], links: CustomLink[] } | null>(null);
@@ -113,10 +117,19 @@ export const GraphCanvasComponent: React.FC = () => {
   }, []);
 
   const loadData = useCallback(async () => {
-    if (!selectedExperiment) return;
+    if (!selectedExperiment) {
+      setIsInitializing(false);
+      return;
+    }
     setError(null);
     try {
-      const response = await fetch(`http://localhost:8000/api/${encodeURIComponent(selectedExperiment)}/graph`);
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout
+
+      const response = await fetch(`${API_BASE}/api/${encodeURIComponent(selectedExperiment)}/graph`, {
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId);
       
       if (!response.ok) {
         throw new Error(`Server responded with ${response.status}: ${await response.text()}`);
@@ -211,8 +224,12 @@ export const GraphCanvasComponent: React.FC = () => {
       });
       setIsInitializing(false);
     } catch (err: any) {
-      console.error('CRITICAL: Failed to load graph data:', err);
-      setError(err.message || String(err));
+      if (err.name === 'AbortError') {
+        setError('Request timed out. The backend might be overloaded or unresponsive.');
+      } else {
+        console.error('CRITICAL: Failed to load graph data:', err);
+        setError(`Failed to load graph data: ${err.message || String(err)}. Check if backend is running at ${API_BASE}`);
+      }
       setData({ nodes: [], links: [] });
       setIsInitializing(false);
     }
@@ -232,15 +249,24 @@ export const GraphCanvasComponent: React.FC = () => {
 
   useEffect(() => {
     const fetchExps = () => {
-      fetch('http://localhost:8000/api/experiments')
-        .then(res => res.json())
+      fetch(`${API_BASE}/api/experiments`)
+        .then(res => {
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          return res.json();
+        })
         .then(data => {
           setExperiments(data);
           if (data.length > 0 && !selectedExperiment) {
             setSelectedExperiment(data[0]);
+          } else if (data.length === 0) {
+            setIsInitializing(false);
           }
         })
-        .catch(err => console.error("Failed to fetch experiments", err));
+        .catch(err => {
+          console.error("Failed to fetch experiments", err);
+          setError(`Could not connect to backend at ${API_BASE}. Make sure 'just vis' is running and port 8000 is accessible.`);
+          setIsInitializing(false);
+        });
     };
 
     fetchExps();
@@ -303,7 +329,7 @@ export const GraphCanvasComponent: React.FC = () => {
     if (selectedNode && selectedNode.type === 'task' && selectedExperiment) {
       setLoadingTraj(true);
       setTrajError(null);
-      fetch(`http://localhost:8000/api/${encodeURIComponent(selectedExperiment)}/trajectory/${encodeURIComponent(selectedNode.id)}`)
+      fetch(`${API_BASE}/api/${encodeURIComponent(selectedExperiment)}/trajectory/${encodeURIComponent(selectedNode.id)}`)
         .then(async res => {
           if (!res.ok) {
             throw new Error(`Failed to fetch trajectories: ${res.status} ${await res.text()}`);

@@ -14,6 +14,7 @@ model Experiment {
   graph_json      Json?        @default("{}")
   created_at      DateTime     @default(now())
   trajectories    Trajectory[]
+  knowledges      Knowledge[]
 
   @@map("experiments")
 }
@@ -23,7 +24,7 @@ model Trajectory {
   experiment            Experiment @relation(fields: [experiment_id], references: [id], onDelete: Cascade)
   experiment_id         Int
   task_id               String
-  knowledge_id          String?
+  knowledge_id          Int?       // Changed from String? to Int? to reference Knowledge table
   instruction          String?
   conclusion           String?
   reward               Float?
@@ -41,11 +42,27 @@ model Trajectory {
   @@index([experiment_id])
 }
 
+model Knowledge {
+  id            Int          @id @default(autoincrement())
+  experiment    Experiment   @relation(fields: [experiment_id], references: [id], onDelete: Cascade)
+  experiment_id Int
+  task_id       String
+  instruction   String
+  title         String
+  content       String
+  created_at    DateTime     @default(now())
+  citations     Citation[]   @relation("KnowledgeToCitation")
+
+  @@map("knowledge_base")
+  @@index([experiment_id])
+}
+
 model Citation {
   id             Int        @id @default(autoincrement())
   trajectory     Trajectory @relation(fields: [trajectory_id], references: [id], onDelete: Cascade)
   trajectory_id  Int
-  knowledge_id   String
+  knowledge_id   Int?       // Changed from Int? to reference Knowledge table
+  knowledge      Knowledge? @relation("KnowledgeToCitation", fields: [knowledge_id], references: [id])
   content        String?
   title          String?
   turn_index     Int        @default(0)

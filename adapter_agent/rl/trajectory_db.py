@@ -57,10 +57,16 @@ class TrajectoryDB:
         # 2. Create associated Citations if present
         if citations:
             for c in citations:
+                k_id = c.get("knowledge_id")
+                try:
+                    k_id_int = int(k_id) if k_id is not None else None
+                except (ValueError, TypeError):
+                    k_id_int = None
+                
                 await client.citation.create(
                     data={
                         "trajectory_id": new_traj.id,
-                        "knowledge_id": c["knowledge_id"],
+                        "knowledge_id": k_id_int,
                         "content": c.get("content"),
                         "title": c.get("title"),
                         "turn_index": c.get("turn_index", 0),
@@ -96,7 +102,14 @@ class TrajectoryDB:
 
             raw_json = t.trials_json
             # Messages is already a list/dict thanks to Prisma Json support
-            messages = raw_json
+            # We restore them to proper TinkerMessage objects so that Renderers can handle tool_calls correctly.
+            if isinstance(raw_json, list):
+                messages = [
+                    PydanticTinkerBaseMessage.model_validate(m).to_tinker_message()
+                    for m in raw_json
+                ]
+            else:
+                messages = []
 
             results.append(
                 {

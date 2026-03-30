@@ -60,6 +60,7 @@ class StudyActor:
     state: ActorHandle[UniRLState]
     env_params: EnvParams
     num_workers: int
+    experiment_id: int
     verifier_model: AgentsSDKModel = field(init=False, default=None)  # type: ignore
     rust_doc_analyzer: AsyncRustDocAnalyzer = field(init=False, default=None)  # type: ignore
     knowledge_db: KnowledgeDB = field(init=False, default=None)  # type: ignore
@@ -74,7 +75,7 @@ class StudyActor:
         self.rust_doc_analyzer = await AsyncRustDocAnalyzer.create_from_libdir(
             self.env_params.library.local_path
         )
-        self.knowledge_db = KnowledgeDB()
+        self.knowledge_db = KnowledgeDB.for_experiment(self.experiment_id)
         await self.knowledge_db.initialize()
         logger.info(f"Study actor {self.process_id} setup completed.")
 
@@ -305,7 +306,7 @@ async def main():
                 eps=1e-12,
             ),
             max_sft_reuse=15,
-            min_sft_batch_size=4,
+            min_sft_batch_size=32,
             max_sft_batch_size=128,
         ),
         log_freq=20,
@@ -390,6 +391,7 @@ async def main():
                     state,
                     cfg.env_params,
                     cfg.study_rollout_params.rollouts_per_actor,
+                    experiment_id,
                 ),
             )
 

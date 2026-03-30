@@ -174,10 +174,7 @@ async def ss_solve_verify(
 
                     if is_unique:
                         logger.info(
-                            f"Knowledge is unique, recording to KnowledgeDB. Reasoning: {uniqueness_reasoning}"
-                        )
-                        await knowledge_db.add_knowledge(
-                            task.instruction, knowledge_obj.title, knowledge_obj.content
+                            f"Knowledge is unique, reasoning: {uniqueness_reasoning}"
                         )
                     else:
                         logger.info(

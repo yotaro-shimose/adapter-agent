@@ -16,10 +16,15 @@ from tinker_cookbook.utils import ml_log
 from tinker_cookbook.utils.ml_log import Logger as MLLogger
 
 from adapter_agent.hierarchical.agent.task_verifier import TaskVerifier
-from adapter_agent.rl.env.session_result import RewireSessionResultNormal
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.rl.config import EnvParams, ExperimentSettings, ModelLoadingSettings
+from adapter_agent.library.knowledge_db import KnowledgeDB
 from adapter_agent.rl.env.conclusion import conclusion_to_metrics
+from adapter_agent.rl.env.session_result import (
+    RewireSessionResultNormal,
+    RewireSessionResultSuccess,
+)
+from adapter_agent.rl.postgres_db import get_db
 from adapter_agent.rl.shared_sampling_client import SharedSamplingClient
 from adapter_agent.rl.task_net import (
     StudyTaskCompleted,
@@ -29,7 +34,6 @@ from adapter_agent.rl.task_net import (
     TaskNetworkTask,
 )
 from adapter_agent.rl.trajectory_db import TrajectoryDB
-from adapter_agent.rl.postgres_db import get_db
 from adapter_agent.util.logger_util import setup_base_loglevel
 
 logger = logging.getLogger(__name__)
@@ -88,7 +92,9 @@ class TrajectoryReplayBuffer:
         count = await self.trajectory_db.get_count(self.max_sft_reuse)
         if count < self.min_sft_batch_size:
             # Added for visibility: only log occasionally if it's repeatedly empty
-            logger.info(f"Buffer check: {count}/{self.min_sft_batch_size} trajectories available. Training waiting...")
+            logger.info(
+                f"Buffer check: {count}/{self.min_sft_batch_size} trajectories available. Training waiting..."
+            )
             return None
 
         batch_size = self.max_sft_batch_size
@@ -97,7 +103,6 @@ class TrajectoryReplayBuffer:
             return None
 
         logger.info(f"Training Batch Ready! size: {len(items)}")
-
         datum = [
             conversation_to_datum(
                 item["messages"],
@@ -107,8 +112,10 @@ class TrajectoryReplayBuffer:
             )
             for item in items
         ]
-        
-        logger.info("Datum construction complete (conversation_to_datum finished). Returning batch...")
+
+        logger.info(
+            "Datum construction complete (conversation_to_datum finished). Returning batch..."
+        )
 
         tasks = {
             item["task_id"]: Counted(
@@ -205,6 +212,22 @@ class UniRLState:
         db = await get_db()
         await db.update_graph_json(self.experiment_id, self.study_task_queue.to_dict())
 
+        # Sync Knowledge from Postgres to ES (Postgres is SSOT)
+        knowledges = await db.get_knowledges(self.experiment_id)
+        if knowledges:
+            logger.info(f"Syncing {len(knowledges)} knowledge items from Postgres to ES...")
+            kdb = KnowledgeDB.for_experiment(self.experiment_id)
+            await kdb.initialize()
+            for k in knowledges:
+                await kdb.add_knowledge(
+                    id=k.id,
+                    query=k.instruction,
+                    title=k.title,
+                    content=k.content
+                )
+            await kdb.close()
+            logger.info("Knowledge sync complete.")
+
         # Also save to local data.json as backup
         log_root = self.cfg.experiment_setting.log_root()
         self.study_task_queue.save_json_sync(log_root / "data.json")
@@ -225,16 +248,42 @@ class UniRLState:
         if not isinstance(result, RewireSessionResultNormal):
             return
 
-        if result.reward > 0 or True: # Save all trajectories for visualization SSOT
+        if result.reward > 0 or True:  # Save all trajectories for visualization SSOT
+            # 1. Handle newly discovered knowledge (SSOT)
+            knowledge_id = None
+            if isinstance(result, RewireSessionResultSuccess) and result.knowledge:
+                db = await get_db()
+                # Save to Postgres first
+                knowledge_id = await db.create_knowledge(
+                    experiment_id=self.experiment_id,
+                    task_id=result.task.id,
+                    instruction=result.task.instruction,
+                    title=result.knowledge.title,
+                    content=result.knowledge.content,
+                )
+                # Then index in ES using the Postgres ID
+                kdb = KnowledgeDB.for_experiment(self.experiment_id)
+                await kdb.initialize()
+                await kdb.add_knowledge(
+                    id=knowledge_id,
+                    query=result.task.instruction,
+                    title=result.knowledge.title,
+                    content=result.knowledge.content,
+                )
+                await kdb.close()
+
+            # 2. Extract citations
             citations_data = [
                 {
                     "knowledge_id": c.knowledge_id,
                     "turn_index": c.turn_index,
                     "content": c.content,
-                    "title": c.title
+                    "title": c.title,
                 }
                 for c in result.citations
             ]
+            
+            # 3. Save trajectory with references to stable Knowledge IDs
             await self.buffer.trajectory_db.add_trajectory(
                 task_id=result.task.id,
                 instruction=result.task.instruction,
@@ -251,7 +300,9 @@ class UniRLState:
         if self.metric_manager.should_study_log():
             # Save to PostgreSQL for visualization
             db = await get_db()
-            await db.update_graph_json(self.experiment_id, self.study_task_queue.to_dict())
+            await db.update_graph_json(
+                self.experiment_id, self.study_task_queue.to_dict()
+            )
 
             # Also save to local log_root as backup if vis_json_path is set
             if self.cfg.vis_json_path:
@@ -287,7 +338,9 @@ class UniRLState:
             f"train/{k}" if not k.startswith("train/") else k: v
             for k, v in metrics.items()
         }
-        logger.info(f"Logging train metrics: {prefixed}") # Ensure it shows up in logs.log
+        logger.info(
+            f"Logging train metrics: {prefixed}"
+        )  # Ensure it shows up in logs.log
         self.ml_logger.log_metrics(prefixed)
 
     @ray.method

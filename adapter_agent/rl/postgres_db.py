@@ -61,6 +61,32 @@ class PostgresDB:
             }
         )
 
+    async def create_knowledge(
+        self,
+        experiment_id: int,
+        task_id: str,
+        instruction: str,
+        title: str,
+        content: str
+    ) -> int:
+        client = await self.get_client()
+        knowledge = await client.knowledge.create(
+            data={
+                "experiment_id": experiment_id,
+                "task_id": task_id,
+                "instruction": instruction,
+                "title": title,
+                "content": content,
+            }
+        )
+        return knowledge.id
+
+    async def get_knowledges(self, experiment_id: int):
+        client = await self.get_client()
+        return await client.knowledge.find_many(
+            where={"experiment_id": experiment_id}
+        )
+
     async def get_client(self) -> Prisma:
         if self._prisma is None or not self._prisma.is_connected():
             await self.connect()

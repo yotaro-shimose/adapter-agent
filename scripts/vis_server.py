@@ -76,18 +76,27 @@ async def get_graph(experiment_name: str):
             
     # Inject into graph_json
     graph = experiment.graph_json
-    if "nodes" in graph:
+    if isinstance(graph, dict) and "nodes" in graph and isinstance(graph["nodes"], list):
         for node in graph["nodes"]:
+            if not isinstance(node, dict):
+                continue
             tid = node.get("id")
+            if not tid or not isinstance(tid, str):
+                continue
+            
+            metadata = node.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+
             if tid in stats:
-                node["metadata"]["success_count"] = stats[tid]["success_count"]
-                node["metadata"]["total_count"] = stats[tid]["total_count"]
-                node["metadata"]["is_solved"] = stats[tid]["success_count"] > 0
+                metadata["success_count"] = stats[tid]["success_count"]
+                metadata["total_count"] = stats[tid]["total_count"]
+                metadata["is_solved"] = stats[tid]["success_count"] > 0
             else:
                 # If no records in DB, ensure counts are 0 to avoid drift from stale memory
-                node["metadata"]["success_count"] = 0
-                node["metadata"]["total_count"] = 0
-                node["metadata"]["is_solved"] = False
+                metadata["success_count"] = 0
+                metadata["total_count"] = 0
+                metadata["is_solved"] = False
                 
     return graph
 
@@ -118,12 +127,12 @@ async def get_trajectory(experiment_name: str, task_id: str):
             "id": t.id,
             "taskId": t.task_id,
             "instruction": t.task_id,
-            "conclusion": t.conclusion or "sft_data",
-            "reward": t.reward or 1.0,
+            "conclusion": t.conclusion if t.conclusion is not None else "n/a",
+            "reward": t.reward if t.reward is not None else 0.0,
             "trials": t.trials_json,
             "citations": [
                 {
-                    "knowledge_id": c.knowledge_id,
+                    "knowledge_id": str(c.knowledge_id) if c.knowledge_id is not None else None,
                     "content": c.content,
                     "title": c.title,
                     "turn_index": c.turn_index
