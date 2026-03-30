@@ -10,6 +10,7 @@ import { useFilteredGraph } from '../hooks/useFilteredGraph';
 import { ControlPanel } from './ControlPanel';
 import { DetailPanel } from './DetailPanel';
 
+import { getNodeLabel, truncateText, getNodeRadius } from '../utils';
 import { COLORS, FORCE_GRAPH_SETTINGS } from '../constants';
 import type { CustomNode } from '../types';
 import './GraphCanvas.css';
@@ -120,11 +121,10 @@ export const GraphCanvasComponent: React.FC = () => {
         nodeCanvasObject={(node, ctx, globalScale) => {
           const n = node as CustomNode;
           const m = n.metadata;
-          const label = n.type === 'knowledge' ? (m.knowledge_title || n.id) : m.instruction;
-          const truncated = label.length > 30 ? label.substring(0, 30) + '...' : label;
+          const label = getNodeLabel(n);
+          const truncated = truncateText(label, 30);
           const fontSize = 12 / globalScale;
-          const isPseudoRoot = n.id === 'pseudo_root';
-          const radius = isPseudoRoot ? 16 : (n.type === 'knowledge' ? 12 : 8);
+          const radius = getNodeRadius(n);
           
           ctx.font = `${fontSize}px system-ui`;
           if (selectedNode && selectedNode.id === n.id) {
@@ -140,6 +140,7 @@ export const GraphCanvasComponent: React.FC = () => {
           ctx.fillStyle = n.color;
           ctx.fill();
 
+          const isPseudoRoot = n.id === 'pseudo_root';
           if (n.type === 'knowledge') {
             ctx.font = `${fontSize * 1.5}px system-ui`;
             ctx.fillText('📚', n.x! - radius/2, n.y! + radius/2);
@@ -168,7 +169,7 @@ export const GraphCanvasComponent: React.FC = () => {
           const n = node as CustomNode;
           ctx.fillStyle = color;
           ctx.beginPath();
-          ctx.arc(n.x!, n.y!, 14, 0, 2 * Math.PI, false);
+          ctx.arc(n.x!, n.y!, getNodeRadius(n) + 4, 0, 2 * Math.PI, false);
           ctx.fill();
         }}
         linkColor={(link) => {

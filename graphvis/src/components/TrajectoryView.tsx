@@ -1,5 +1,6 @@
 import React from 'react';
 import ReactMarkdown from 'react-markdown';
+import { getTrajectoryContent } from '../utils';
 import type { TrajectoryData } from '../types';
 import './GraphCanvas.css';
 
@@ -75,13 +76,7 @@ export const TrajectoryView: React.FC<TrajectoryViewProps> = ({
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
         {currentTrajectory.trials.map((turn, i) => {
-          const contentStr = typeof turn.content === 'string' 
-            ? turn.content 
-            : Array.isArray(turn.content) 
-              ? turn.content.map((p: any) => 
-                  p.type === 'thinking' ? `<think>${p.thinking}</think>` : (p.text || '')
-                ).join('')
-              : String(turn.content || '');
+          const contentStr = getTrajectoryContent(turn);
 
           const isThought = turn.role === 'assistant' && contentStr.includes('<think>');
           const thoughtMatch = contentStr.match(/<think>([\s\S]*?)<\/think>/);

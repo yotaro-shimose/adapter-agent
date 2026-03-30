@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect } from 'react';
 import { API_BASE, COLORS } from '../constants';
+import { getNodeLabel } from '../utils';
 import type { CustomNode, CustomLink, GraphExportData } from '../types';
 
 export function useGraphData(selectedExperiment: string | null) {
@@ -28,18 +29,21 @@ export function useGraphData(selectedExperiment: string | null) {
       
       const json: GraphExportData = await response.json();
 
-      const taskNodes: CustomNode[] = json.nodes.map(n => ({
-        id: n.id,
-        label: n.id,
-        name: n.metadata.instruction,
-        val: 5,
-        metadata: {
-          ...n.metadata,
-          citations: n.metadata.citations || []
-        },
-        color: n.id === 'pseudo_root' ? COLORS.PSEUDO_ROOT : (n.type === 'knowledge' ? COLORS.KNOWLEDGE_NODE : (n.metadata.is_solved ? COLORS.SOLVED_TASK : n.metadata.is_executing ? COLORS.EXECUTING_TASK : COLORS.QUEUED_TASK)),
-        type: (n.type as any) || 'task'
-      }));
+      const taskNodes: CustomNode[] = json.nodes.map(n => {
+        const node: CustomNode = {
+          id: n.id,
+          label: n.id,
+          metadata: {
+            ...n.metadata,
+            citations: n.metadata.citations || []
+          },
+          color: n.id === 'pseudo_root' ? COLORS.PSEUDO_ROOT : (n.type === 'knowledge' ? COLORS.KNOWLEDGE_NODE : (n.metadata.is_solved ? COLORS.SOLVED_TASK : n.metadata.is_executing ? COLORS.EXECUTING_TASK : COLORS.QUEUED_TASK)),
+          type: (n.type as any) || 'task',
+          val: 5
+        };
+        node.name = getNodeLabel(node);
+        return node;
+      });
 
       const knowledge_ids = new Set<string>();
       taskNodes.forEach(tn => {
