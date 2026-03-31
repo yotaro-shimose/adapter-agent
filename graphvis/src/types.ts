@@ -12,6 +12,10 @@ export interface GraphNodeMetadata {
   slices: { question: string, answer: string, reasoning: string }[];
   knowledge_content?: string | null;
   knowledge_title?: string | null;
+  generator_task_id?: string;
+  generated_knowledge_id?: string;
+  unique_task_success_count?: number;
+  unique_task_total_count?: number;
 }
 
 export interface CustomNode extends NodeObject {

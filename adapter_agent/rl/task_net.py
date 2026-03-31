@@ -161,6 +161,7 @@ class GraphNodeMetadata(BaseModel):
     slices: list[dict[str, str]] = Field(default_factory=list)
     knowledge_content: str | None = None
     knowledge_title: str | None = None
+    generated_knowledge_id: str | None = None
 
 
 class GraphExportNode(BaseModel):
@@ -186,6 +187,7 @@ class NormalizedKnowledge(Entity):
     knowledge: str
     title: str = "Untitled Knowledge"
     slices: list[QRA] = Field(default_factory=list)
+    knowledge_id: str | None = None
 
 
 class PWParams(BaseModel):
@@ -591,10 +593,12 @@ class TaskNetwork:
 
             knowledge_content = None
             knowledge_title = None
+            generated_knowledge_id = None
             if node.is_sft_solved:
                 for k in node.knowledges.values():
                     knowledge_content = k.knowledge
                     knowledge_title = k.title
+                    generated_knowledge_id = k.knowledge_id or k.id
                     break
 
             metadata = GraphNodeMetadata(
@@ -617,6 +621,7 @@ class TaskNetwork:
                 slices=slices_data,
                 knowledge_content=knowledge_content,
                 knowledge_title=knowledge_title,
+                generated_knowledge_id=generated_knowledge_id,
             )
 
             nodes_exported.append(

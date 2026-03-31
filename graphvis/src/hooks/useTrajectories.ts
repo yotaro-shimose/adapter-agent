@@ -12,8 +12,14 @@ export function useTrajectories(selectedNode: CustomNode | null, selectedExperim
     if (selectedNode && selectedNode.type === 'task' && selectedExperiment) {
       setLoadingTraj(true);
       setTrajError(null);
-      fetch(`${API_BASE}/api/${encodeURIComponent(selectedExperiment)}/trajectory/${encodeURIComponent(selectedNode.id)}`)
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 120000);
+      
+      fetch(`${API_BASE}/api/${encodeURIComponent(selectedExperiment)}/trajectory/${encodeURIComponent(selectedNode.id)}`, {
+        signal: controller.signal
+      })
         .then(async res => {
+          clearTimeout(timeoutId);
           if (!res.ok) {
             throw new Error(`Failed to fetch trajectories: ${res.status}`);
           }
@@ -25,8 +31,13 @@ export function useTrajectories(selectedNode: CustomNode | null, selectedExperim
           setLoadingTraj(false);
         })
         .catch(err => {
-          console.error("Failed to fetch trajectory:", err);
-          setTrajError(err.message || String(err));
+          clearTimeout(timeoutId);
+          if (err.name === 'AbortError') {
+            setTrajError('Trajectory request timed out.');
+          } else {
+            console.error("Failed to fetch trajectory:", err);
+            setTrajError(err.message || String(err));
+          }
           setLoadingTraj(false);
           setTrajectories([]);
         });

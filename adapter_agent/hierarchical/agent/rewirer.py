@@ -43,14 +43,30 @@ def format_trajectory_transcript(
 
             tool_calls = msg.get("tool_calls", [])
             for call in tool_calls:
+                # Handle both object (from API) and dict (from JSON DB)
+                if isinstance(call, dict):
+                    fn = call.get("function", {})
+                    name = fn.get("name", "unknown")
+                    args = fn.get("arguments", "{}")
+                else:
+                    name = call.function.name
+                    args = call.function.arguments
+                
                 transcript_lines.append(
-                    f"[Tool Call: {call.function.name} - Args: {call.function.arguments}]"
+                    f"[Tool Call: {name} - Args: {args}]"
                 )
 
             unparsed_tool_calls = msg.get("unparsed_tool_calls", [])
             for call in unparsed_tool_calls:
+                if isinstance(call, dict):
+                    raw_text = call.get("raw_text", "n/a")
+                    error = call.get("error", "n/a")
+                else:
+                    raw_text = call.raw_text
+                    error = call.error
+
                 transcript_lines.append(
-                    f"[Unparsed Tool Call: Raw Text: {call.raw_text} - Error: {call.error}]"
+                    f"[Unparsed Tool Call: Raw Text: {raw_text} - Error: {error}]"
                 )
 
             transcript_lines.append("")

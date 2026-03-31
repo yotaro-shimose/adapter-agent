@@ -270,6 +270,11 @@ class UniRLState:
                     title=result.knowledge.title,
                     content=result.knowledge.content,
                 )
+                # Also update in-memory TaskNetwork knowledge ID for visualization mapping
+                task_meta = self.study_task_queue.nodes[result.task.id]
+                for k in task_meta.knowledges.values():
+                    k.knowledge_id = str(knowledge_id)
+
                 await kdb.close()
 
             # 2. Extract citations

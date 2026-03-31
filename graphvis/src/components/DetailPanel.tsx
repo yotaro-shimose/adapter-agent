@@ -1,6 +1,7 @@
 import React from 'react';
 import ReactMarkdown from 'react-markdown';
 import { TrajectoryView } from './TrajectoryView';
+import { COLORS } from '../constants';
 import type { CustomNode, CustomLink, TrajectoryData } from '../types';
 import './GraphCanvas.css';
 
@@ -65,18 +66,29 @@ export const DetailPanel: React.FC<DetailPanelProps> = ({
         <ReactMarkdown>{isKnowledge && m.knowledge_content ? m.knowledge_content : m.instruction}</ReactMarkdown>
       </div>
 
-      {!isKnowledge && (
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '15px', marginBottom: '25px' }}>
-          <div style={{ background: 'rgba(40, 167, 69, 0.15)', padding: '12px', borderRadius: '10px', borderLeft: '4px solid #28a745' }}>
-            <div style={{ fontSize: '11px', color: '#aaa', textTransform: 'uppercase', fontWeight: 'bold' }}>Success Rate</div>
-            <div style={{ fontSize: '20px', fontWeight: 'bold', color: '#28a745', marginTop: '4px' }}>{m.success_count}/{m.total_count}</div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '15px', marginBottom: '25px' }}>
+        <div style={{ background: isKnowledge ? 'rgba(155, 89, 182, 0.15)' : 'rgba(40, 167, 69, 0.15)', padding: '12px', borderRadius: '10px', borderLeft: `4px solid ${isKnowledge ? COLORS.KNOWLEDGE_NODE : '#28a745'}`, minWidth: '140px' }}>
+          <div style={{ fontSize: '11px', color: '#aaa', textTransform: 'uppercase', fontWeight: 'bold' }}>
+            {isKnowledge ? 'Utility Status' : 'Success Rate'}
           </div>
-          <div style={{ background: 'rgba(241, 196, 15, 0.15)', padding: '12px', borderRadius: '10px', borderLeft: '4px solid #f1c40f' }}>
-            <div style={{ fontSize: '11px', color: '#aaa', textTransform: 'uppercase', fontWeight: 'bold' }}>Status</div>
-            <div style={{ fontSize: '16px', fontWeight: 'bold', color: '#f1c40f', marginTop: '4px' }}>{m.is_solved ? '✅ Solved' : m.is_executing ? '⚡ Active' : '⏳ Queued'}</div>
+          <div style={{ marginTop: '8px' }}>
+            <div style={{ fontSize: '18px', fontWeight: 'bold', color: isKnowledge ? COLORS.KNOWLEDGE_NODE : '#28a745' }}>
+              {m.success_count}/{m.total_count} <span style={{ fontSize: '11px', fontWeight: 'normal', opacity: 0.7 }}>CITS</span>
+            </div>
+            {isKnowledge && (
+              <div style={{ fontSize: '18px', fontWeight: 'bold', color: isKnowledge ? COLORS.KNOWLEDGE_NODE : '#28a745', marginTop: '2px' }}>
+                {m.unique_task_success_count}/{m.unique_task_total_count} <span style={{ fontSize: '11px', fontWeight: 'normal', opacity: 0.7 }}>TSKS</span>
+              </div>
+            )}
           </div>
         </div>
-      )}
+        <div style={{ background: 'rgba(241, 196, 15, 0.15)', padding: '12px', borderRadius: '10px', borderLeft: '4px solid #f1c40f' }}>
+          <div style={{ fontSize: '11px', color: '#aaa', textTransform: 'uppercase', fontWeight: 'bold' }}>Status</div>
+          <div style={{ fontSize: '16px', fontWeight: 'bold', color: '#f1c40f', marginTop: '4px' }}>
+            {isKnowledge ? '✅ Verified' : m.is_solved ? '✅ Solved' : m.is_executing ? '⚡ Active' : '⏳ Queued'}
+          </div>
+        </div>
+      </div>
 
       {selectedNode.type === 'task' && (
         <TrajectoryView
@@ -90,32 +102,73 @@ export const DetailPanel: React.FC<DetailPanelProps> = ({
 
       {isKnowledge && (
         <div style={{ marginBottom: '24px' }}>
+          {m.generator_task_id && (
+            <div style={{ marginBottom: '20px' }}>
+              <div style={{ fontSize: '11px', color: '#888', textTransform: 'uppercase', marginBottom: '12px', fontWeight: 'bold' }}>
+                Originating Task
+              </div>
+              {(() => {
+                const genNode = allNodes.find(n => n.id === m.generator_task_id);
+                const isSolved = genNode?.metadata.is_solved;
+                return (
+                  <div 
+                    onClick={() => genNode && handleNodeSelect(genNode)}
+                    style={{
+                      background: 'rgba(97, 218, 251, 0.1)',
+                      padding: '12px',
+                      borderRadius: '8px',
+                      fontSize: '14px',
+                      borderLeft: `4px solid ${COLORS.PRIMARY_ACCENT}`,
+                      cursor: genNode ? 'pointer' : 'default',
+                      fontWeight: '500',
+                      display: 'flex',
+                      alignItems: 'flex-start',
+                      textAlign: 'left',
+                      gap: '10px'
+                    }}
+                  >
+                    <span style={{ marginTop: '2px' }}>{isSolved ? '✅' : '❌'}</span>
+                    <div style={{ flex: 1 }}>{genNode?.name || m.generator_task_id}</div>
+                  </div>
+                );
+              })()}
+            </div>
+          )}
+
           <div style={{ fontSize: '11px', color: '#888', textTransform: 'uppercase', marginBottom: '12px', fontWeight: 'bold' }}>
             Impacted Tasks
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
             {allLinks
               .filter(l => (typeof l.target === 'string' ? l.target : (l.target as any).id) === selectedNode.id)
+              // Exclude the generator if it's already shown as an origin
+              .filter(l => (typeof l.source === 'string' ? l.source : (l.source as any).id) !== m.generator_task_id)
               .map((l, i) => {
                 const sourceId = typeof l.source === 'string' ? l.source : (l.source as any).id;
                 const sourceNode = allNodes.find(n => n.id === sourceId);
+                const isSolved = sourceNode?.metadata.is_solved;
                 return (
                   <div 
                     key={i} 
                     onClick={() => sourceNode && handleNodeSelect(sourceNode)}
                     style={{
-                      background: 'rgba(255, 255, 255, 0.05)',
+                      background: isSolved ? 'rgba(40, 167, 69, 0.1)' : 'rgba(231, 76, 60, 0.1)',
                       padding: '10px',
                       borderRadius: '8px',
                       fontSize: '13px',
-                      borderLeft: '3px solid #61dafb',
+                      borderLeft: `3px solid ${isSolved ? COLORS.SOLVED_TASK : COLORS.ERROR}`,
                       cursor: sourceNode ? 'pointer' : 'default',
                       transition: 'background 0.2s',
                       textOverflow: 'ellipsis',
-                      overflow: 'hidden'
+                      overflow: 'hidden',
+                      display: 'flex',
+                      alignItems: 'flex-start',
+                      textAlign: 'left',
+                      gap: '8px'
                     }}
                   >
-                    {sourceNode?.name || sourceId}
+                    <span style={{ marginTop: '1px' }}>{isSolved ? '✅' : '❌'}</span>
+                    <div style={{ flex: 1 }}>{sourceNode?.name || sourceId}</div>
                   </div>
                 );
               })}
@@ -128,7 +181,7 @@ export const DetailPanel: React.FC<DetailPanelProps> = ({
           <div style={{ fontSize: '11px', color: '#888', textTransform: 'uppercase', marginBottom: '12px', fontWeight: 'bold' }}>
             Knowledge Slices ({m.slices.length})
           </div>
-          {m.slices.map((s, i) => (
+          {m.slices.map((s: any, i: number) => (
             <div key={i} style={{ borderBottom: '1px solid #333', padding: '16px 0' }}>
               <div style={{ fontSize: '14px', marginBottom: '8px', fontWeight: '500' }}>
                 <span style={{ color: '#61dafb', fontWeight: 'bold' }}>Q:</span> {s.question}

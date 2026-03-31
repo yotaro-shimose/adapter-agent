@@ -16,7 +16,7 @@ export function useGraphData(selectedExperiment: string | null) {
     setError(null);
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 10000);
+      const timeoutId = setTimeout(() => controller.abort(), 120000);
 
       const response = await fetch(`${API_BASE}/api/${encodeURIComponent(selectedExperiment)}/graph`, {
         signal: controller.signal
@@ -46,15 +46,47 @@ export function useGraphData(selectedExperiment: string | null) {
       });
 
       const knowledge_ids = new Set<string>();
+      const knowledge_stats_map = new Map<string, { 
+        total_citations: number, 
+        success_citations: number,
+        tasks_attempted: Set<string>,
+        tasks_solved: Set<string>
+      }>();
+      
       taskNodes.forEach(tn => {
-        tn.metadata.citations.forEach(c => knowledge_ids.add(c.knowledge_id));
+        tn.metadata.citations.forEach(c => {
+          knowledge_ids.add(c.knowledge_id);
+          const stats = knowledge_stats_map.get(c.knowledge_id) || { 
+            total_citations: 0, 
+            success_citations: 0, 
+            tasks_attempted: new Set<string>(), 
+            tasks_solved: new Set<string>() 
+          };
+          
+          stats.total_citations += 1;
+          if (tn.metadata.is_solved) {
+            stats.success_citations += 1;
+            stats.tasks_solved.add(tn.id);
+          }
+          stats.tasks_attempted.add(tn.id);
+          
+          knowledge_stats_map.set(c.knowledge_id, stats);
+        });
       });
 
       const taskNodeMap = new Map<string, CustomNode>();
       taskNodes.forEach(n => taskNodeMap.set(n.id, n));
 
+      const knowledgeIdToTaskId = new Map<string, string>();
+      taskNodes.forEach(tn => {
+        if (tn.metadata.generated_knowledge_id) {
+          knowledgeIdToTaskId.set(tn.metadata.generated_knowledge_id, tn.id);
+        }
+      });
+
       const knowledgeNodes: CustomNode[] = Array.from(knowledge_ids).map(kid => {
-        const sourceTask = taskNodeMap.get(kid);
+        const generatorTaskId = knowledgeIdToTaskId.get(kid);
+        const sourceTask = generatorTaskId ? taskNodeMap.get(generatorTaskId) : undefined;
         
         let capturedContent: string | null = null;
         let capturedTitle: string | null = null;
@@ -68,16 +100,25 @@ export function useGraphData(selectedExperiment: string | null) {
         });
 
         const knowledge_title = sourceTask?.metadata.knowledge_title || capturedTitle || `Knowledge ${kid}`;
+        const stats = knowledge_stats_map.get(kid) || { 
+          total_citations: 0, 
+          success_citations: 0, 
+          tasks_attempted: new Set<string>(), 
+          tasks_solved: new Set<string>() 
+        };
 
         return {
           id: kid,
           label: kid,
           name: knowledge_title,
-          val: 10,
+          // Scale by unique successful tasks as requested
+          val: 12 + stats.tasks_solved.size * 8, 
           metadata: {
             instruction: `Knowledge ID: ${kid}`,
-            success_count: 0,
-            total_count: 0,
+            success_count: stats.success_citations,
+            total_count: stats.total_citations,
+            unique_task_success_count: stats.tasks_solved.size,
+            unique_task_total_count: stats.tasks_attempted.size,
             is_solved: true,
             is_executing: false,
             slice_count: 0,
@@ -85,7 +126,8 @@ export function useGraphData(selectedExperiment: string | null) {
             citations: [],
             slices: [],
             knowledge_content: sourceTask?.metadata.knowledge_content || capturedContent,
-            knowledge_title: knowledge_title
+            knowledge_title: knowledge_title,
+            generator_task_id: generatorTaskId
           },
           color: COLORS.KNOWLEDGE_NODE,
           type: 'knowledge'

@@ -160,7 +160,10 @@ export const GraphCanvasComponent: React.FC = () => {
           ctx.font = `${fontSize}px system-ui`;
           ctx.fillText(truncated, n.x!, n.y! + radius + 8);
           
-          const stats = `${m.success_count}/${m.total_count}` + (m.gen_count > 0 ? ` 📂${m.gen_count}` : '');
+          const stats = n.type === 'knowledge' 
+            ? `Used: ${m.unique_task_success_count}/${m.unique_task_total_count} Tks`
+            : `${m.success_count}/${m.total_count}` + (m.gen_count > 0 ? ` 📂${m.gen_count}` : '');
+            
           ctx.font = `${fontSize * 0.8}px system-ui`;
           ctx.fillStyle = '#aaa';
           ctx.fillText(stats, n.x!, n.y! + radius + 10 + fontSize);

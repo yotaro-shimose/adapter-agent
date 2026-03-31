@@ -41,7 +41,13 @@ export const truncateText = (text: string, length: number): string => {
  * Calculates the radius for a node based on its type and role.
  */
 export const getNodeRadius = (node: CustomNode): number => {
-  if (node.id === 'pseudo_root') return 16;
-  if (node.type === 'knowledge') return 12;
-  return 8;
+  const m = node.metadata;
+  if (node.id === 'pseudo_root') return 24;
+  if (node.type === 'knowledge') {
+    // Knowledge nodes scale with broad utility (unique tasks successfully solved). 
+    // This highlights knowledge that is useful across different problem sets.
+    const taskScale = (m.unique_task_success_count || 0) * 6;
+    return Math.min(16 + taskScale, 48); // Min 16, Cap at 48
+  }
+  return 14; // Default task node radius
 };
