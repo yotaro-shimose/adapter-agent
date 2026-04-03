@@ -600,6 +600,16 @@ class AsyncRustDocAnalyzer:
         print_node(self.data.root, is_root=True)
         return "\n".join(lines)
 
+    def get_modules(self) -> List[str]:
+        """Return a list of all module names in the crate."""
+        modules = []
+        for item_id, item in self.data.index.items():
+            if "module" in item.inner:
+                name = self.resolve_full_name(item_id)
+                if name:
+                    modules.append(name)
+        return sorted(list(set(modules)))
+
     async def __aenter__(self):
         return self
 

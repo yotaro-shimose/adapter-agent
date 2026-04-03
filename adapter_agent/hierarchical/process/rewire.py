@@ -1,11 +1,11 @@
 import logging
 from typing import Any, cast
 
+import tinker
 from coder_mcp.runtime import CoderMCPRuntimeError
 from oai_utils.tinker import TinkerModel
-from adapter_agent.rl.env.session_result import Knowledge
 from tinker_cookbook.renderers.base import Message as TinkerMessage
-from tinker_cookbook.rl.types import Trajectory, Transition
+from tinker_cookbook.rl.types import TokensWithLogprobs, Trajectory, Transition
 
 from adapter_agent.hierarchical.agent.knowledge_normalizer import (
     AgentsSDKModel,
@@ -19,11 +19,11 @@ from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
 from adapter_agent.library.knowledge_db import KnowledgeDB
-from adapter_agent.rl.completer import TinkerMessageCompleter
 from adapter_agent.rl.env.reward import LLMAsAJudge
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.rl.env.session_result import (
     Citation,
+    Knowledge,
     RewireSessionResult,
     RewireSessionResultError,
     RewireSessionResultFailure,
@@ -52,9 +52,16 @@ async def ss_solve_verify(
     runtime_settings: RuntimeSettings,
     knowledge_db: KnowledgeDB,
     qwen_no_think: bool = False,
+    internalized_knowledge: str | None = None,
+    blocked_knowledge_ids: set[str] | None = None,
 ) -> RewireSessionResult:
     verifier = Verifier(model=verifier_model, rust_doc_analyzer=rust_doc_analyzer)
-    ss_state = SimplifiedSolverEnvState.numrs2(task=task, qwen_no_think=qwen_no_think)
+    ss_state = SimplifiedSolverEnvState.numrs2(
+        task=task,
+        qwen_no_think=qwen_no_think,
+        internalized_knowledge=internalized_knowledge,
+        blocked_knowledge_ids=blocked_knowledge_ids,
+    )
     try:
         async with runtime_settings.build_runtime() as runtime:
             async with build_simplified_solver_env(
@@ -67,40 +74,50 @@ async def ss_solve_verify(
                 max_turns=max_turns,
                 runtime=runtime,
             ) as env:
-                msg_env = cast(SimplifiedSolverEnv, env.message_env)
-
-                completer = TinkerMessageCompleter(
-                    solver_model.sampling_client,
-                    renderer=solver_model.renderer,
-                    max_tokens=None,  # type: ignore
-                )
-
-                ob = await msg_env.initial_observation()
+                # Use TokenEnv directly to handle prefilling
+                ob, stop = await env.initial_observation()
                 transitions = []
                 while True:
                     try:
-                        ac_message = await completer(ob)
-                        ac_with_logprobs = ac_message["tokens_with_logprobs"]
+                        # Sample from the model
+                        # We use sampling_client directly because ob is ModelInput (which supports prefill)
+                        sample_result = await solver_model.sampling_client.sample_async(
+                            prompt=ob,
+                            num_samples=1,
+                            sampling_params=tinker.SamplingParams(
+                                stop=stop,
+                                temperature=1.0,
+                            ),
+                        )
+                        sampled_tokens = sample_result.sequences[0].tokens
+                        ac_with_logprobs = TokensWithLogprobs(
+                            tokens=sampled_tokens,
+                            maybe_logprobs=sample_result.sequences[0].logprobs,
+                        )
                     except MaximumContextExceeded:
                         logger.debug(
                             "Maximum context length exceeded during the rewiring loop"
                         )
-                        ob.append(CONTEXT_EXCEEDED_MESSAGE)
+                        # Fallback to message env for recording the failure
+                        msg_env = cast(SimplifiedSolverEnv, env.message_env)
+                        msg_env.history.append(CONTEXT_EXCEEDED_MESSAGE)
                         trajectory = Trajectory(
                             transitions=transitions,
-                            final_ob=solver_model.renderer.build_generation_prompt(ob),
+                            final_ob=solver_model.renderer.build_generation_prompt(
+                                msg_env.history
+                            ),
                         )
                         return RewireSessionResultFailure(
                             task=task,
-                            trials=ob,
+                            trials=msg_env.history,
                             conclusion="context_length_exceeded",
                             trajectory=trajectory,
                         )
 
-                    model_input = solver_model.renderer.build_generation_prompt(ob)
-                    step_result = await msg_env.step(ac_message)
+                    model_input_before = ob
+                    step_result = await env.step(sampled_tokens)
                     transition = Transition(
-                        ob=model_input,
+                        ob=model_input_before,
                         ac=ac_with_logprobs,
                         reward=step_result.reward,
                         episode_done=step_result.episode_done,
@@ -109,20 +126,22 @@ async def ss_solve_verify(
                     )
                     transitions.append(transition)
 
-                    ob = step_result.next_messages
                     if step_result.episode_done:
                         break
 
+                msg_env = cast(SimplifiedSolverEnv, env.message_env)
                 trajectory = Trajectory(
                     transitions=transitions,
-                    final_ob=solver_model.renderer.build_generation_prompt(ob),
+                    final_ob=solver_model.renderer.build_generation_prompt(
+                        msg_env.history
+                    ),
                 )
 
                 knowledge_obj: Knowledge | None = None
 
                 # Extract citations from the trials
                 citations = []
-                for turn_idx, msg in enumerate(ob):
+                for turn_idx, msg in enumerate(msg_env.history):
                     msg_dict = cast(dict[str, Any], msg)
                     knowledge_id = msg_dict.get("knowledge_id")
                     if knowledge_id:
@@ -139,7 +158,7 @@ async def ss_solve_verify(
                     # Only attempt to extract normalized knowledge from successful trials
                     logger.info("Extracting normalized knowledge from trajectory...")
                     normalizer = KnowledgeNormalizer(model=verifier_model)
-                    knowledge_obj = await normalizer.normalize(ob)
+                    knowledge_obj = await normalizer.normalize(msg_env.history)
 
                     verification_result = await verify_normalized_knowledge(
                         runtime=runtime,
@@ -153,7 +172,7 @@ async def ss_solve_verify(
                         )
                         return RewireSessionResultFailure(
                             task=task,
-                            trials=ob,
+                            trials=msg_env.history,
                             conclusion="verification_failed",
                             trajectory=trajectory,
                             reasoning=verification_result.reasoning,
@@ -164,12 +183,13 @@ async def ss_solve_verify(
                     uniqueness_checker = KnowledgeUniquenessChecker(
                         model=verifier_model
                     )
-                    is_unique, uniqueness_reasoning = (
-                        await uniqueness_checker.check_uniqueness(
-                            new_knowledge=knowledge_obj.content,
-                            task=task,
-                            knowledge_db=knowledge_db,
-                        )
+                    (
+                        is_unique,
+                        uniqueness_reasoning,
+                    ) = await uniqueness_checker.check_uniqueness(
+                        new_knowledge=knowledge_obj.content,
+                        task=task,
+                        knowledge_db=knowledge_db,
                     )
 
                     if is_unique:
@@ -183,7 +203,7 @@ async def ss_solve_verify(
 
                     return RewireSessionResultSuccess(
                         task=task,
-                        trials=ob,
+                        trials=msg_env.history,
                         knowledge=knowledge_obj,
                         trajectory=trajectory,
                         reasoning=verification_result.reasoning,
@@ -192,8 +212,8 @@ async def ss_solve_verify(
                 else:
                     return RewireSessionResultFailure(
                         task=task,
-                        trials=ob,
-                        conclusion=step_result.conclusion,
+                        trials=msg_env.history,
+                        conclusion="rewire_failed",  # step_result from TokenEnv doesn't have conclusion
                         trajectory=trajectory,
                         knowledge=knowledge_obj,
                         citations=citations,

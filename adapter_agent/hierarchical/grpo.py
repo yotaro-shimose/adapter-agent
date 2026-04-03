@@ -1,32 +1,41 @@
 import logging
 
 import tinker
-from tinker_cookbook.rl.data_processing import (
-    assemble_training_data,
-    compute_advantages,
-)
 from tinker_cookbook.rl.types import TrajectoryGroup
 
 from adapter_agent.hierarchical.state import RLGroup
+from adapter_agent.rl.config import OptimizerParams
+from adapter_agent.rl.trajectory import prepare_minibatch_simplified
 
 logger = logging.getLogger(__name__)
 
 
+def _remove_mask(datum: tinker.Datum) -> tinker.Datum:
+    """
+    Remove the 'mask' field from loss_fn_inputs as it often causes 400 errors
+    with certain server-side loss functions like 'importance_sampling' or 'ppo'.
+    """
+    return tinker.Datum(
+        model_input=datum.model_input,
+        loss_fn_inputs={k: v for k, v in datum.loss_fn_inputs.items() if k != "mask"},
+    )
+
+
 async def compute_grpo_loss(
-    groups: list[RLGroup], training_client: tinker.TrainingClient
+    groups: list[RLGroup],
+    training_client: tinker.TrainingClient,
+    optimizer_params: OptimizerParams,
 ):
     """
-    Computes GRPO-like loss (using importance_sampling on server) for a list of RLGroups.
-    Prepares data using tinker_cookbook utilities.
+    Computes GRPO-like loss for a list of RLGroups.
+    Uses native adapter_agent trajectory processing for consistency.
     """
     if not groups:
-        return 0.0
+        return None
 
     # Convert RLGroup to TrajectoryGroup
     traj_groups = []
     for g in groups:
-        # RLGroup has trajectories and rewards.
-        # TrajectoryGroup expects metrics_G as well.
         metrics_G = [{} for _ in g.rewards]
         traj_groups.append(
             TrajectoryGroup(
@@ -36,20 +45,28 @@ async def compute_grpo_loss(
             )
         )
 
-    # Use tinker_cookbook to compute advantages and assemble data
-    # This ensures compatibility with "importance_sampling" loss on server
-    advantages = compute_advantages(traj_groups)
-    data_D, _ = assemble_training_data(traj_groups, advantages)
+    # Use native prepare_minibatch_simplified
+    # It handles internal advantage calculation and data assembly.
+    # Note: KL penalty is disabled here as requested.
+    data_D, _metrics = await prepare_minibatch_simplified(
+        trajectory_groups=traj_groups,
+        regularization=optimizer_params.advantage_regularizer,
+    )
 
     if not data_D:
         logger.warning("No valid training data assembled for GRPO step.")
-        return 0.0
+        return None
 
-    logger.info(f"Computing GRPO (importance_sampling) step with {len(data_D)} datums.")
+    logger.info(
+        f"Computing GRPO step with {len(data_D)} datums using loss_fn={optimizer_params.loss_fn}."
+    )
 
-    # Call training client with importance_sampling
+    # Strip mask to avoid 400 Bad Request on the server
+    clean_data_D = [_remove_mask(d) for d in data_D]
+
+    # Call training client
     fwd_bwd_future = await training_client.forward_backward_async(
-        data=data_D, loss_fn="importance_sampling"
+        data=clean_data_D, loss_fn=optimizer_params.loss_fn
     )
     result = await fwd_bwd_future.result_async()
     return result

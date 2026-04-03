@@ -32,10 +32,12 @@ def format_trajectory_transcript(
                                 transcript_lines.append("<think>")
                                 transcript_lines.append(thinking.strip())
                                 transcript_lines.append("</think>")
+                                transcript_lines.append("")
                         elif part.get("type") == "text":
                             text = part.get("text", "")
                             if isinstance(text, str) and text:
                                 transcript_lines.append(text)
+                                transcript_lines.append("")
             else:
                 content = get_text_content(msg)
                 transcript_lines.append(content)

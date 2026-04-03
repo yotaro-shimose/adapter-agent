@@ -36,11 +36,13 @@ class SearchTool(Tool):
         analyzer: AsyncRustDocAnalyzer,
         knowledge_db: KnowledgeDB,
         mutable_state: SimplifiedSolverMutableState,
+        blocked_knowledge_ids: set[str] = field(default_factory=set),
     ):
         self.search_model = search_model
         self.analyzer = analyzer
         self.knowledge_db = knowledge_db
         self.mutable_state = mutable_state
+        self.blocked_knowledge_ids = blocked_knowledge_ids
 
     @property
     def name(self) -> str:
@@ -89,10 +91,11 @@ class SearchTool(Tool):
         # Fetch more to ensure we have enough even after filtering
         db_results = await self.knowledge_db.search(query, limit=10)
         
-        # Filter out seen knowledge pieces
+        # Filter out seen knowledge pieces AND blocked knowledge pieces (internalized)
         unseen_results = [
             res for res in db_results 
-            if res["id"] not in self.mutable_state.seen_knowledge_ids
+            if res["id"] not in self.mutable_state.seen_knowledge_ids 
+            and res["id"] not in self.blocked_knowledge_ids
         ]
         
         # Take the top 3 unseen ones

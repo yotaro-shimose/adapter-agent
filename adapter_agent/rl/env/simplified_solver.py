@@ -12,7 +12,7 @@ from coder_mcp.runtime import (
 from tinker_cookbook.completers import StopCondition
 from tinker_cookbook.renderers import Renderer
 from tinker_cookbook.renderers.base import Message as TinkerMessage
-from tinker_cookbook.renderers.base import TextPart, ThinkingPart, ToolCall, ToolSpec
+from tinker_cookbook.renderers.base import TextPart, ToolCall, ToolSpec
 from tinker_cookbook.rl import types
 from tinker_cookbook.rl.message_env import (
     EnvFromMessageEnv,
@@ -32,7 +32,6 @@ from adapter_agent.rl.env.reward import LLMAsAJudgeSingleTurn
 from adapter_agent.rl.env.search_tool import SearchTool, SimplifiedSolverMutableState
 from adapter_agent.util.exception import CodingEnvironmentError
 
-
 CARGO_INIT_MAIN_RS = """\
 fn main() {
     println!("Hello, world!");
@@ -44,22 +43,25 @@ fn main() {
 class SimplifiedSolverEnvState:
     task: Task
     library_name: str
-    prethink: str | None
+    internalized_knowledge: str | None
     messages: list[TinkerMessage]
+    blocked_knowledge_ids: set[str] = field(default_factory=set)
     qwen_no_think: bool = False
 
     @classmethod
     def numrs2(
         cls,
         task: Task,
-        prethink: str | None = None,
+        internalized_knowledge: str | None = None,
+        blocked_knowledge_ids: set[str] | None = None,
         qwen_no_think: bool = False,
     ) -> Self:
         return cls(
             task=task,
             library_name="numrs2",
-            prethink=prethink,
+            internalized_knowledge=internalized_knowledge,
             messages=[],
+            blocked_knowledge_ids=blocked_knowledge_ids or set(),
             qwen_no_think=qwen_no_think,
         )
 
@@ -67,8 +69,9 @@ class SimplifiedSolverEnvState:
         return self.__class__(
             task=self.task,
             library_name=self.library_name,
-            prethink=self.prethink,
+            internalized_knowledge=self.internalized_knowledge,
             messages=messages,
+            blocked_knowledge_ids=self.blocked_knowledge_ids,
             qwen_no_think=self.qwen_no_think,
         )
 
@@ -76,7 +79,6 @@ class SimplifiedSolverEnvState:
 @dataclass
 class SSStepResult(MessageStepResult):
     conclusion: SSConclusion = field(default="not_finished")
-
 
 
 @dataclass
@@ -97,6 +99,7 @@ class SimplifiedSolverEnv(MessageEnv):
             self.rust_doc_analyzer,
             self.knowledge_db,
             self.mutable_state,
+            blocked_knowledge_ids=self.initial_state.blocked_knowledge_ids,
         )
         self.tools = {
             search_tool.name: search_tool,
@@ -233,8 +236,10 @@ You create a solution using simple playground to find the correct code.
 
 <Context>
 You are working in a cargo-initialized project.
-You need to solve the problem using `{env_state.library_name}` library which is already installed as a dependency (e.g. via `cargo add`).
-Note `{env_state.library_name}` is a new library you should be unfamilier with.
+You are an **expert** in the `{env_state.library_name}` library. 
+You possess **deep internalized technical knowledge** of this library. 
+Before using the `search` tool, you MUST consult your own internal reasoning (thoughts) to retrieve API signatures, patterns, and rules. 
+Only search for highly specific details or error resolutions that are not already present in your memory.
 </Context>
 
 <HowTo>
@@ -256,11 +261,12 @@ Note: Outputting a `<submit> ... </submit>` block will IMMEDIATELY SUBMIT your a
 
     guidelines = """\
 Verification: Once again, you MUST verify your answer. You should make your best efforts to avoid hallucination and make sure your answer is correct.
-Self-contained: Note your solution has to be fully self-contained including both fully functioning source code and explanation.
+Self-contained: Note your solution has been fully self-contained including both fully functioning source code and explanation.
 Testing Code: Before submitting the final answer, use the `<write_and_run>...</write_and_run>` tags to test code and see outputs. Avoid JSON syntax errors.
 Code block inclusion: Your final answer MUST include exactly one `<submit>\\n<your_code_here>\\n</submit>` block. Its content will be pasted to main.rs and executed for final verification to END the task.
-Simple Search Keyword: When using the `search` tool, try asking full questions or simple keywords to best determine library logic.
-Error Reflection: If `<write_and_run>` test fails, analyze the compiler error carefully. When you find your understanding about the library is wrong, use the `search` tool again.
+Trust Internal Knowledge: Favor your internalized recollections (summarized in your initial thoughts) over repetitive searching. Use the `search` tool only for details you don't already possess.
+Avoid Redundant Search: The number of `search` calls is strictly limited. Avoid repeated or redundant queries for information already provided or recalled in your thoughts.
+Error Reflection: If `<write_and_run>` test fails, analyze the compiler error carefully. If you find your understanding is flawed, use the `search` tool sparingly to fill specific gaps.
 """
     PROMPT += f"\n<Guidelines>\n{guidelines}\n</Guidelines>"
 
@@ -291,7 +297,7 @@ class SimplifiedSolverTokenEnv(EnvFromMessageEnv):
         self,
         renderer: Renderer,
         message_env: SimplifiedSolverEnv,
-        prethink: str | None = None,
+        internalized_knowledge: str | None = None,
         failed_parse_reward: float = -1.0,
         terminate_on_parse_error: bool = True,
         max_trajectory_tokens: int | None = None,
@@ -303,14 +309,15 @@ class SimplifiedSolverTokenEnv(EnvFromMessageEnv):
             terminate_on_parse_error=terminate_on_parse_error,
             max_trajectory_tokens=max_trajectory_tokens,
         )
-        self.prethink = prethink
+        self.internalized_knowledge = internalized_knowledge
 
     async def get_state(self) -> SimplifiedSolverEnvState:
         return await self.message_env.get_state()  # type: ignore
 
     async def initial_observation(self) -> tuple[tinker.ModelInput, StopCondition]:
         messages = await self.message_env.initial_observation()
-        prefill = f"<think>{self.prethink}</think>" if self.prethink else None
+        # No tags, just raw technical fact statement to start the response
+        prefill = self.internalized_knowledge
         return self.renderer.build_generation_prompt(
             messages, prefill=prefill
         ), self._base_stop_condition
@@ -329,20 +336,23 @@ class SimplifiedSolverTokenEnv(EnvFromMessageEnv):
                 metrics={"parse_error": 1.0},
             )
 
-        if self.prethink:
+        if self.internalized_knowledge:
             if isinstance(assistant_message["content"], str):
                 assistant_message["content"] = [
                     TextPart(type="text", text=assistant_message["content"])
                 ]
+
+            # Prepend the internalized knowledge (plain text context) to the first TextPart
+            # Or add it as the very first part if preferred.
             assistant_content = [
-                ThinkingPart(
-                    type="thinking",
-                    thinking=self.prethink,
+                TextPart(
+                    type="text",
+                    text=self.internalized_knowledge,
                 ),
                 *assistant_message["content"],
             ]
             assistant_message["content"] = assistant_content
-            self.prethink = None
+            self.internalized_knowledge = None
 
         msg_step = await self.message_env.step(assistant_message)
         next_observation = self.renderer.build_generation_prompt(msg_step.next_messages)
@@ -415,7 +425,7 @@ async def build_simplified_solver_env(
     yield SimplifiedSolverTokenEnv(
         renderer=renderer,
         message_env=msg_env,
-        prethink=env_state.prethink,
+        internalized_knowledge=env_state.internalized_knowledge,
         failed_parse_reward=-1.0,
         max_trajectory_tokens=max_trajectory_tokens,
     )
