@@ -26,6 +26,8 @@ logging.basicConfig(
 logging.getLogger("adapter_agent").setLevel(logging.DEBUG)
 # Also grpo.py uses the module logger
 logging.getLogger("adapter_agent.hierarchical.grpo").setLevel(logging.DEBUG)
+# Suppress noisy coder_mcp logs
+logging.getLogger("coder_mcp.runtime.runtime").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 

@@ -68,22 +68,27 @@ class GeneratorAgent[T: AgentsSDKModel](BaseAgent[T]):
 
         prompt = f"""\
 <Role>
-You are an expert Rust software architect and technical educator.
-Your task is to generate a high-quality {mode_desc} based on the provided API documentation.
+You are an expert Rust software architect who has already mastered the library.
+Your task is to generate a high-quality {mode_desc}.
 </Role>
 
 <Objective>
-- Create a realistic coding challenge (Question) that test the understanding of the API.
-- The task should be solvable using only the information in the provided documentation.
-- The code (Answer) should be correct, idiomatic Rust.
-{"- The reasoning ($R$) should explain the thought process, API choices, and logic flow." if is_sft else "- Even in RL mode, you must provide an Answer to ensure the question is definitely solvable."}
+- Create a realistic coding challenge (Question) that tests the understanding of the API.
+- The code (Answer) must be correct, idiomatic Rust, and the execution results should clearly demonstrate that it works as intended.
+{"- The reasoning ($R$) should reflect your internalized thought process, API choices, and logic flow." if is_sft else "- Even in RL mode, you must provide an Answer to ensure the question is definitely solvable."}
 </Objective>
 
+<Persona & Knowledge State>
+- **Internalized Expertise**: Speak and reason from the perspective of an expert who has already integrated the library's concepts. 
+- **No Meta-References**: Avoid any mention of "the provided documentation," "the overview," or "the text." Use direct first-person reasoning (e.g., "I will use...", "I need to...").
+- **Professional Intuition**: Your reasoning should reflect professional intuition and problem-solving flow, even if the technical facts are technically provided in the context.
+</Persona & Knowledge State>
+
 <Guidelines>
-1. **Focus on the provided API**. Do not create tasks that ignore the specific library being taught.
-2. **Solvability**. Ensure all types and methods used in the Answer are present in the Crate Overview.
-3. **Complexity**. The task should not be trivial (like "print hello"), but should demonstrate meaningful usage of the API.
-4. **Reliability**. All code generated MUST be valid Rust.
+1. **Focus on the Library**. Design tasks that require meaningful application of the specific library's features.
+2. **Solvability**. Ensure all types and methods used are technically accurate according to the provided overview.
+3. **Verifiability**. Ensure the generated code produces clear output during execution so that its correctness can be easily verified from the resulting execution logs.
+4. **Reliability**. All code generated MUST be valid, compilable Rust.
 </Guidelines>
 
 <OutputFormat>

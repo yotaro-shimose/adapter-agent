@@ -2,15 +2,18 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, cast
-
-from more_itertools import chunked
-
 
 import tinker
+import wandb
+from more_itertools import chunked
 from oai_utils.agent import AgentsSDKModel
+from oai_utils.async_utils import gather_with_semaphore
 from oai_utils.tinker import TinkerModel, setup_tinkermodel
 from oai_utils.tinker.model_helper import get_tokenizer_renderer
+from rich.console import Console, Group
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.rule import Rule
 from tinker_cookbook.renderers import Message, TextPart, ThinkingPart, TrainOnWhat
 from tinker_cookbook.rl.types import TokensWithLogprobs, Trajectory, Transition
 from tinker_cookbook.supervised.data import conversation_to_datum
@@ -21,6 +24,7 @@ from adapter_agent.data import QA, QRA
 from adapter_agent.hierarchical.agent.generator import GeneratorAgent
 from adapter_agent.hierarchical.agent.solver import SolverAgent
 from adapter_agent.hierarchical.agent.verifier import Verifier
+from adapter_agent.hierarchical.grpo import compute_grpo_loss
 from adapter_agent.hierarchical.state import RLGroup
 from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
 from adapter_agent.rl.config import (
@@ -33,8 +37,9 @@ from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.util.parsing import extract_rust_code
 
 logger = logging.getLogger(__name__)
-# Suppress noisy LiteLLM logs
+# Suppress noisy logs
 logging.getLogger("LiteLLM").setLevel(logging.WARNING)
+logging.getLogger("coder_mcp.runtime.runtime").setLevel(logging.WARNING)
 
 
 @dataclass
@@ -62,6 +67,33 @@ class RLTrajectory:
     success: bool
 
 
+@dataclass
+class RolloutMetadata:
+    ac: TokensWithLogprobs
+    qra: QRA | None
+
+
+@dataclass
+class SFTStepResult:
+    representative_sample: RLTrajectory | None
+    qra_list: list[QRA]
+
+
+@dataclass
+class TaskRolloutResult:
+    num_success: int
+    num_rollouts: int
+    group: RLGroup | None
+    sample: RLTrajectory | None
+
+
+@dataclass
+class RLStepResult:
+    rollout_success_ratio: float
+    task_success_ratio: float
+    sample: RLTrajectory | None
+
+
 class InternalizationPipeline:
     def __init__(
         self,
@@ -82,9 +114,9 @@ class InternalizationPipeline:
         )
 
         # Training/Solver (Initialized in setup)
-        self.training_client: Optional[tinker.TrainingClient] = None
-        self.service_client: Optional[tinker.ServiceClient] = None
-        self.ml_logger: Optional[MLLogger] = None
+        self.training_client: tinker.TrainingClient | None = None
+        self.service_client: tinker.ServiceClient | None = None
+        self.ml_logger: MLLogger | None = None
 
     async def setup(self):
         """
@@ -135,8 +167,6 @@ class InternalizationPipeline:
         )
 
         if self.ml_logger:
-            import wandb
-
             self._samples_table = wandb.Table(
                 columns=["Iteration", "Question", "Reasoning", "Code", "Success"]
             )
@@ -158,29 +188,31 @@ class InternalizationPipeline:
             iteration += 1
             logger.info(f"--- Iteration {iteration} ---")
 
-            # Step 1: Conditional SFT (Warm up / Recovery)
+            # Phase 1: Conditional SFT (Warm up / Recovery)
             # Skip SFT if task success ratio is at least 50%
-            sft_sample = None
+            sft_result: SFTStepResult | None = None
             if task_success_ratio < 0.5:
-                sft_sample, sft_tasks = await self.execute_sft_step()
+                sft_result = await self.execute_sft_step()
                 eval_tasks = [
                     QA(question=t.question, answer=t.answer)
-                    for t in sft_tasks[: self.config.k_rl]
+                    for t in sft_result.qra_list[: self.config.k_rl]
                 ]
             else:
                 logger.info(
                     f"Skipping SFT Step (Task Success: {task_success_ratio:.2%}). Generating fresh tasks..."
                 )
-                # Still generate tasks using the teacher to maintain quality
                 fresh_tasks = await self.generate_teacher_tasks(self.config.k_rl)
-                eval_tasks = [QA(question=t.question, answer=t.answer) for t in fresh_tasks]
+                eval_tasks = [
+                    QA(question=t.question, answer=t.answer) for t in fresh_tasks
+                ]
 
-            # Step 2: RL (Exploration / Correction)
-            (rollout_success_ratio, task_success_ratio, rl_sample) = (
-                await self.execute_rl_step(eval_tasks=eval_tasks)
-            )
+            # Phase 2: RL (Exploration / Correction)
+            rl_result = await self.execute_rl_step(eval_tasks=eval_tasks)
 
-            # Step 3: W&B Iteration Summary
+            rollout_success_ratio = rl_result.rollout_success_ratio
+            task_success_ratio = rl_result.task_success_ratio
+
+            # Phase 3: W&B Iteration Summary
             self._log_metrics(
                 "overall",
                 {
@@ -188,10 +220,14 @@ class InternalizationPipeline:
                     "task_success_ratio": task_success_ratio,
                 },
             )
-            self._update_wandb_table(iteration, rl_sample)
+            self._update_wandb_table(iteration, rl_result.sample)
 
-            # Step 4: Visualization / Logging
-            self._visualize_iteration(iteration, sft_sample, rl_sample)
+            # Phase 4: Visualization / Logging
+            self._visualize_iteration(
+                iteration,
+                sft_result.representative_sample if sft_result else None,
+                rl_result.sample,
+            )
 
             logger.info(
                 f"Iteration {iteration} complete. "
@@ -199,27 +235,28 @@ class InternalizationPipeline:
                 f"Task Success: {task_success_ratio:.2%}"
             )
 
-
-    async def generate_teacher_tasks(self, count: int) -> List[QRA]:
+    async def generate_teacher_tasks(self, count: int) -> list[QRA]:
         """
         Generate and verify high-quality QRA tasks using the teacher model.
         """
         logger.info(f"Teacher generating {count} high-quality tasks...")
         topic_hint = self.config.api_doc_path.stem
 
-        # 1. Generate
-        async def generate_task(_):
-            return await self.generator.generate_sft(topic_hint=topic_hint)
-
-        tasks_raw: List[QRA] = await self._run_parallel(generate_task, range(count))
+        tasks = [
+            self.generator.generate_sft(topic_hint=topic_hint) for _ in range(count)
+        ]
+        tasks_raw: list[QRA] = await gather_with_semaphore(
+            tasks, max_concurrent=self.config.concurrency
+        )
 
         # 2. Verify
         logger.info(f"Verifying {len(tasks_raw)} teacher-generated tasks...")
-
-        async def verify_task(qra: QRA):
-            return await self._verify_with_execution(qra.question, qra)
-
-        results: List[RLTrajectory] = await self._run_parallel(verify_task, tasks_raw)
+        verification_tasks = [
+            self._verify_with_execution(qra.question, qra) for qra in tasks_raw
+        ]
+        results: list[RLTrajectory] = await gather_with_semaphore(
+            verification_tasks, max_concurrent=self.config.concurrency
+        )
 
         # 3. Handle failures? For now, we return all, but verifier result in QRA is important.
         # Actually, let's filter only successful ones to ensure RL always has valid data.
@@ -233,386 +270,332 @@ class InternalizationPipeline:
 
         return valid_tasks
 
-    async def execute_sft_step(self) -> tuple[Optional[RLTrajectory], List[QRA]]:
+    async def execute_sft_step(self) -> SFTStepResult:
         """
         Generate QRA tasks and perform supervised fine-tuning.
         """
         logger.info("Executing SFT Step...")
         assert self.training_client is not None, "TrainingClient must be initialized"
 
-        # 1. Generate & Verify teacher tasks
         qra_list = await self.generate_teacher_tasks(self.config.k_sft)
-        teacher_success_ratio = len(qra_list) / self.config.k_sft if self.config.k_sft else 0
+        teacher_success_ratio = (
+            len(qra_list) / self.config.k_sft if self.config.k_sft else 0
+        )
         self._log_metrics("sft", {"teacher_success_ratio": teacher_success_ratio})
 
-        # Find a representative successful sample for logging
-        # We need to re-verify or just take the first one if we want RLTrajectory
-        # Actually, generate_teacher_tasks returns QRA, not RLTrajectory.
-        # Let's perform a single verification again for the representative if needed,
-        # or update generate_teacher_tasks to return both.
-        # For simplicity, we just use the first valid QRA to create a dummy RLTrajectory
-        # for logging purposes in visualize_iteration.
-        representative_sft_sample = None
+        representative_sample = None
         if qra_list:
-            # We'll just run one verification to get the full RLTrajectory record
-            representative_sft_sample = await self._verify_with_execution(
+            representative_sample = await self._verify_with_execution(
                 qra_list[0].question, qra_list[0]
             )
+            await self._perform_sft_training(qra_list)
 
-        # 3. Train on successful tasks
-        if qra_list:
-            logger.info(
-                f"Fine-tuning student on {len(qra_list)}/{self.config.k_sft} VALID QRA samples..."
+        return SFTStepResult(
+            representative_sample=representative_sample, qra_list=qra_list
+        )
+
+    async def _perform_sft_training(self, qra_list: list[QRA]):
+        logger.info(
+            f"Fine-tuning student on {len(qra_list)}/{self.config.k_sft} VALID QRA samples..."
+        )
+
+        assert self.training_client is not None
+        _, renderer = get_tokenizer_renderer(
+            self.training_client, self.config.model_loading_settings.model_name
+        )
+
+        datums = [
+            conversation_to_datum(
+                conversation=[
+                    Message(role="user", content=qra.question),
+                    Message(
+                        role="assistant",
+                        content=[
+                            ThinkingPart(type="thinking", thinking=qra.reasoning),
+                            TextPart(type="text", text=f"\n\n{qra.answer}"),
+                        ],
+                    ),
+                ],
+                renderer=renderer,
+                train_on_what=TrainOnWhat.LAST_ASSISTANT_MESSAGE,
+                max_length=None,
             )
+            for qra in qra_list
+        ]
 
-            _, renderer = get_tokenizer_renderer(
-                self.training_client, self.config.model_loading_settings.model_name
-            )
+        await self._run_sft_training_loop(datums)
 
-            datums = [
-                conversation_to_datum(
-                    conversation=[
-                        Message(role="user", content=qra.question),
-                        Message(
-                            role="assistant",
-                            content=[
-                                ThinkingPart(type="thinking", thinking=qra.reasoning),
-                                TextPart(type="text", text=f"\n\n{qra.answer}"),
-                            ],
-                        ),
-                    ],
-                    renderer=renderer,
-                    train_on_what=TrainOnWhat.LAST_ASSISTANT_MESSAGE,
-                    max_length=None,
+    async def _run_sft_training_loop(self, datums: list):
+        params = self.config.sft_optimizer_params
+        batches = list(chunked(datums, params.batch_size))
+
+        assert self.training_client is not None
+        logger.info("Initializing SFT training loop with look-ahead...")
+        fwd_bwd_future = await self.training_client.forward_backward_async(
+            data=batches[0], loss_fn="cross_entropy"
+        )
+        optim_future = await self.training_client.optim_step_async(params.adam_params)
+
+        for epoch in range(params.num_epochs):
+            for step, _ in enumerate(batches):
+                # Enqueue next
+                next_ep, next_st = self._get_next_batch_idx(
+                    epoch, step, len(batches), params.num_epochs
                 )
-                for qra in qra_list
-            ]
-
-            batch_size = self.config.sft_optimizer_params.batch_size
-            num_epochs = self.config.sft_optimizer_params.num_epochs
-            adam_params = self.config.sft_optimizer_params.adam_params
-
-            batches = list(chunked(datums, batch_size))
-
-            # Helper to get next batch index (epoch, step)
-            def get_next_batch_idx(ep: int, st: int) -> tuple[int | None, int | None]:
-                if st + 1 < len(batches):
-                    return ep, st + 1
-                elif ep + 1 < num_epochs:
-                    return ep + 1, 0
-                return None, None
-
-            # 1. Enqueue the very first batch
-            logger.info("Initializing SFT training loop with look-ahead...")
-            fwd_bwd_future = await self.training_client.forward_backward_async(
-                data=batches[0], loss_fn="cross_entropy"
-            )
-            optim_future = await self.training_client.optim_step_async(adam_params)
-
-            # 2. Asynchronous look-ahead loop
-            for epoch in range(num_epochs):
-                for step, _ in enumerate(batches):
-                    # Enqueue NEXT step before awaiting current
-                    next_ep, next_st = get_next_batch_idx(epoch, step)
-                    if next_ep is not None and next_st is not None:
-                        next_fwd_bwd_future = (
-                            await self.training_client.forward_backward_async(
-                                data=batches[next_st], loss_fn="cross_entropy"
-                            )
+                if next_ep is not None and next_st is not None:
+                    next_fwd_bwd_future = (
+                        await self.training_client.forward_backward_async(
+                            data=batches[next_st], loss_fn="cross_entropy"
                         )
-                        next_optim_future = (
-                            await self.training_client.optim_step_async(adam_params)
-                        )
-                    else:
-                        next_fwd_bwd_future = None
-                        next_optim_future = None
-
-                    # Await CURRENT step results
-                    assert fwd_bwd_future is not None
-                    assert optim_future is not None
-
-                    fwd_bwd_result = await fwd_bwd_future.result_async()
-                    await optim_future.result_async()
-
-
-                    # Log metrics
-                    # Prefix by epoch for trend tracking
-                    self._log_metrics(
-                        f"sft/epoch_{epoch + 1}/step_{step + 1}", fwd_bwd_result.metrics
                     )
-                    # Global SFT logs
-                    self._log_metrics("sft", fwd_bwd_result.metrics)
+                    next_optim_future = await self.training_client.optim_step_async(
+                        params.adam_params
+                    )
+                else:
+                    next_fwd_bwd_future = next_optim_future = None
 
-                    # Find appropriate loss metric (handle 'loss', 'loss:sum', etc.)
-                    current_loss = fwd_bwd_result.metrics.get("loss")
-                    if current_loss is None:
-                        for k, v in fwd_bwd_result.metrics.items():
-                            if k.startswith("loss"):
-                                current_loss = v
-                                break
+                # Await current
+                if fwd_bwd_future is not None:
+                    fwd_bwd_result = await fwd_bwd_future.result_async()
+                    assert optim_future is not None
+                    await optim_future.result_async()
+                    self._log_sft_metrics(
+                        epoch, step, len(batches), fwd_bwd_result, params.num_epochs
+                    )
 
-                    if step % 5 == 0:
-                        logger.info(
-                            f"SFT Epoch {epoch + 1}/{num_epochs}, Step {step + 1}/{len(batches)}: "
-                            f"loss={current_loss if current_loss is not None else 'N/A'}"
-                        )
+                fwd_bwd_future, optim_future = next_fwd_bwd_future, next_optim_future
 
+        logger.info(f"SFT Step complete after {params.num_epochs} epochs.")
 
-                    # Move next to current
-                    fwd_bwd_future = next_fwd_bwd_future
-                    optim_future = next_optim_future
+    def _get_next_batch_idx(
+        self, epoch: int, step: int, num_batches: int, num_epochs: int
+    ) -> tuple[int | None, int | None]:
+        if step + 1 < num_batches:
+            return epoch, step + 1
+        elif epoch + 1 < num_epochs:
+            return epoch + 1, 0
+        return None, None
 
+    def _log_sft_metrics(
+        self, epoch: int, step: int, num_batches: int, result, total_epochs: int
+    ):
+        self._log_metrics(f"sft/epoch_{epoch + 1}/step_{step + 1}", result.metrics)
+        self._log_metrics("sft", result.metrics)
 
-            logger.info(f"SFT Step complete after {num_epochs} epochs.")
+        loss = result.metrics.get("loss")
+        if loss is None:
+            loss = next(
+                (v for k, v in result.metrics.items() if k.startswith("loss")), "N/A"
+            )
 
-        return (representative_sft_sample, qra_list)
+        if step % 5 == 0:
+            logger.info(
+                f"SFT Epoch {epoch + 1}/{total_epochs}, Step {step + 1}/{num_batches}: loss={loss}"
+            )
 
-    async def execute_rl_step(
-        self, eval_tasks: Optional[List[QA]] = None
-    ) -> tuple[float, float, Optional[RLTrajectory]]:
+    async def execute_rl_step(self, eval_tasks: list[QA] | None = None) -> RLStepResult:
         """
         Generate evaluation tasks, rollout solutions, verify (with execution), and train GRPO if success exists.
-        Returns the (rollout_success_ratio, task_success_ratio, sample_trajectory).
+        Returns an RLStepResult.
         """
-
         logger.info("Executing RL Step...")
 
-        # 1. Obtain Evaluation Tasks
-        if eval_tasks is None:
-            logger.info(f"Generating {self.config.k_rl} RL eval tasks...")
-            modules = self.rust_doc_analyzer.get_modules()
+        tasks = await self._ensure_eval_tasks(eval_tasks)
+        task_results = await gather_with_semaphore(
+            [self._rollout_and_verify_task_group(t) for t in tasks],
+            max_concurrent=self.config.concurrency,
+        )
 
-            async def generate_rl_task(i: int) -> QA:
-                topic_hint = modules[i % len(modules)] if modules else None
-                logger.info(
-                    f"Starting RL eval task generation {i + 1}/{self.config.k_rl} (Hint: {topic_hint})"
-                )
-                return await self.generator.generate_rl(topic_hint=topic_hint)
+        if self._should_perform_grpo(task_results):
+            await self._perform_grpo_update(task_results)
 
-            eval_tasks = await self._run_parallel(
-                generate_rl_task, range(self.config.k_rl)
-            )
-        else:
+        await self._sync_sampling_weights()
+
+        return self._summarize_rl_results(task_results)
+
+    async def _ensure_eval_tasks(self, eval_tasks: list[QA] | None) -> list[QA]:
+        if eval_tasks is not None:
             logger.info(f"Re-using {len(eval_tasks)} tasks from SFT for RL Step.")
+            return eval_tasks
 
-        # 2. Rollout & Verify for each task
-        total_rollouts = 0
-        total_successes = 0
-        rl_sample: RLTrajectory | None = None
-        all_rl_groups: List[RLGroup] = []
+        logger.info(f"Generating {self.config.k_rl} RL eval tasks...")
+        modules = self.rust_doc_analyzer.get_modules()
 
+        async def generate_rl_task(i: int) -> QA:
+            topic_hint = modules[i % len(modules)] if modules else None
+            return await self.generator.generate_rl(topic_hint=topic_hint)
+
+        return await gather_with_semaphore(
+            [generate_rl_task(i) for i in range(self.config.k_rl)],
+            max_concurrent=self.config.concurrency,
+        )
+
+    async def _rollout_and_verify_task_group(self, qa: QA) -> TaskRolloutResult:
+        assert isinstance(self.solver.model, TinkerModel)
         library_name = self.config.api_doc_path.stem
         system_prompt = self._get_solver_system_prompt(library_name)
 
-        async def process_task(qa: QA):
-            task_label = f"Task: {qa.question[:40]}..."
-            logger.info(f"[{task_label}] Rolling out solutions...")
-
-            assert self.solver is not None
-            assert isinstance(self.solver.model, TinkerModel)
-
-            messages = [
+        model_input = self.solver.model.renderer.build_generation_prompt(
+            [
                 Message(role="system", content=system_prompt),
                 Message(role="user", content=qa.question),
             ]
-            model_input = self.solver.model.renderer.build_generation_prompt(messages)
+        )
 
-            # Sample k solutions
-            sample_results = await self.solver.model.sampling_client.sample_async(
-                prompt=model_input,
-                num_samples=self.config.k_rollout,
-                sampling_params=tinker.SamplingParams(
-                    include_logprobs=True,
-                ),
-            )
+        sample_results = await self.solver.model.sampling_client.sample_async(
+            prompt=model_input,
+            num_samples=self.config.k_rollout,
+            sampling_params=tinker.SamplingParams(include_logprobs=True),
+        )
 
-            rollout_metadata = []
-            verification_tasks = []
+        verification_tasks = []
+        metadata_list: list[RolloutMetadata] = []
 
-            for seq in sample_results.sequences:
-                ac = TokensWithLogprobs(tokens=seq.tokens, maybe_logprobs=seq.logprobs)
-                assistant_message, parse_success = (
-                    self.solver.model.renderer.parse_response(ac.tokens)
-                )
+        for seq in sample_results.sequences:
+            ac = TokensWithLogprobs(tokens=seq.tokens, maybe_logprobs=seq.logprobs)
+            msg, success = self.solver.model.renderer.parse_response(ac.tokens)
 
-                if not parse_success:
+            if not success:
 
-                    async def failed_result():
-                        return RLTrajectory(
-                            question=qa.question,
-                            reasoning="Parse Error",
-                            answer="N/A",
-                            execution_output="The model output could not be parsed as a valid message.",
-                            verification_reasoning="Parse failure.",
-                            success=False,
-                        )
+                async def failed_result():
+                    return self._create_failed_trajectory(qa.question)
 
-                    verification_tasks.append(failed_result())
-                    r_qra = QRA(
-                        question=qa.question, reasoning="Parse Error", answer=""
-                    )
-                    rollout_metadata.append({"ac": ac, "qra": r_qra})
-                    continue
-
-                # Extract reasoning and answer content
-                content = assistant_message["content"]
-                reasoning = ""
-                answer_text = ""
-
-                if isinstance(content, list):
-                    for part in content:
-                        if part["type"] == "thinking":
-                            reasoning += part["thinking"]
-                        elif part["type"] == "text":
-                            answer_text += part["text"]
-
-                    # If thinking part is empty, fallback to extracting reasoning from start of text
-                    if not reasoning and answer_text:
-                        reasoning = answer_text.split("```rust")[0].strip()
-                else:
-                    answer_text = content
-                    reasoning = answer_text.split("```rust")[0].strip()
-
-                code = extract_rust_code(answer_text)
-                r_qra = QRA(question=qa.question, reasoning=reasoning, answer=code)
-
-                verification_tasks.append(
-                    self._verify_with_execution(qa.question, r_qra)
-                )
-
-                # Prepare metadata for trajectory building
-                rollout_metadata.append({"ac": ac, "qra": r_qra})
-
-            # Parallel Verification per task (inner parallelism)
-            results: List[RLTrajectory] = await asyncio.gather(*verification_tasks)
-
-            final_trajectories = []
-            rewards = []
-            task_rl_sample: RLTrajectory | None = None
-
-            for i, res in enumerate(results):
-                reward = 1.0 if res.success else 0.0
-                rewards.append(reward)
-
-                ac_action = cast(TokensWithLogprobs, rollout_metadata[i]["ac"])
-                transition = Transition(
-                    ob=model_input,
-                    ac=ac_action,
-                    reward=reward,
-                    episode_done=True,
-                )
-
-                final_trajectories.append(
-                    Trajectory(
-                        transitions=[transition], final_ob=tinker.ModelInput.empty()
-                    )
-                )
-
-                if task_rl_sample is None and res.success:
-                    task_rl_sample = res
-
-            if task_rl_sample is None and results:
-                task_rl_sample = results[0]
-
-            num_success = sum(1 for res in results if res.success)
-
-            logger.info(
-                f"[{task_label}] Completion: {num_success}/{self.config.k_rollout} successful."
-            )
-
-            group: RLGroup | None = None
-            if final_trajectories:
-                if len(set(rewards)) > 1:
-                    group = RLGroup(trajectories=final_trajectories, rewards=rewards)
-                else:
-                    logger.info(
-                        f"[{task_label}] Skipping GRPO group: all rewards are equal ({rewards[0] if rewards else 'N/A'})."
-                    )
-
-            return num_success, len(results), group, task_rl_sample
-
-        # Use semaphore for task-level concurrency control (outer parallelism)
-        task_results = await self._run_parallel(process_task, eval_tasks)
-
-        for n_success, n_rollouts, group, task_rl_sample in task_results:
-            total_successes += n_success
-            total_rollouts += n_rollouts
-            if group:
-                all_rl_groups.append(group)
-            # Pick first success for sample logging
-            if rl_sample is None and task_rl_sample and task_rl_sample.success:
-                rl_sample = task_rl_sample
-
-        if rl_sample is None and task_results:
-            # Fallback to first non-None sample if no success in any task
-            for res in task_results:
-                if res[3] is not None:
-                    rl_sample = res[3]
-                    break
-
-        # 3. Trigger GRPO training for the entire batch
-        if self.training_client and all_rl_groups:
-            has_success = any(r > 0 for g in all_rl_groups for r in g.rewards)
-            if has_success:
-                logger.info(
-                    f"Triggering GRPO training for batch of {len(all_rl_groups)} groups..."
-                )
-
-                from adapter_agent.hierarchical.grpo import compute_grpo_loss
-
-                grpo_result = await compute_grpo_loss(
-                    all_rl_groups, self.training_client, self.config.rl_optimizer_params
-                )
-
-                # Optimization step
-                optim_future = await self.training_client.optim_step_async(
-                    self.config.rl_optimizer_params.adam_params
-                )
-                await optim_future.result_async()
-
-                # Check for metrics
-                loss_val = "N/A"
-                if hasattr(grpo_result, "metrics"):
-                    loss_val = grpo_result.metrics.get("loss", "N/A")
-                    self._log_metrics("rl", grpo_result.metrics)
-
-                logger.info(f"GRPO Batch Update complete. Loss: {loss_val}")
+                verification_tasks.append(failed_result())
+                metadata_list.append(RolloutMetadata(ac=ac, qra=None))
             else:
-                logger.info(
-                    "Skipping GRPO batch update: no successful samples found in any group."
+                qra = self._parse_qra_from_message(qa.question, msg)
+                verification_tasks.append(self._verify_with_execution(qa.question, qra))
+                metadata_list.append(RolloutMetadata(ac=ac, qra=qra))
+
+        results = await asyncio.gather(*verification_tasks)
+        return self._build_task_rollout_result(qa, model_input, results, metadata_list)
+
+    def _create_failed_trajectory(self, question: str) -> RLTrajectory:
+        return RLTrajectory(
+            question=question,
+            reasoning="Parse Error",
+            answer="N/A",
+            execution_output="The model output could not be parsed as a valid message.",
+            verification_reasoning="Parse failure.",
+            success=False,
+        )
+
+    def _parse_qra_from_message(self, question: str, message: Message) -> QRA:
+        content = message["content"]
+        reasoning = ""
+        answer_text = ""
+
+        if isinstance(content, list):
+            for part in content:
+                if part["type"] == "thinking":
+                    reasoning += part["thinking"]
+                elif part["type"] == "text":
+                    answer_text += part["text"]
+            if not reasoning and answer_text:
+                reasoning = answer_text.split("```rust")[0].strip()
+        else:
+            answer_text = content
+            reasoning = answer_text.split("```rust")[0].strip()
+
+        return QRA(
+            question=question,
+            reasoning=reasoning,
+            answer=extract_rust_code(answer_text),
+        )
+
+    def _build_task_rollout_result(
+        self,
+        qa: QA,
+        model_input,
+        results: list[RLTrajectory],
+        metadata: list[RolloutMetadata],
+    ) -> TaskRolloutResult:
+        trajectories = []
+        rewards = []
+        sample: RLTrajectory | None = None
+
+        for i, res in enumerate(results):
+            reward = 1.0 if res.success else 0.0
+            rewards.append(reward)
+            trajectories.append(
+                Trajectory(
+                    transitions=[
+                        Transition(
+                            ob=model_input,
+                            ac=metadata[i].ac,
+                            reward=reward,
+                            episode_done=True,
+                        )
+                    ],
+                    final_ob=tinker.ModelInput.empty(),
                 )
-
-        success_ratio = total_successes / total_rollouts if total_rollouts > 0 else 0.0
-        task_successes = sum(1 for res in task_results if res[0] > 0)
-        task_success_ratio = task_successes / len(task_results) if task_results else 0.0
-
-        # Log Metrics
-        if self.ml_logger:
-            self.ml_logger.log_metrics(
-                {
-                    "rl/rollout_success_ratio": success_ratio,
-                    "rl/task_success_ratio": task_success_ratio,
-                }
             )
+            if sample is None or (res.success and not sample.success):
+                sample = res
 
-        # 4. Sync Sampling Weights
-        await self._sync_sampling_weights()
+        group = (
+            RLGroup(trajectories=trajectories, rewards=rewards)
+            if len(set(rewards)) > 1
+            else None
+        )
+        return TaskRolloutResult(
+            num_success=sum(1 for res in results if res.success),
+            num_rollouts=len(results),
+            group=group,
+            sample=sample,
+        )
 
-        return success_ratio, task_success_ratio, rl_sample
+    def _should_perform_grpo(self, task_results: list[TaskRolloutResult]) -> bool:
+        return any(tr.group is not None for tr in task_results)
 
+    async def _perform_grpo_update(self, task_results: list[TaskRolloutResult]):
+        assert self.training_client is not None
+        groups = [tr.group for tr in task_results if tr.group is not None]
 
-    async def _run_parallel(self, coro_func, items: list | range) -> list:
-        """
-        Execute an async function over a list of items with concurrency control.
-        """
-        semaphore = asyncio.Semaphore(self.config.concurrency)
+        logger.info(f"Triggering GRPO training for batch of {len(groups)} groups...")
+        grpo_result = await compute_grpo_loss(
+            groups, self.training_client, self.config.rl_optimizer_params
+        )
 
-        async def sem_task(item):
-            async with semaphore:
-                return await coro_func(item)
+        optim_future = await self.training_client.optim_step_async(
+            self.config.rl_optimizer_params.adam_params
+        )
+        await optim_future.result_async()
 
-        tasks = [sem_task(item) for item in items]
-        return await asyncio.gather(*tasks)
+        if hasattr(grpo_result, "metrics"):
+            self._log_metrics("rl", grpo_result.metrics)
+
+    def _summarize_rl_results(
+        self, task_results: list[TaskRolloutResult]
+    ) -> RLStepResult:
+        total_success = sum(tr.num_success for tr in task_results)
+        total_rollouts = sum(tr.num_rollouts for tr in task_results)
+        task_success = sum(1 for tr in task_results if tr.num_success > 0)
+
+        rl_sample = next(
+            (tr.sample for tr in task_results if tr.sample and tr.sample.success), None
+        )
+        if not rl_sample and task_results:
+            rl_sample = task_results[0].sample
+
+        result = RLStepResult(
+            rollout_success_ratio=total_success / total_rollouts
+            if total_rollouts > 0
+            else 0.0,
+            task_success_ratio=task_success / len(task_results)
+            if task_results
+            else 0.0,
+            sample=rl_sample,
+        )
+
+        self._log_metrics(
+            "rl",
+            {
+                "rollout_success_ratio": result.rollout_success_ratio,
+                "task_success_ratio": result.task_success_ratio,
+            },
+        )
+        return result
 
     def _log_metrics(self, prefix: str, metrics: dict):
         """
@@ -621,13 +604,11 @@ class InternalizationPipeline:
         if self.ml_logger:
             self.ml_logger.log_metrics({f"{prefix}/{k}": v for k, v in metrics.items()})
 
-    def _update_wandb_table(self, iteration: int, rl_sample: Optional[RLTrajectory]):
+    def _update_wandb_table(self, iteration: int, rl_sample: RLTrajectory | None):
         """
         Add a row to the persistent WandB samples table.
         """
         if self.ml_logger and rl_sample and self._samples_table is not None:
-            import wandb
-
             self._samples_table.add_data(
                 iteration,
                 rl_sample.question,
@@ -658,6 +639,7 @@ Your task is to solve the programming challenge using the `{library_name}` libra
 <Guidelines>
 1. Write high-quality, idiomatic Rust code.
 2. Ensure your solution is complete and self-contained.
+3. Ensure that your code produces clear output during execution so that its correctness can be easily verified from the execution results.
 </Guidelines>
 """
 
@@ -724,11 +706,6 @@ Your task is to solve the programming challenge using the `{library_name}` libra
         """
         Log a representative sample from SFT and RL phases using Rich for a better UX.
         """
-        from rich.console import Console, Group
-        from rich.markdown import Markdown
-        from rich.panel import Panel
-        from rich.rule import Rule
-
         console = Console()
 
         def create_sample_panel(sample: RLTrajectory, title: str, color: str):
