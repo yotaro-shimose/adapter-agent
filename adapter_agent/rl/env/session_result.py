@@ -1,15 +1,14 @@
-from typing import Any
 from dataclasses import dataclass, field
+from typing import Any
 
 from tinker_cookbook.renderers.base import Message as TinkerMessage
 from tinker_cookbook.rl.types import Trajectory
 
-from adapter_agent.hierarchical.types import Task
+from adapter_agent.hierarchical.types import Entity, Task
 from adapter_agent.rl.env.conclusion import SSConclusion
 
 
-@dataclass
-class Knowledge:
+class Knowledge(Entity):
     title: str
     content: str
 

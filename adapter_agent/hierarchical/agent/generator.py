@@ -1,12 +1,14 @@
 import logging
 from dataclasses import dataclass
+from typing import Optional
 
-from oai_utils.agent import AgentRunFailure, AgentsSDKModel, AgentWrapper
+from oai_utils.agent import AgentsSDKModel, AgentWrapper
 from pydantic import BaseModel
 
 from adapter_agent.data import QA, QRA
 from adapter_agent.hierarchical.agent.base import BaseAgent
 from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
+from adapter_agent.rl.env.session_result import Knowledge
 
 logger = logging.getLogger(__name__)
 
@@ -15,39 +17,39 @@ logger = logging.getLogger(__name__)
 class GeneratorAgent[T: AgentsSDKModel](BaseAgent[T]):
     rust_doc_analyzer: AsyncRustDocAnalyzer
 
-    async def generate_sft(self, topic_hint: str) -> QRA:
+    async def generate_sft(self, knowledge: Knowledge) -> Optional[QRA]:
         """
-        Generate a QRA triplet for SFT bootstrapping.
+        Generate a QRA triplet for SFT bootstrapping based on a specific Knowledge item.
         """
         prompt = self._build_system_prompt(is_sft=True)
         agent = self._create_agent(prompt, output_type=QRA)
 
-        input_prompt = self._build_input_prompt(topic_hint)
+        input_prompt = self._build_input_prompt(knowledge)
 
         try:
-            result = await agent.run(input_prompt)
+            result = await agent.run(input_prompt, time_out_seconds=60.0)
             output = result.final_output()
             return output
-        except AgentRunFailure as e:
-            logger.error(f"SFT Task generation failed: {e}")
-            raise
+        except Exception as e:
+            logger.error(f"Problem generation (SFT) failed for '{knowledge.title}': {e}")
+            return None
 
-    async def generate_rl(self, topic_hint: str | None = None) -> QA:
+    async def generate_rl(self, knowledge: Knowledge) -> Optional[QA]:
         """
-        Generate a QA pair for RL.
+        Generate a QA pair for RL based on a specific Knowledge item.
         """
         prompt = self._build_system_prompt(is_sft=False)
         agent = self._create_agent(prompt, output_type=QA)
 
-        input_prompt = self._build_input_prompt(topic_hint)
+        input_prompt = self._build_input_prompt(knowledge)
 
         try:
-            result = await agent.run(input_prompt)
+            result = await agent.run(input_prompt, time_out_seconds=60.0)
             output = result.final_output()
             return output
-        except AgentRunFailure as e:
-            logger.error(f"RL Task generation failed: {e}")
-            raise
+        except Exception as e:
+            logger.error(f"Problem generation (RL) failed for '{knowledge.title}': {e}")
+            return None
 
     def _create_agent[OUT: BaseModel](
         self, instructions: str, output_type: type[OUT]
@@ -97,15 +99,11 @@ You must return the result in a structured JSON format.
 """
         return prompt
 
-    def _build_input_prompt(self, topic_hint: str | None = None) -> str:
-        crate_overview = self.rust_doc_analyzer.get_overview()
-        hint_text = f"\n<Topic Hint>\n{topic_hint}\n</Topic Hint>" if topic_hint else ""
-
+    def _build_input_prompt(self, knowledge: Knowledge) -> str:
         return f"""\
-<Crate Overview>
-{crate_overview}
-</Crate Overview>
-{hint_text}
+<Knowledge Item: {knowledge.title}>
+{knowledge.content}
+</Knowledge Item>
 
-Please generate a new task now.
+Please generate a new task based on the knowledge provided above.
 """

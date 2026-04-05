@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from dataclasses import dataclass
-from pathlib import Path
+from typing import Self
 
 import tinker
 import wandb
@@ -34,6 +34,7 @@ from adapter_agent.rl.config import (
     SFTOptimizerParams,
 )
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
+from adapter_agent.rl.env.session_result import Knowledge
 from adapter_agent.util.parsing import extract_rust_code
 
 logger = logging.getLogger(__name__)
@@ -44,12 +45,14 @@ logging.getLogger("coder_mcp.runtime.runtime").setLevel(logging.WARNING)
 
 @dataclass
 class PipelineConfig:
-    api_doc_path: Path
+    knowledge_list: list[Knowledge]
     runtime_settings: RuntimeSettings
     model_loading_settings: ModelLoadingSettings
     sft_optimizer_params: SFTOptimizerParams
     rl_optimizer_params: OptimizerParams
     experiment_settings: ExperimentSettings
+    sft_threshold: float = 0.5
+    max_sft_knowledge: int = 8
     k_sft: int = 16
     k_rl: int = 16
     k_rollout: int = 16
@@ -65,6 +68,17 @@ class RLTrajectory:
     execution_output: str
     verification_reasoning: str
     success: bool
+
+    @classmethod
+    def failed(cls, question: str) -> Self:
+        return cls(
+            question=question,
+            reasoning="Parse Error",
+            answer="N/A",
+            execution_output="The model output could not be parsed as a valid message.",
+            verification_reasoning="Parse failure.",
+            success=False,
+        )
 
 
 @dataclass
@@ -86,12 +100,84 @@ class TaskRolloutResult:
     group: RLGroup | None
     sample: RLTrajectory | None
 
+    @classmethod
+    def from_results(
+        cls,
+        model_input,
+        results: list[RLTrajectory],
+        metadata: list[RolloutMetadata],
+    ) -> Self:
+        trajectories = []
+        rewards = []
+        sample: RLTrajectory | None = None
+
+        for i, res in enumerate(results):
+            reward = 1.0 if res.success else 0.0
+            rewards.append(reward)
+            trajectories.append(
+                Trajectory(
+                    transitions=[
+                        Transition(
+                            ob=model_input,
+                            ac=metadata[i].ac,
+                            reward=reward,
+                            episode_done=True,
+                        )
+                    ],
+                    final_ob=tinker.ModelInput.empty(),
+                )
+            )
+            if sample is None:
+                sample = res
+
+        group = (
+            RLGroup(trajectories=trajectories, rewards=rewards)
+            if len(set(rewards)) > 1
+            else None
+        )
+        return cls(
+            num_success=sum(1 for res in results if res.success),
+            num_rollouts=len(results),
+            group=group,
+            sample=sample,
+        )
+
 
 @dataclass
 class RLStepResult:
     rollout_success_ratio: float
     task_success_ratio: float
+    total_success: int
+    total_rollouts: int
+    task_success: int
+    num_tasks: int
     sample: RLTrajectory | None
+
+    @classmethod
+    def from_task_rollouts(cls, task_results: list[TaskRolloutResult]) -> Self:
+        total_success = sum(tr.num_success for tr in task_results)
+        total_rollouts = sum(tr.num_rollouts for tr in task_results)
+        task_success = sum(1 for tr in task_results if tr.num_success > 0)
+        num_tasks = len(task_results)
+
+        rl_sample = next(
+            (tr.sample for tr in task_results if tr.sample and tr.sample.success), None
+        )
+        if not rl_sample and task_results:
+            rl_sample = task_results[0].sample
+
+        result = cls(
+            rollout_success_ratio=total_success / total_rollouts
+            if total_rollouts > 0
+            else 0.0,
+            task_success_ratio=task_success / num_tasks if num_tasks > 0 else 0.0,
+            total_success=total_success,
+            total_rollouts=total_rollouts,
+            task_success=task_success,
+            num_tasks=num_tasks,
+            sample=rl_sample,
+        )
+        return result
 
 
 class InternalizationPipeline:
@@ -101,9 +187,11 @@ class InternalizationPipeline:
         generator_model: AgentsSDKModel,
         verifier_model: AgentsSDKModel,
         rust_doc_analyzer: AsyncRustDocAnalyzer,
+        library_name: str,
     ):
         self.config = config
         self.rust_doc_analyzer = rust_doc_analyzer
+        self.library_name = library_name
 
         # Agents
         self.generator = GeneratorAgent(
@@ -117,6 +205,12 @@ class InternalizationPipeline:
         self.training_client: tinker.TrainingClient | None = None
         self.service_client: tinker.ServiceClient | None = None
         self.ml_logger: MLLogger | None = None
+        self._samples_table: wandb.Table | None = None
+
+        # Performance Tracking: Maps knowledge title to current task success ratio
+        self.performance_map: dict[str, float] = {
+            k.id: 0.0 for k in self.config.knowledge_list
+        }
 
     async def setup(self):
         """
@@ -175,82 +269,130 @@ class InternalizationPipeline:
 
     async def run(self):
         """
-        Main loop: SFT -> RL -> (SFT/RL)
+        Main loop: Orchestrate SFT and RL across multiple knowledge items.
         """
         await self.setup()
-        logger.info(f"Starting API internalization for doc: {self.config.api_doc_path}")
+        logger.info(
+            f"Starting API internalization for {len(self.config.knowledge_list)} items."
+        )
 
-        rollout_success_ratio = 0.0
-        task_success_ratio = 0.0
         iteration = 0
-
-        while iteration < self.config.max_iterations and rollout_success_ratio < 1.0:
+        while iteration < self.config.max_iterations:
             iteration += 1
             logger.info(f"--- Iteration {iteration} ---")
 
-            # Phase 1: Conditional SFT (Warm up / Recovery)
-            # Skip SFT if task success ratio is at least 50%
+            # 1. Identify knowledge items needing SFT
+            sft_candidates = [
+                k
+                for k in self.config.knowledge_list
+                if self.performance_map[k.id] < self.config.sft_threshold
+            ]
+
+            sft_targets = sft_candidates[: self.config.max_sft_knowledge]
             sft_result: SFTStepResult | None = None
-            if task_success_ratio < 0.5:
-                sft_result = await self.execute_sft_step()
-                eval_tasks = [
-                    QA(question=t.question, answer=t.answer)
-                    for t in sft_result.qra_list[: self.config.k_rl]
-                ]
-            else:
-                logger.info(
-                    f"Skipping SFT Step (Task Success: {task_success_ratio:.2%}). Generating fresh tasks..."
+
+            if sft_targets:
+                logger.info(f"Selected {len(sft_targets)} items for SFT refinement.")
+                sft_result = await self.execute_sft_step(sft_targets)
+
+            # 2. RL Phase: Exploration and Correction for ALL knowledge items in PARALLEL
+            logger.info(
+                f"Running RL Phase for {len(self.config.knowledge_list)} items concurrently."
+            )
+
+            rl_results = await asyncio.gather(
+                *[self.execute_rl_step(k) for k in self.config.knowledge_list]
+            )
+
+            iteration_metrics = {}
+            total_rl_success = 0
+            total_rl_rollouts = 0
+            total_rl_task_success = 0
+            total_rl_tasks = 0
+
+            for i, (knowledge, rl_result) in enumerate(
+                zip(self.config.knowledge_list, rl_results)
+            ):
+                # Update performance map with the latest task success ratio
+                self.performance_map[knowledge.id] = rl_result.task_success_ratio
+
+                # Accumulate per-knowledge metrics (using same prefix as requested)
+                iteration_metrics[
+                    f"rl/{knowledge.title}/rollout_success_ratio"
+                ] = rl_result.rollout_success_ratio
+                iteration_metrics[
+                    f"rl/{knowledge.title}/task_success_ratio"
+                ] = rl_result.task_success_ratio
+
+                # Accumulate for aggregate metrics
+                total_rl_success += rl_result.total_success
+                total_rl_rollouts += rl_result.total_rollouts
+                total_rl_task_success += rl_result.task_success
+                total_rl_tasks += rl_result.num_tasks
+
+                self._update_wandb_table(iteration, rl_result.sample)
+
+                # Visualization / Logging (for terminal feedback)
+                # Only show header and SFT sample for the first item
+                self._visualize_iteration(
+                    iteration,
+                    sft_result.representative_sample if sft_result else None,
+                    rl_result.sample,
+                    include_header=(i == 0),
+                    include_sft=(i == 0 and sft_result is not None),
                 )
-                fresh_tasks = await self.generate_teacher_tasks(self.config.k_rl)
-                eval_tasks = [
-                    QA(question=t.question, answer=t.answer) for t in fresh_tasks
-                ]
 
-            # Phase 2: RL (Exploration / Correction)
-            rl_result = await self.execute_rl_step(eval_tasks=eval_tasks)
+            # 3. Overall Progress
+            if total_rl_rollouts > 0:
+                iteration_metrics["rl/rollout_success_ratio"] = (
+                    total_rl_success / total_rl_rollouts
+                )
+            if total_rl_tasks > 0:
+                iteration_metrics["rl/task_success_ratio"] = (
+                    total_rl_task_success / total_rl_tasks
+                )
 
-            rollout_success_ratio = rl_result.rollout_success_ratio
-            task_success_ratio = rl_result.task_success_ratio
-
-            # Phase 3: W&B Iteration Summary
-            self._log_metrics(
-                "overall",
-                {
-                    "rollout_success_ratio": rollout_success_ratio,
-                    "task_success_ratio": task_success_ratio,
-                },
+            mean_task_success = sum(self.performance_map.values()) / len(
+                self.performance_map
             )
-            self._update_wandb_table(iteration, rl_result.sample)
+            iteration_metrics["rl/mean_task_success"] = mean_task_success
 
-            # Phase 4: Visualization / Logging
-            self._visualize_iteration(
-                iteration,
-                sft_result.representative_sample if sft_result else None,
-                rl_result.sample,
-            )
+            # Single point for logging all RL-related metrics in this iteration
+            if self.ml_logger:
+                self.ml_logger.log_metrics(iteration_metrics)
 
             logger.info(
-                f"Iteration {iteration} complete. "
-                f"Rollout Success: {rollout_success_ratio:.2%}, "
-                f"Task Success: {task_success_ratio:.2%}"
+                f"Iteration {iteration} complete. Mean Task Success: {mean_task_success:.2%}"
             )
 
-    async def generate_teacher_tasks(self, count: int) -> list[QRA]:
-        """
-        Generate and verify high-quality QRA tasks using the teacher model.
-        """
-        logger.info(f"Teacher generating {count} high-quality tasks...")
-        topic_hint = self.config.api_doc_path.stem
+            if mean_task_success >= 1.0:
+                logger.info("All knowledge items internalized successfully!")
+                break
 
-        tasks = [
-            self.generator.generate_sft(topic_hint=topic_hint) for _ in range(count)
-        ]
-        tasks_raw: list[QRA] = await gather_with_semaphore(
-            tasks, max_concurrent=self.config.concurrency
+    async def generate_teacher_tasks(
+        self, count: int, knowledge: Knowledge
+    ) -> list[QRA]:
+        """
+        Generate and verify high-quality QRA tasks using the teacher model for a specific Knowledge item.
+        """
+        logger.info(
+            f"Teacher generating {count} high-quality tasks for '{knowledge.title}'..."
         )
 
+        tasks = [self.generator.generate_sft(knowledge) for _ in range(count)]
+        tasks_raw_maybe: list[QRA | None] = await gather_with_semaphore(
+            tasks, max_concurrent=self.config.concurrency
+        )
+        tasks_raw = [t for t in tasks_raw_maybe if t is not None]
+
+        if not tasks_raw:
+            logger.warning(f"No valid teacher tasks generated for '{knowledge.title}'.")
+            return []
+
         # 2. Verify
-        logger.info(f"Verifying {len(tasks_raw)} teacher-generated tasks...")
+        logger.info(
+            f"Verifying {len(tasks_raw)} teacher-generated tasks for '{knowledge.title}'..."
+        )
         verification_tasks = [
             self._verify_with_execution(qra.question, qra) for qra in tasks_raw
         ]
@@ -265,38 +407,40 @@ class InternalizationPipeline:
         # If too few were valid, we might want to try again or just proceed with what we have.
         if len(valid_tasks) < count:
             logger.warning(
-                f"Only {len(valid_tasks)}/{count} teacher tasks were valid (verified)."
+                f"Only {len(valid_tasks)}/{count} teacher tasks were valid (verified) for '{knowledge.title}'."
             )
 
         return valid_tasks
 
-    async def execute_sft_step(self) -> SFTStepResult:
+    async def execute_sft_step(self, targets: list[Knowledge]) -> SFTStepResult:
         """
-        Generate QRA tasks and perform supervised fine-tuning.
+        Perform supervised fine-tuning across multiple knowledge targets.
         """
-        logger.info("Executing SFT Step...")
+        logger.info(f"Executing SFT Step for {len(targets)} targets...")
         assert self.training_client is not None, "TrainingClient must be initialized"
 
-        qra_list = await self.generate_teacher_tasks(self.config.k_sft)
-        teacher_success_ratio = (
-            len(qra_list) / self.config.k_sft if self.config.k_sft else 0
+        combined_qra_list = []
+        qra_lists = await asyncio.gather(
+            *[self.generate_teacher_tasks(self.config.k_sft, k) for k in targets]
         )
-        self._log_metrics("sft", {"teacher_success_ratio": teacher_success_ratio})
+        combined_qra_list = [qra for sublist in qra_lists for qra in sublist]
 
-        representative_sample = None
-        if qra_list:
+        if combined_qra_list:
+            # Pick a representative sample (from the first target)
             representative_sample = await self._verify_with_execution(
-                qra_list[0].question, qra_list[0]
+                combined_qra_list[0].question, combined_qra_list[0]
             )
-            await self._perform_sft_training(qra_list)
+            await self._perform_sft_training(combined_qra_list)
+        else:
+            representative_sample = None
 
         return SFTStepResult(
-            representative_sample=representative_sample, qra_list=qra_list
+            representative_sample=representative_sample, qra_list=combined_qra_list
         )
 
     async def _perform_sft_training(self, qra_list: list[QRA]):
         logger.info(
-            f"Fine-tuning student on {len(qra_list)}/{self.config.k_sft} VALID QRA samples..."
+            f"Fine-tuning student on {len(qra_list)} total VALID QRA samples..."
         )
 
         assert self.training_client is not None
@@ -393,14 +537,15 @@ class InternalizationPipeline:
                 f"SFT Epoch {epoch + 1}/{total_epochs}, Step {step + 1}/{num_batches}: loss={loss}"
             )
 
-    async def execute_rl_step(self, eval_tasks: list[QA] | None = None) -> RLStepResult:
+    async def execute_rl_step(
+        self, knowledge: Knowledge, eval_tasks: list[QA] | None = None
+    ) -> RLStepResult:
         """
-        Generate evaluation tasks, rollout solutions, verify (with execution), and train GRPO if success exists.
-        Returns an RLStepResult.
+        Generate evaluation tasks for a specific knowledge item, rollout solutions, verify, and train GRPO.
         """
-        logger.info("Executing RL Step...")
+        logger.info(f"Executing RL Step for '{knowledge.title}'...")
 
-        tasks = await self._ensure_eval_tasks(eval_tasks)
+        tasks = await self._ensure_eval_tasks(knowledge, eval_tasks)
         task_results = await gather_with_semaphore(
             [self._rollout_and_verify_task_group(t) for t in tasks],
             max_concurrent=self.config.concurrency,
@@ -413,26 +558,32 @@ class InternalizationPipeline:
 
         return self._summarize_rl_results(task_results)
 
-    async def _ensure_eval_tasks(self, eval_tasks: list[QA] | None) -> list[QA]:
+    async def _ensure_eval_tasks(
+        self, knowledge: Knowledge, eval_tasks: list[QA] | None
+    ) -> list[QA]:
         if eval_tasks is not None:
-            logger.info(f"Re-using {len(eval_tasks)} tasks from SFT for RL Step.")
+            logger.info(
+                f"Re-using {len(eval_tasks)} tasks for '{knowledge.title}' RL Step."
+            )
             return eval_tasks
 
-        logger.info(f"Generating {self.config.k_rl} RL eval tasks...")
-        modules = self.rust_doc_analyzer.get_modules()
+        logger.info(
+            f"Generating {self.config.k_rl} RL eval tasks for '{knowledge.title}'..."
+        )
+        # (Assuming the Knowledge item has all needed info; no need for rust_doc_analyzer modules here)
 
-        async def generate_rl_task(i: int) -> QA:
-            topic_hint = modules[i % len(modules)] if modules else None
-            return await self.generator.generate_rl(topic_hint=topic_hint)
+        async def generate_rl_task(_) -> QA | None:
+            return await self.generator.generate_rl(knowledge)
 
-        return await gather_with_semaphore(
+        tasks_maybe = await gather_with_semaphore(
             [generate_rl_task(i) for i in range(self.config.k_rl)],
             max_concurrent=self.config.concurrency,
         )
+        return [t for t in tasks_maybe if t is not None]
 
     async def _rollout_and_verify_task_group(self, qa: QA) -> TaskRolloutResult:
         assert isinstance(self.solver.model, TinkerModel)
-        library_name = self.config.api_doc_path.stem
+        library_name = self.library_name
         system_prompt = self._get_solver_system_prompt(library_name)
 
         model_input = self.solver.model.renderer.build_generation_prompt(
@@ -458,7 +609,7 @@ class InternalizationPipeline:
             if not success:
 
                 async def failed_result():
-                    return self._create_failed_trajectory(qa.question)
+                    return RLTrajectory.failed(qa.question)
 
                 verification_tasks.append(failed_result())
                 metadata_list.append(RolloutMetadata(ac=ac, qra=None))
@@ -468,17 +619,7 @@ class InternalizationPipeline:
                 metadata_list.append(RolloutMetadata(ac=ac, qra=qra))
 
         results = await asyncio.gather(*verification_tasks)
-        return self._build_task_rollout_result(qa, model_input, results, metadata_list)
-
-    def _create_failed_trajectory(self, question: str) -> RLTrajectory:
-        return RLTrajectory(
-            question=question,
-            reasoning="Parse Error",
-            answer="N/A",
-            execution_output="The model output could not be parsed as a valid message.",
-            verification_reasoning="Parse failure.",
-            success=False,
-        )
+        return TaskRolloutResult.from_results(model_input, results, metadata_list)
 
     def _parse_qra_from_message(self, question: str, message: Message) -> QRA:
         content = message["content"]
@@ -501,48 +642,6 @@ class InternalizationPipeline:
             question=question,
             reasoning=reasoning,
             answer=extract_rust_code(answer_text),
-        )
-
-    def _build_task_rollout_result(
-        self,
-        qa: QA,
-        model_input,
-        results: list[RLTrajectory],
-        metadata: list[RolloutMetadata],
-    ) -> TaskRolloutResult:
-        trajectories = []
-        rewards = []
-        sample: RLTrajectory | None = None
-
-        for i, res in enumerate(results):
-            reward = 1.0 if res.success else 0.0
-            rewards.append(reward)
-            trajectories.append(
-                Trajectory(
-                    transitions=[
-                        Transition(
-                            ob=model_input,
-                            ac=metadata[i].ac,
-                            reward=reward,
-                            episode_done=True,
-                        )
-                    ],
-                    final_ob=tinker.ModelInput.empty(),
-                )
-            )
-            if sample is None or (res.success and not sample.success):
-                sample = res
-
-        group = (
-            RLGroup(trajectories=trajectories, rewards=rewards)
-            if len(set(rewards)) > 1
-            else None
-        )
-        return TaskRolloutResult(
-            num_success=sum(1 for res in results if res.success),
-            num_rollouts=len(results),
-            group=group,
-            sample=sample,
         )
 
     def _should_perform_grpo(self, task_results: list[TaskRolloutResult]) -> bool:
@@ -568,34 +667,7 @@ class InternalizationPipeline:
     def _summarize_rl_results(
         self, task_results: list[TaskRolloutResult]
     ) -> RLStepResult:
-        total_success = sum(tr.num_success for tr in task_results)
-        total_rollouts = sum(tr.num_rollouts for tr in task_results)
-        task_success = sum(1 for tr in task_results if tr.num_success > 0)
-
-        rl_sample = next(
-            (tr.sample for tr in task_results if tr.sample and tr.sample.success), None
-        )
-        if not rl_sample and task_results:
-            rl_sample = task_results[0].sample
-
-        result = RLStepResult(
-            rollout_success_ratio=total_success / total_rollouts
-            if total_rollouts > 0
-            else 0.0,
-            task_success_ratio=task_success / len(task_results)
-            if task_results
-            else 0.0,
-            sample=rl_sample,
-        )
-
-        self._log_metrics(
-            "rl",
-            {
-                "rollout_success_ratio": result.rollout_success_ratio,
-                "task_success_ratio": result.task_success_ratio,
-            },
-        )
-        return result
+        return RLStepResult.from_task_rollouts(task_results)
 
     def _log_metrics(self, prefix: str, metrics: dict):
         """
@@ -702,6 +774,8 @@ Your task is to solve the programming challenge using the `{library_name}` libra
         iteration: int,
         sft_sample: RLTrajectory | None,
         rl_sample: RLTrajectory | None,
+        include_header: bool = True,
+        include_sft: bool = True,
     ):
         """
         Log a representative sample from SFT and RL phases using Rich for a better UX.
@@ -738,13 +812,17 @@ Your task is to solve the programming challenge using the `{library_name}` libra
                 expand=False,
             )
 
-        console.print()
-        console.print(
-            Rule(f"[bold cyan]Iteration {iteration} Summary[/bold cyan]", style="cyan")
-        )
-        console.print()
+        if include_header:
+            console.print()
+            console.print(
+                Rule(
+                    f"[bold cyan]Iteration {iteration} Summary[/bold cyan]",
+                    style="cyan",
+                )
+            )
+            console.print()
 
-        if sft_sample:
+        if include_sft and sft_sample:
             console.print(
                 create_sample_panel(
                     sft_sample, "Phase 1: Teacher (SFT) Sample", "magenta"

@@ -8,6 +8,7 @@ from adapter_agent.hierarchical.pipeline.internalization_pipeline import (
     InternalizationPipeline,
     PipelineConfig,
 )
+from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
 from adapter_agent.model_helper import get_gemini
 from adapter_agent.rl.config import (
     ExperimentSettings,
@@ -16,6 +17,7 @@ from adapter_agent.rl.config import (
     SFTOptimizerParams,
 )
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
+from adapter_agent.rl.env.session_result import Knowledge
 
 # Configure logging
 logging.basicConfig(
@@ -32,42 +34,17 @@ logging.getLogger("coder_mcp.runtime.runtime").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
-class MarkdownAnalyzer:
-    """
-    Minimal analyzer that returns the content of a Markdown file as the overview.
-    Used for primitive-only internalization tests.
-    """
-
-    def __init__(self, path: Path):
-        self.path = path
-
-    def get_overview(self) -> str:
-        if not self.path.exists():
-            return f"Error: {self.path} not found."
-        return self.path.read_text(encoding="utf-8")
-
-    def get_modules(self) -> list[str]:
-        """Return a list of modules for topic hinting. For this test, just one."""
-        return ["numrs2::array"]
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        pass
-
-
 async def main():
-    api_doc_path = Path("numrs2.md")
+    json_path = Path("repositories/numrs/target/doc/numrs2.json")
 
-    if not api_doc_path.exists():
-        logger.error(f"API documentation not found at {api_doc_path}")
+    if not json_path.exists():
+        logger.error(f"RustDoc JSON not found at {json_path}")
         return
 
-    logger.info("Setting up primitive-only internalization pipeline...")
+    logger.info("Setting up internalization pipeline with professional analyzer...")
 
-    # 1. Analyzer (Minimal Markdown)
-    analyzer = MarkdownAnalyzer(api_doc_path)
+    # 1. Analyzer (RustDoc JSON + Elasticsearch)
+    analyzer = await AsyncRustDocAnalyzer.create_from_json(json_path)
 
     # 2. Model (Gemini)
     try:
@@ -82,8 +59,22 @@ async def main():
     )
 
     # 4. Pipeline Config
+    k1 = Knowledge(
+        title="numrs2", content=Path("numrs2.md").read_text()
+    )
+    k2 = Knowledge(
+        title="numrs2_exp", content=Path("numrs2_exp.md").read_text()
+    )
+    k3 = Knowledge(
+        title="numrs2_cos", content=Path("numrs2_cos.md").read_text()
+    )
+    k4 = Knowledge(
+        title="numrs2_arithmetic",
+        content=Path("numrs2_arithmetic.md").read_text(),
+    )
     config = PipelineConfig(
-        api_doc_path=api_doc_path,
+        # knowledge_list=[k1, k2, k3, k4],
+        knowledge_list=[k1],
         runtime_settings=runtime_settings,
         model_loading_settings=ModelLoadingSettings(
             model_name="Qwen/Qwen3-8B", lora_rank=32
@@ -108,6 +99,7 @@ async def main():
         k_rollout=8,
         concurrency=32,
         max_iterations=10,
+        max_sft_knowledge=8,
     )
 
     # 5. Pipeline
@@ -116,6 +108,7 @@ async def main():
         generator_model=model,
         verifier_model=model,  # Using Gemini for both generation and verification
         rust_doc_analyzer=analyzer,  # type: ignore
+        library_name="numrs2",
     )
 
     try:
