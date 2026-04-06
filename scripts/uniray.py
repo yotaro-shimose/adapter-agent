@@ -29,16 +29,13 @@ from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.rl.env.session_result import (
     RewireSessionResultFailure,
 )
-from adapter_agent.rl.postgres_db import get_db
 from adapter_agent.rl.shared_sampling_client import SharedSamplingClient
 from adapter_agent.rl.task_net import (
     TaskNetwork,
     is_study,
 )
-from adapter_agent.rl.trajectory_db import create_trajectory_db
 from adapter_agent.rl.unirl_state import (
     StudyRolloutParams,
-    TrajectoryReplayBuffer,
     UniRLConfig,
     UniRLState,
     UniRLTrainParams,
@@ -48,7 +45,6 @@ from adapter_agent.util.logger_util import setup_base_loglevel
 
 # Silence Ray logs
 os.environ["RAY_DEDUP_LOGS"] = "0"
-os.environ["RAY_COLOR_PREFIX"] = "0"
 os.environ["OPENAI_AGENTS_DISABLE_TRACING"] = "1"
 
 logger = logging.getLogger(__name__)
@@ -60,7 +56,7 @@ class StudyActor:
     state: ActorHandle[UniRLState]
     env_params: EnvParams
     num_workers: int
-    experiment_id: int
+    experiment_name: str
     verifier_model: AgentsSDKModel = field(init=False, default=None)  # type: ignore
     rust_doc_analyzer: AsyncRustDocAnalyzer = field(init=False, default=None)  # type: ignore
     knowledge_db: KnowledgeDB = field(init=False, default=None)  # type: ignore
@@ -72,11 +68,12 @@ class StudyActor:
     async def setup(self):
         logger.info(f"Study actor {self.process_id} setup started.")
         self.verifier_model = get_gemini()
+        # Actor initialization always skips ES bulk insert/initialization
         self.rust_doc_analyzer = await AsyncRustDocAnalyzer.create_from_libdir(
-            self.env_params.library.local_path
+            self.env_params.library.local_path, skip_init=True
         )
-        self.knowledge_db = KnowledgeDB.for_experiment(self.experiment_id)
-        await self.knowledge_db.initialize()
+        self.knowledge_db = KnowledgeDB.for_experiment(self.experiment_name)
+        # KnowledgeDB.initialize is now handled by the State actor's setup
         logger.info(f"Study actor {self.process_id} setup completed.")
 
     @ray.method
@@ -100,10 +97,12 @@ class StudyActor:
         while True:
             latest_model = await self.state.get_latest_model.remote()
             task_manager = await task_manager_from_state_handle(self.state)
-
             async with task_manager as current:
                 if is_study(current):
                     task = current.task
+                    logger.debug(
+                        f"Study worker {worker_id} processing task: {task.task}"
+                    )
                     ret = await ss_solve_verify(
                         solver_model=latest_model,
                         verifier_model=self.verifier_model,
@@ -113,6 +112,10 @@ class StudyActor:
                         qwen_no_think=self.env_params.qwen_no_think,
                         runtime_settings=self.env_params.runtime_settings,
                         knowledge_db=self.knowledge_db,
+                    )
+
+                    logger.debug(
+                        f"Study worker {worker_id} processing task: {task.task}"
                     )
 
                     if not task.is_generation or not isinstance(
@@ -264,19 +267,23 @@ def setup_training_client(
     return training_client
 
 
+ray.init(
+    configure_logging=True,
+    logging_config=ray.LoggingConfig(
+        log_level="INFO", additional_log_standard_attrs=["name"]
+    ),
+    runtime_env={"env_vars": {"RAY_DEBUG": "1"}},
+)
+
+
 async def main():
     load_dotenv()
     # Suppress ray console output
-    ray.init(
-        configure_logging=True,
-        logging_config=ray.LoggingConfig(
-            log_level="INFO", additional_log_standard_attrs=["name"]
-        ),
-    )
+
     cfg = UniRLConfig(
         experiment_setting=ExperimentSettings(
             wandb_project="Adapter Agent UniRL",
-            experiment_name=f"Adapter Agent_UniRL_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            experiment_name=f"unirl_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         ),
         env_params=EnvParams(
             max_turns=10,
@@ -293,7 +300,8 @@ async def main():
             lora_rank=32,
         ),
         study_rollout_params=StudyRolloutParams(
-            num_study_actor=10,
+            num_study_actor=1,
+            # num_study_actor=10,
             rollouts_per_actor=8,
         ),
         train_params=UniRLTrainParams(
@@ -331,52 +339,49 @@ async def main():
 
     sampling_client_manager = SharedSamplingClient(model.sampling_client)
 
-    # Initialize Trajectory DB using PostgreSQL experiment registry
-    db = await get_db()
-    experiment_id = await db.register_experiment(cfg.experiment_setting.experiment_name)
-    trajectory_db = await create_trajectory_db(experiment_id)
-    buffer = TrajectoryReplayBuffer(
-        min_sft_batch_size=cfg.train_params.min_sft_batch_size,
-        max_sft_batch_size=cfg.train_params.max_sft_batch_size,
-        max_sft_reuse=cfg.train_params.max_sft_reuse,
-        trajectory_db=trajectory_db,
-        renderer=model.renderer,
+    # Warm up Elasticsearch index for RustDoc in main process to avoid actor thundering herd
+    logger.info("Warming up RustDoc Elasticsearch index in main process...")
+    await AsyncRustDocAnalyzer.create_from_libdir(
+        cfg.env_params.library.local_path, skip_init=False
     )
+    logger.info("RustDoc ES warmup complete.")
 
     UniRLStateActor = ray.remote(UniRLState)
     state: ActorHandle[UniRLState] = cast(
         ActorHandle[UniRLState],
         UniRLStateActor.remote(
             study_task_queue=study_queue,
-            buffer=buffer,
             litellm_model_name=model.model,
             renderer=model.renderer,
             sampling_client_manager=sampling_client_manager,
             task_verifier=task_verifier,
             library_name=cfg.env_params.library.name,
             cfg=cfg,
-            experiment_id=experiment_id,
+            experiment_name=cfg.experiment_setting.experiment_name,
         ),
     )
-    # Ensure initial graph is saved to DB for visualization
-    await state.setup_db.remote()
 
-    TrainWorkerActorClass = ray.remote(TrainWorker)
-    train_worker_actor: ActorHandle[TrainWorker] = cast(
-        ActorHandle[TrainWorker],
-        TrainWorkerActorClass.remote(
-            state,
-            cfg.train_params,
-            cfg.experiment_setting,
-            cfg.model_loading_settings,
-        ),
-    )
+    # Initialize database and register experiment inside the actor
+    await state.setup.remote()
+    experiment_name = cfg.experiment_setting.experiment_name
+    logger.info(f"Experiment initialized: {experiment_name}")
+
+    # TrainWorkerActorClass = ray.remote(TrainWorker)
+    # train_worker_actor: ActorHandle[TrainWorker] = cast(
+    #     ActorHandle[TrainWorker],
+    #     TrainWorkerActorClass.remote(
+    #         state,
+    #         cfg.train_params,
+    #         cfg.experiment_setting,
+    #         cfg.model_loading_settings,
+    #     ),
+    # )
     async with litellm_concurrent_limit(
         cfg.study_rollout_params.num_study_actor
         * cfg.study_rollout_params.rollouts_per_actor
         + 10
     ):
-        train_task = train_worker_actor.run.remote()
+        # train_task = train_worker_actor.run.remote()
         # Study Worker の起動
         study_workers = []
         StudyActorClass = ray.remote(StudyActor)
@@ -391,7 +396,7 @@ async def main():
                     state,
                     cfg.env_params,
                     cfg.study_rollout_params.rollouts_per_actor,
-                    experiment_id,
+                    experiment_name,
                 ),
             )
 
@@ -399,7 +404,8 @@ async def main():
             study_workers.append(worker_task_ref)
             logger.info(f"Launched Study Worker {i}...")
 
-        ray.get([train_task, *study_workers])
+        ray.get([*study_workers])
+        # ray.get([train_task, *study_workers])
 
 
 if __name__ == "__main__":

@@ -17,14 +17,14 @@ from tinker_cookbook.utils.ml_log import Logger as MLLogger
 
 from adapter_agent.hierarchical.agent.task_verifier import TaskVerifier
 from adapter_agent.hierarchical.types import Task
-from adapter_agent.rl.config import EnvParams, ExperimentSettings, ModelLoadingSettings
 from adapter_agent.library.knowledge_db import KnowledgeDB
+from adapter_agent.rl.config import EnvParams, ExperimentSettings, ModelLoadingSettings
 from adapter_agent.rl.env.conclusion import conclusion_to_metrics
 from adapter_agent.rl.env.session_result import (
     RewireSessionResultNormal,
     RewireSessionResultSuccess,
 )
-from adapter_agent.rl.postgres_db import get_db
+from adapter_agent.rl.rl_database import RLDatabase
 from adapter_agent.rl.shared_sampling_client import SharedSamplingClient
 from adapter_agent.rl.task_net import (
     StudyTaskCompleted,
@@ -33,7 +33,6 @@ from adapter_agent.rl.task_net import (
     TaskNetworkCompleted,
     TaskNetworkTask,
 )
-from adapter_agent.rl.trajectory_db import TrajectoryDB
 from adapter_agent.util.logger_util import setup_base_loglevel
 
 logger = logging.getLogger(__name__)
@@ -84,21 +83,21 @@ class TrajectoryReplayBuffer:
     min_sft_batch_size: int
     max_sft_batch_size: int
     max_sft_reuse: int
-    trajectory_db: TrajectoryDB
     renderer: Renderer
+    db: RLDatabase = field(init=False)
 
     async def get_batch(self) -> TinkerBatch | None:
         # Check available count before potentially consuming/deleting trajectories
-        count = await self.trajectory_db.get_count(self.max_sft_reuse)
+        count = await self.db.get_count(self.max_sft_reuse)
         if count < self.min_sft_batch_size:
             # Added for visibility: only log occasionally if it's repeatedly empty
-            logger.info(
+            logger.debug(
                 f"Buffer check: {count}/{self.min_sft_batch_size} trajectories available. Training waiting..."
             )
             return None
 
         batch_size = self.max_sft_batch_size
-        items = await self.trajectory_db.get_batch(batch_size, self.max_sft_reuse)
+        items = await self.db.get_batch(batch_size, self.max_sft_reuse)
         if len(items) < self.min_sft_batch_size:
             return None
 
@@ -129,7 +128,7 @@ class TrajectoryReplayBuffer:
         )
 
     async def get_metrics(self) -> dict[str, int]:
-        count = await self.trajectory_db.get_count(self.max_sft_reuse)
+        count = await self.db.get_count(self.max_sft_reuse)
         return {
             "study_buffer_size": count,
         }
@@ -179,16 +178,18 @@ class MetricManager:
 class UniRLState:
     # Model
     study_task_queue: TaskNetwork
-    buffer: TrajectoryReplayBuffer
     litellm_model_name: str
     renderer: Renderer
     sampling_client_manager: SharedSamplingClient
     task_verifier: TaskVerifier
     library_name: str
     cfg: UniRLConfig
-    experiment_id: int
+    experiment_name: str
+    db: RLDatabase = field(init=False, default=None)  # type: ignore
+    buffer: TrajectoryReplayBuffer = field(init=False, default=None)  # type: ignore
     metric_manager: MetricManager = field(init=False, default=None)  # type: ignore
     ml_logger: MLLogger = field(init=False, default=None)  # type: ignore
+    kdb: KnowledgeDB = field(init=False, default=None)  # type: ignore
 
     def __post_init__(self):
         setup_base_loglevel()
@@ -207,30 +208,50 @@ class UniRLState:
         )
 
     @ray.method
-    async def setup_db(self):
+    async def setup(self) -> str:
+        """
+        Initialize database connection and register experiment.
+        This must be called once after actor creation.
+        """
+        self.db = RLDatabase()
+        await self.db.connect()
+        # Ensure experiment exists in DB
+        await self.db.register_experiment(self.experiment_name)
+
+        # Initialize KnowledgeDB once for this experiment
+        self.kdb = KnowledgeDB.for_experiment(self.experiment_name)
+        await self.kdb.initialize()
+
+        # Initialize Replay Buffer internally with the actor's DB and Renderer
+        self.buffer = TrajectoryReplayBuffer(
+            min_sft_batch_size=self.cfg.train_params.min_sft_batch_size,
+            max_sft_batch_size=self.cfg.train_params.max_sft_batch_size,
+            max_sft_reuse=self.cfg.train_params.max_sft_reuse,
+            renderer=self.renderer,
+        )
+        self.buffer.db = self.db
+        self.buffer.db.experiment_name = self.experiment_name
+
         # Initial save of graph to PostgreSQL for visualization
-        db = await get_db()
-        await db.update_graph_json(self.experiment_id, self.study_task_queue.to_dict())
+        await self.db.update_graph_json(self.study_task_queue.to_dict())
 
         # Sync Knowledge from Postgres to ES (Postgres is SSOT)
-        knowledges = await db.get_knowledges(self.experiment_id)
+        knowledges = await self.db.get_knowledges()
         if knowledges:
-            logger.info(f"Syncing {len(knowledges)} knowledge items from Postgres to ES...")
-            kdb = KnowledgeDB.for_experiment(self.experiment_id)
-            await kdb.initialize()
+            logger.info(
+                f"Syncing {len(knowledges)} knowledge items from Postgres to ES..."
+            )
             for k in knowledges:
-                await kdb.add_knowledge(
-                    id=k.id,
-                    query=k.instruction,
-                    title=k.title,
-                    content=k.content
+                await self.kdb.add_knowledge(
+                    id=k.id, query=k.instruction, title=k.title, content=k.content
                 )
-            await kdb.close()
             logger.info("Knowledge sync complete.")
 
         # Also save to local data.json as backup
         log_root = self.cfg.experiment_setting.log_root()
         self.study_task_queue.save_json_sync(log_root / "data.json")
+
+        return self.experiment_name
 
     @ray.method
     def get_next_task(self) -> TaskNetworkTask:
@@ -252,19 +273,16 @@ class UniRLState:
             # 1. Handle newly discovered knowledge (SSOT)
             knowledge_id = None
             if isinstance(result, RewireSessionResultSuccess) and result.knowledge:
-                db = await get_db()
                 # Save to Postgres first
-                knowledge_id = await db.create_knowledge(
-                    experiment_id=self.experiment_id,
+                knowledge_id = await self.db.create_knowledge(
+                    knowledge_id=result.knowledge.id,
                     task_id=result.task.id,
                     instruction=result.task.instruction,
                     title=result.knowledge.title,
                     content=result.knowledge.content,
                 )
                 # Then index in ES using the Postgres ID
-                kdb = KnowledgeDB.for_experiment(self.experiment_id)
-                await kdb.initialize()
-                await kdb.add_knowledge(
+                await self.kdb.add_knowledge(
                     id=knowledge_id,
                     query=result.task.instruction,
                     title=result.knowledge.title,
@@ -273,9 +291,7 @@ class UniRLState:
                 # Also update in-memory TaskNetwork knowledge ID for visualization mapping
                 task_meta = self.study_task_queue.nodes[result.task.id]
                 for k in task_meta.knowledges.values():
-                    k.knowledge_id = str(knowledge_id)
-
-                await kdb.close()
+                    k.knowledge_id = knowledge_id
 
             # 2. Extract citations
             citations_data = [
@@ -287,16 +303,19 @@ class UniRLState:
                 }
                 for c in result.citations
             ]
-            
+
             # 3. Save trajectory with references to stable Knowledge IDs
-            await self.buffer.trajectory_db.add_trajectory(
+            await self.buffer.db.add_trajectory(
                 task_id=result.task.id,
                 instruction=result.task.instruction,
                 conclusion=result.conclusion,
                 reward=result.reward,
                 trajectory=result.trials,
+                knowledge_id=knowledge_id,
                 final_knowledge=result.knowledge.content if result.knowledge else None,
-                final_knowledge_title=result.knowledge.title if result.knowledge else None,
+                final_knowledge_title=result.knowledge.title
+                if result.knowledge
+                else None,
                 citations=citations_data,
             )
 
@@ -304,10 +323,7 @@ class UniRLState:
 
         if self.metric_manager.should_study_log():
             # Save to PostgreSQL for visualization
-            db = await get_db()
-            await db.update_graph_json(
-                self.experiment_id, self.study_task_queue.to_dict()
-            )
+            await self.db.update_graph_json(self.study_task_queue.to_dict())
 
             # Also save to local log_root as backup if vis_json_path is set
             if self.cfg.vis_json_path:

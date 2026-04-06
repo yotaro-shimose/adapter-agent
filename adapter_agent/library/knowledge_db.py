@@ -18,9 +18,34 @@ class KnowledgeDB:
         self.index_name = index_name
 
     @classmethod
-    def for_experiment(cls, experiment_id: int, host: str = "http://localhost:9200") -> "KnowledgeDB":
-        """Create a KnowledgeDB instance with an index name scoped to the experiment ID."""
-        return cls(host=host, index_name=f"knowledge_box_{experiment_id}")
+    def for_experiment(cls, experiment_name: str, host: str = "http://localhost:9200") -> "KnowledgeDB":
+        """Create a KnowledgeDB instance with an index name scoped to the experiment name."""
+        index_name = f"knowledge_box_{experiment_name}"
+
+        # Validate Elasticsearch index name rules:
+        # - Lowercase only
+        # - Cannot include \, /, *, ?, ", <, >, |, ` ` (space), ,, #
+        # - Cannot start with -, _, +
+        # - Cannot be . or ..
+        # - Cannot be longer than 255 bytes
+        if index_name != index_name.lower():
+            raise ValueError(
+                f"Elasticsearch index name must be lowercase. Got: '{index_name}' "
+                f"(derived from experiment_name: '{experiment_name}'). "
+                f"Please use a lowercase experiment name without spaces for KnowledgeDB compatibility."
+            )
+
+        import re
+
+        invalid_chars = r'[\\/*?"<>| ,#]'
+        if re.search(invalid_chars, index_name):
+            raise ValueError(
+                f"Elasticsearch index name contains invalid characters. Got: '{index_name}' "
+                f"(derived from experiment_name: '{experiment_name}'). "
+                f"Invalid characters are: \\ / * ? \" < > | , # and space."
+            )
+
+        return cls(host=host, index_name=index_name)
 
     async def initialize(self) -> None:
         """Create the index with BM25 settings if it doesn't exist."""
@@ -50,12 +75,13 @@ class KnowledgeDB:
                 }
             )
 
-    async def add_knowledge(self, id: int, query: str, title: str, content: str) -> str:
+    async def add_knowledge(self, id: str, query: str, title: str, content: str) -> str:
         """Add a new knowledge entry using a stable Postgres ID and return the ES document ID."""
         logger.info(f"Adding knowledge to '{self.index_name}' (id: {id}, title: {title}, query: {query})")
         res = await self.client.index(
             index=self.index_name,
-            id=str(id), # Use Postgres ID as the stable ES document ID
+            id=id, # Use Postgres UUID as the stable ES document ID
+
             document={
                 "query": query,
                 "title": title,

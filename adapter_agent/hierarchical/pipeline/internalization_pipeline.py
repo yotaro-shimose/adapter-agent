@@ -56,6 +56,8 @@ class PipelineConfig:
     k_sft: int = 16
     k_rl: int = 16
     k_rollout: int = 16
+    over_generation_factor: float = 1.5
+    max_generation_attempts: int = 3
     concurrency: int = 8
     max_iterations: int = 10
 
@@ -281,7 +283,32 @@ class InternalizationPipeline:
             iteration += 1
             logger.info(f"--- Iteration {iteration} ---")
 
-            # 1. Identify knowledge items needing SFT
+            # 1. Prepare task pools for all knowledge items IN PARALLEL
+            # If a knowledge item fails to provide enough tasks, it is permanently removed.
+            
+            logger.info(f"Preparing task pools for {len(self.config.knowledge_list)} knowledge items...")
+            
+            pools_results = await asyncio.gather(
+                *[self._prepare_task_pool(k) for k in self.config.knowledge_list]
+            )
+            
+            knowledge_pools: dict[str, list[QRA]] = {}
+            active_knowledge = []
+            
+            for k, pool in zip(self.config.knowledge_list, pools_results):
+                if pool:
+                    knowledge_pools[k.id] = pool
+                    active_knowledge.append(k)
+                else:
+                    logger.error(f"KNOWLEDGE REJECTED: '{k.title}' failed to generate enough valid tasks. Removing permanently.")
+            
+            self.config.knowledge_list = active_knowledge
+            
+            if not self.config.knowledge_list:
+                logger.warning("No knowledge items remaining. Terminating pipeline.")
+                break
+
+            # 2. Identify knowledge items needing SFT
             sft_candidates = [
                 k
                 for k in self.config.knowledge_list
@@ -293,15 +320,15 @@ class InternalizationPipeline:
 
             if sft_targets:
                 logger.info(f"Selected {len(sft_targets)} items for SFT refinement.")
-                sft_result = await self.execute_sft_step(sft_targets)
+                sft_result = await self.execute_sft_step(sft_targets, knowledge_pools)
 
-            # 2. RL Phase: Exploration and Correction for ALL knowledge items in PARALLEL
+            # 3. RL Phase: Exploration and Correction for ALL knowledge items in PARALLEL
             logger.info(
                 f"Running RL Phase for {len(self.config.knowledge_list)} items concurrently."
             )
 
             rl_results = await asyncio.gather(
-                *[self.execute_rl_step(k) for k in self.config.knowledge_list]
+                *[self.execute_rl_step(k, knowledge_pools[k.id]) for k in self.config.knowledge_list]
             )
 
             iteration_metrics = {}
@@ -369,50 +396,59 @@ class InternalizationPipeline:
                 logger.info("All knowledge items internalized successfully!")
                 break
 
-    async def generate_teacher_tasks(
-        self, count: int, knowledge: Knowledge
-    ) -> list[QRA]:
+    async def _prepare_task_pool(self, knowledge: Knowledge) -> list[QRA] | None:
         """
-        Generate and verify high-quality QRA tasks using the teacher model for a specific Knowledge item.
+        Generate a pool of high-quality tasks for both SFT and RL.
+        Includes over-generation and retry logic.
         """
-        logger.info(
-            f"Teacher generating {count} high-quality tasks for '{knowledge.title}'..."
-        )
+        target_valid_count = self.config.k_sft + self.config.k_rl
+        gen_batch_size = int(target_valid_count * self.config.over_generation_factor)
 
-        tasks = [self.generator.generate_sft(knowledge) for _ in range(count)]
-        tasks_raw_maybe: list[QRA | None] = await gather_with_semaphore(
-            tasks, max_concurrent=self.config.concurrency
-        )
-        tasks_raw = [t for t in tasks_raw_maybe if t is not None]
-
-        if not tasks_raw:
-            logger.warning(f"No valid teacher tasks generated for '{knowledge.title}'.")
-            return []
-
-        # 2. Verify
-        logger.info(
-            f"Verifying {len(tasks_raw)} teacher-generated tasks for '{knowledge.title}'..."
-        )
-        verification_tasks = [
-            self._verify_with_execution(qra.question, qra) for qra in tasks_raw
-        ]
-        results: list[RLTrajectory] = await gather_with_semaphore(
-            verification_tasks, max_concurrent=self.config.concurrency
-        )
-
-        # 3. Handle failures? For now, we return all, but verifier result in QRA is important.
-        # Actually, let's filter only successful ones to ensure RL always has valid data.
-        valid_tasks = [tasks_raw[i] for i, res in enumerate(results) if res.success]
-
-        # If too few were valid, we might want to try again or just proceed with what we have.
-        if len(valid_tasks) < count:
-            logger.warning(
-                f"Only {len(valid_tasks)}/{count} teacher tasks were valid (verified) for '{knowledge.title}'."
+        valid_pool = []
+        for attempt in range(self.config.max_generation_attempts):
+            logger.info(
+                f"Attempt {attempt + 1}/{self.config.max_generation_attempts}: "
+                f"Generating {gen_batch_size} tasks for '{knowledge.title}'..."
             )
 
-        return valid_tasks
+            # Generate batch
+            tasks = [self.generator.generate_sft(knowledge) for _ in range(gen_batch_size)]
+            tasks_raw_maybe = await gather_with_semaphore(
+                tasks, max_concurrent=self.config.concurrency
+            )
+            tasks_raw = [t for t in tasks_raw_maybe if t is not None]
 
-    async def execute_sft_step(self, targets: list[Knowledge]) -> SFTStepResult:
+            if not tasks_raw:
+                continue
+
+            # Verify batch
+            verification_tasks = [
+                self._verify_with_execution(qra.question, qra) for qra in tasks_raw
+            ]
+            results: list[RLTrajectory] = await gather_with_semaphore(
+                verification_tasks, max_concurrent=self.config.concurrency
+            )
+
+            # Add successful ones to pool
+            valid_pool.extend(
+                [tasks_raw[i] for i, res in enumerate(results) if res.success]
+            )
+
+            if len(valid_pool) >= target_valid_count:
+                logger.info(
+                    f"Successfully prepared pool with {len(valid_pool)} tasks for '{knowledge.title}'."
+                )
+                return valid_pool
+
+        logger.warning(
+            f"Failed to reach target task count ({target_valid_count}) for '{knowledge.title}' "
+            f"after {self.config.max_generation_attempts} attempts. Only got {len(valid_pool)}."
+        )
+        return None
+
+    async def execute_sft_step(
+        self, targets: list[Knowledge], pools: dict[str, list[QRA]]
+    ) -> SFTStepResult:
         """
         Perform supervised fine-tuning across multiple knowledge targets.
         """
@@ -420,10 +456,12 @@ class InternalizationPipeline:
         assert self.training_client is not None, "TrainingClient must be initialized"
 
         combined_qra_list = []
-        qra_lists = await asyncio.gather(
-            *[self.generate_teacher_tasks(self.config.k_sft, k) for k in targets]
-        )
-        combined_qra_list = [qra for sublist in qra_lists for qra in sublist]
+        for k in targets:
+            pool = pools[k.id]
+            # Take k_sft tasks and consume them
+            sft_tasks = pool[: self.config.k_sft]
+            pools[k.id] = pool[self.config.k_sft :]
+            combined_qra_list.extend(sft_tasks)
 
         if combined_qra_list:
             # Pick a representative sample (from the first target)
@@ -538,14 +576,16 @@ class InternalizationPipeline:
             )
 
     async def execute_rl_step(
-        self, knowledge: Knowledge, eval_tasks: list[QA] | None = None
+        self, knowledge: Knowledge, pool: list[QRA]
     ) -> RLStepResult:
         """
-        Generate evaluation tasks for a specific knowledge item, rollout solutions, verify, and train GRPO.
+        Rollout solutions for pool tasks, verify, and train GRPO.
         """
         logger.info(f"Executing RL Step for '{knowledge.title}'...")
 
-        tasks = await self._ensure_eval_tasks(knowledge, eval_tasks)
+        # Use the remaining tasks in the pool for RL (capped at k_rl)
+        tasks = pool[: self.config.k_rl]
+        
         task_results = await gather_with_semaphore(
             [self._rollout_and_verify_task_group(t) for t in tasks],
             max_concurrent=self.config.concurrency,
@@ -557,29 +597,6 @@ class InternalizationPipeline:
         await self._sync_sampling_weights()
 
         return self._summarize_rl_results(task_results)
-
-    async def _ensure_eval_tasks(
-        self, knowledge: Knowledge, eval_tasks: list[QA] | None
-    ) -> list[QA]:
-        if eval_tasks is not None:
-            logger.info(
-                f"Re-using {len(eval_tasks)} tasks for '{knowledge.title}' RL Step."
-            )
-            return eval_tasks
-
-        logger.info(
-            f"Generating {self.config.k_rl} RL eval tasks for '{knowledge.title}'..."
-        )
-        # (Assuming the Knowledge item has all needed info; no need for rust_doc_analyzer modules here)
-
-        async def generate_rl_task(_) -> QA | None:
-            return await self.generator.generate_rl(knowledge)
-
-        tasks_maybe = await gather_with_semaphore(
-            [generate_rl_task(i) for i in range(self.config.k_rl)],
-            max_concurrent=self.config.concurrency,
-        )
-        return [t for t in tasks_maybe if t is not None]
 
     async def _rollout_and_verify_task_group(self, qa: QA) -> TaskRolloutResult:
         assert isinstance(self.solver.model, TinkerModel)

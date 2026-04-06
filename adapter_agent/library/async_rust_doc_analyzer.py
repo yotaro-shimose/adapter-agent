@@ -146,7 +146,8 @@ class AsyncRustDocAnalyzer:
         path: Path, 
         host: str = "http://localhost:9200", 
         pubapi_path: Optional[Path] = None, 
-        index_name: Optional[str] = None
+        index_name: Optional[str] = None,
+        skip_init: bool = False
     ) -> Self:
         if not path.exists():
             raise FileNotFoundError(f"JSON file not found at {path}")
@@ -195,11 +196,17 @@ class AsyncRustDocAnalyzer:
             pubapi_path=pubapi_path
         )
         
-        await cls._init_elasticsearch(es_client, final_index_name, async_instance)
+        if not skip_init:
+            await cls._init_elasticsearch(es_client, final_index_name, async_instance)
         return async_instance
 
     @classmethod
-    async def create_from_libdir(cls, host_lib_dir: Path, host: str = "http://localhost:9200") -> Self:
+    async def create_from_libdir(
+        cls, 
+        host_lib_dir: Path, 
+        host: str = "http://localhost:9200",
+        skip_init: bool = False
+    ) -> Self:
         doc_path = host_lib_dir / "target" / "doc"
         pubapi_path = host_lib_dir / "pubapi.txt"
         json_path = None
@@ -209,7 +216,7 @@ class AsyncRustDocAnalyzer:
                 break
 
         if json_path and json_path.exists():
-            return await cls.create_from_json(json_path, host=host, pubapi_path=pubapi_path)
+            return await cls.create_from_json(json_path, host=host, pubapi_path=pubapi_path, skip_init=skip_init)
         else:
             raise FileNotFoundError(f"Could not find rustdoc json in {doc_path}.")
 

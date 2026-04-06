@@ -61,7 +61,7 @@ async def get_graph(experiment_name: str):
     
     # AGGREGATE COUNTS FROM Trajectory table for SSOT
     trajectories = await client.trajectory.find_many(
-        where={"experiment_id": experiment.id}
+        where={"experiment_name": experiment_name}
     )
     
     # Calculate counts per task_id
@@ -113,7 +113,7 @@ async def get_trajectory(experiment_name: str, task_id: str):
     # Fetch trajectories for this experiment and task
     trajectories = await client.trajectory.find_many(
         where={
-            "experiment_id": exp.id,
+            "experiment_name": experiment_name,
             "task_id": task_id
         },
         order={"created_at": "asc"},

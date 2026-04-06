@@ -30,7 +30,6 @@ from adapter_agent.rl.env.session_result import (
     RewireSessionResultSuccess,
 )
 from adapter_agent.rl.env.simplified_solver import (
-    SimplifiedSolverEnv,
     SimplifiedSolverEnvState,
     build_simplified_solver_env,
 )
@@ -99,7 +98,7 @@ async def ss_solve_verify(
                             "Maximum context length exceeded during the rewiring loop"
                         )
                         # Fallback to message env for recording the failure
-                        msg_env = cast(SimplifiedSolverEnv, env.message_env)
+                        msg_env = env.message_env
                         msg_env.history.append(CONTEXT_EXCEEDED_MESSAGE)
                         trajectory = Trajectory(
                             transitions=transitions,
@@ -129,7 +128,7 @@ async def ss_solve_verify(
                     if step_result.episode_done:
                         break
 
-                msg_env = cast(SimplifiedSolverEnv, env.message_env)
+                msg_env = env.message_env
                 trajectory = Trajectory(
                     transitions=transitions,
                     final_ob=solver_model.renderer.build_generation_prompt(
@@ -213,7 +212,7 @@ async def ss_solve_verify(
                     return RewireSessionResultFailure(
                         task=task,
                         trials=msg_env.history,
-                        conclusion="rewire_failed",  # step_result from TokenEnv doesn't have conclusion
+                        conclusion=step_result.conclusion,
                         trajectory=trajectory,
                         knowledge=knowledge_obj,
                         citations=citations,

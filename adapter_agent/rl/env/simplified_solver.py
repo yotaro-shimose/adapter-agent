@@ -15,7 +15,6 @@ from tinker_cookbook.renderers.base import Message as TinkerMessage
 from tinker_cookbook.renderers.base import TextPart, ToolCall, ToolSpec
 from tinker_cookbook.rl import types
 from tinker_cookbook.rl.message_env import (
-    EnvFromMessageEnv,
     MessageEnv,
     MessageStepResult,
 )
@@ -79,6 +78,11 @@ class SimplifiedSolverEnvState:
 @dataclass
 class SSStepResult(MessageStepResult):
     conclusion: SSConclusion = field(default="not_finished")
+
+
+@dataclass(kw_only=True)
+class SSTokenEnvResult(types.StepResult):
+    conclusion: SSConclusion
 
 
 @dataclass
@@ -292,7 +296,7 @@ Error Reflection: If `<write_and_run>` test fails, analyze the compiler error ca
     ]
 
 
-class SimplifiedSolverTokenEnv(EnvFromMessageEnv):
+class SimplifiedSolverTokenEnv(types.Env):
     def __init__(
         self,
         renderer: Renderer,
@@ -302,14 +306,13 @@ class SimplifiedSolverTokenEnv(EnvFromMessageEnv):
         terminate_on_parse_error: bool = True,
         max_trajectory_tokens: int | None = None,
     ):
-        super().__init__(
-            renderer=renderer,
-            message_env=message_env,
-            failed_parse_reward=failed_parse_reward,
-            terminate_on_parse_error=terminate_on_parse_error,
-            max_trajectory_tokens=max_trajectory_tokens,
-        )
+        self.renderer = renderer
+        self.message_env = message_env
+        self.failed_parse_reward = failed_parse_reward
+        self.terminate_on_parse_error = terminate_on_parse_error
+        self.max_trajectory_tokens = max_trajectory_tokens
         self.internalized_knowledge = internalized_knowledge
+        self._base_stop_condition = renderer.get_stop_sequences()
 
     async def get_state(self) -> SimplifiedSolverEnvState:
         return await self.message_env.get_state()  # type: ignore
@@ -324,16 +327,17 @@ class SimplifiedSolverTokenEnv(EnvFromMessageEnv):
 
     async def step(
         self, action: types.Action, *, extra: types.ActionExtra | None = None
-    ) -> types.StepResult:
+    ) -> SSTokenEnvResult:
         assistant_message, parse_success = self.renderer.parse_response(action)
 
         if not parse_success:
-            return types.StepResult(
+            return SSTokenEnvResult(
                 reward=self.failed_parse_reward,
                 episode_done=self.terminate_on_parse_error,
                 next_observation=tinker.ModelInput.empty(),
                 next_stop_condition=self._base_stop_condition,
                 metrics={"parse_error": 1.0},
+                conclusion="parse_failed",
             )
 
         if self.internalized_knowledge:
@@ -362,20 +366,22 @@ class SimplifiedSolverTokenEnv(EnvFromMessageEnv):
             self.max_trajectory_tokens is not None
             and next_observation.length > self.max_trajectory_tokens
         ):
-            return types.StepResult(
+            return SSTokenEnvResult(
                 reward=0.0,
                 episode_done=True,
                 next_observation=tinker.ModelInput.empty(),
                 next_stop_condition=self._base_stop_condition,
                 metrics={**msg_step.metrics, "context_overflow": 1.0},
+                conclusion="context_length_exceeded",
             )
 
-        return types.StepResult(
+        return SSTokenEnvResult(
             reward=msg_step.reward,
             episode_done=msg_step.episode_done,
             next_observation=next_observation,
             next_stop_condition=next_stop_condition,
             metrics=msg_step.metrics,
+            conclusion=msg_step.conclusion,
         )
 
 
