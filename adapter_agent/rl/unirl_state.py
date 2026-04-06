@@ -186,7 +186,6 @@ class UniRLState:
     cfg: UniRLConfig
     experiment_name: str
     db: RLDatabase = field(init=False, default=None)  # type: ignore
-    buffer: TrajectoryReplayBuffer = field(init=False, default=None)  # type: ignore
     metric_manager: MetricManager = field(init=False, default=None)  # type: ignore
     ml_logger: MLLogger = field(init=False, default=None)  # type: ignore
     kdb: KnowledgeDB = field(init=False, default=None)  # type: ignore
@@ -221,16 +220,6 @@ class UniRLState:
         # Initialize KnowledgeDB once for this experiment
         self.kdb = KnowledgeDB.for_experiment(self.experiment_name)
         await self.kdb.initialize()
-
-        # Initialize Replay Buffer internally with the actor's DB and Renderer
-        self.buffer = TrajectoryReplayBuffer(
-            min_sft_batch_size=self.cfg.train_params.min_sft_batch_size,
-            max_sft_batch_size=self.cfg.train_params.max_sft_batch_size,
-            max_sft_reuse=self.cfg.train_params.max_sft_reuse,
-            renderer=self.renderer,
-        )
-        self.buffer.db = self.db
-        self.buffer.db.experiment_name = self.experiment_name
 
         # Initial save of graph to PostgreSQL for visualization
         await self.db.update_graph_json(self.study_task_queue.to_dict())
@@ -305,7 +294,7 @@ class UniRLState:
             ]
 
             # 3. Save trajectory with references to stable Knowledge IDs
-            await self.buffer.db.add_trajectory(
+            await self.db.add_trajectory(
                 task_id=result.task.id,
                 instruction=result.task.instruction,
                 conclusion=result.conclusion,
@@ -331,12 +320,10 @@ class UniRLState:
 
     async def handle_study_result(self, result: RewireSessionResultNormal):
         metrics = conclusion_to_metrics(result.conclusion)
-        buffer_metrics = await self.buffer.get_metrics()
         task_queue_metrics = {
             "study_queue_size": self.study_task_queue.node_count(),
         }
         non_averaging_metrics: dict[str, float | int] = {
-            **buffer_metrics,
             **task_queue_metrics,
         }
         self.metric_manager.register_study_metrics(metrics, non_averaging_metrics)
@@ -348,9 +335,9 @@ class UniRLState:
     def is_finished(self) -> bool:
         return False
 
-    @ray.method
-    async def get_batch(self) -> TinkerBatch | None:
-        return await self.buffer.get_batch()
+    # @ray.method
+    # async def get_batch(self) -> TinkerBatch | None:
+    #     return await self.buffer.get_batch()
 
     @ray.method
     def log_train_metrics(self, metrics: dict[str, Any]):

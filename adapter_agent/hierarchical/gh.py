@@ -11,6 +11,7 @@ from oai_utils.async_utils import gather_with_semaphore
 from oai_utils.litellm import litellm_concurrent_limit
 from pydantic import BaseModel
 
+from adapter_agent.hierarchical.types import Task
 from adapter_agent.model_helper import get_gemini
 
 batch_completion
@@ -179,6 +180,18 @@ async def main():
             print(f"Saved {len(data_rows)} rows to {output_file}")
         else:
             print("No data rows generated.")
+
+
+def load_gh_archive() -> list[Task]:
+    import polars as pl
+
+    path = Path("data/easy_benchmark_verified.csv")
+    df = pl.read_csv(path)
+    tasks = [
+        Task.from_instruction(row["problem_statement"])
+        for row in df.iter_rows(named=True)
+    ]
+    return tasks
 
 
 if __name__ == "__main__":

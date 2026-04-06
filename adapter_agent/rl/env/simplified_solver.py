@@ -2,7 +2,7 @@ import asyncio
 import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, Self
+from typing import Any, Self, cast
 
 import tinker
 from coder_mcp.runtime import (
@@ -14,10 +14,7 @@ from tinker_cookbook.renderers import Renderer
 from tinker_cookbook.renderers.base import Message as TinkerMessage
 from tinker_cookbook.renderers.base import TextPart, ToolCall, ToolSpec
 from tinker_cookbook.rl import types
-from tinker_cookbook.rl.message_env import (
-    MessageEnv,
-    MessageStepResult,
-)
+from tinker_cookbook.rl.message_env import MessageEnv, MessageStepResult
 from tinker_cookbook.tool_use.tools import handle_tool_call
 from typing_extensions import AsyncGenerator
 
@@ -98,16 +95,14 @@ class SimplifiedSolverEnv(MessageEnv):
     history: list[TinkerMessage] = field(default_factory=list)
 
     def __post_init__(self):
-        search_tool = SearchTool(
+        self.search_tool = SearchTool(
             self.search_model,
             self.rust_doc_analyzer,
             self.knowledge_db,
             self.mutable_state,
             blocked_knowledge_ids=self.initial_state.blocked_knowledge_ids,
         )
-        self.tools = {
-            search_tool.name: search_tool,
-        }
+        self.tools = {}
 
     async def initial_observation(self) -> list[TinkerMessage]:
         if not self.history:
@@ -153,6 +148,37 @@ class SimplifiedSolverEnv(MessageEnv):
                         if part["type"] == "text"
                     )
 
+                # Detect if the agent tried to use multiple tool tags at once
+                all_tags = re.findall(
+                    r"<(search_library_doc|write_and_run|submit)>",
+                    text_content,
+                    re.DOTALL,
+                )
+                if len(all_tags) > 1:
+                    new_message = TinkerMessage(
+                        role="user",
+                        content=(
+                            f"[SYSTEM ERROR] MULTIPLE_TOOL_TAGS_DETECTED\n"
+                            f"You attempted to use multiple tool actions in a single response: {', '.join(set(all_tags))}.\n"
+                            f"You MUST only use ONE tool tag per turn. Please re-think and emit only a single action."
+                        ),
+                    )
+                    self.history.append(new_message)
+
+                    if self.mutable_state.remaining_turns <= 0:
+                        return SSStepResult(
+                            reward=0.0,
+                            episode_done=True,
+                            next_messages=self.history,
+                            conclusion="max_turns_exceeded",
+                        )
+                    return SSStepResult(
+                        reward=0.0,
+                        episode_done=False,
+                        next_messages=self.history,
+                        conclusion="multiple_tool_tags",
+                    )
+
                 # Check for XML code test submission
                 write_match = re.search(
                     r"<write_and_run>(.*?)</write_and_run>", text_content, re.DOTALL
@@ -162,9 +188,67 @@ class SimplifiedSolverEnv(MessageEnv):
                     await self.rust_env.set_content("src/main.rs", code_to_test)
 
                     run_ret, run_success = await self.rust_env.run_cargo()
-                    content = f"<FileWritten>\\nsrc/main.rs has been updated.\\n</FileWritten>\\n<CargoRunResult>\\n{run_ret}\\n</CargoRunResult>\\n<RemainingTurns>\\n{self.mutable_state.remaining_turns}\\n</RemainingTurns>"
+                    
+                    search_limit = self.mutable_state.total_turns // 2
+                    remaining_search_quota = max(0, search_limit - self.mutable_state.search_count)
+                    
+                    content = (
+                        f"<FileWritten>\nsrc/main.rs has been updated.\n</FileWritten>\n"
+                        f"<CargoRunResult>\n{run_ret}\n</CargoRunResult>\n\n"
+                        f"[STATUS]\n"
+                        f"RemainingSearchQuota: {remaining_search_quota}\n"
+                        f"RemainingTurns: {self.mutable_state.remaining_turns}"
+                    )
 
                     new_message = TinkerMessage(role="user", content=content)
+                    self.history.append(new_message)
+
+                    if self.mutable_state.remaining_turns <= 0:
+                        return SSStepResult(
+                            reward=0.0,
+                            episode_done=True,
+                            next_messages=self.history,
+                            conclusion="max_turns_exceeded",
+                        )
+                    return SSStepResult(
+                        reward=0.0,
+                        episode_done=False,
+                        next_messages=self.history,
+                        conclusion="not_finished",
+                    )
+
+                # Check for XML search tool
+                search_match = re.search(
+                    r"<search_library_doc>(.*?)</search_library_doc>",
+                    text_content,
+                    re.DOTALL,
+                )
+                if search_match:
+                    query = search_match.group(1).strip()
+                    final_ans, ctx = await self.search_tool.search(query)
+
+                    search_limit = self.mutable_state.total_turns // 2
+                    remaining_search_quota = max(
+                        0, search_limit - self.mutable_state.search_count
+                    )
+
+                    content = (
+                        f"{final_ans}\n\n"
+                        f"[STATUS]\n"
+                        f"RemainingSearchQuota: {remaining_search_quota}\n"
+                        f"RemainingTurns: {self.mutable_state.remaining_turns}"
+                    )
+
+                    new_message = TinkerMessage(role="user", content=content)
+                    # Adding knowledge_id and content as dynamic attributes to track citations
+                    cast(dict[str, Any], new_message)["knowledge_id"] = ctx.knowledge_id
+                    cast(dict[str, Any], new_message)[
+                        "knowledge_title"
+                    ] = ctx.knowledge_title
+                    cast(dict[str, Any], new_message)[
+                        "knowledge_content"
+                    ] = ctx.final_answer
+
                     self.history.append(new_message)
 
                     if self.mutable_state.remaining_turns <= 0:
@@ -240,15 +324,16 @@ You create a solution using simple playground to find the correct code.
 
 <Context>
 You are working in a cargo-initialized project.
-You are an **expert** in the `{env_state.library_name}` library. 
-You possess **deep internalized technical knowledge** of this library. 
-Before using the `search` tool, you MUST consult your own internal reasoning (thoughts) to retrieve API signatures, patterns, and rules. 
-Only search for highly specific details or error resolutions that are not already present in your memory.
+You need to solve the problem using `{env_state.library_name}` library which is already installed as a dependency (e.g. via `cargo add`).
+Note `{env_state.library_name}` is a new library you should be unfamilier with.
 </Context>
 
 <HowTo>
 You have a simplified coding environment with the following tools:
-- `search`: A JSON tool. Use this to search both symbol names and documentation for functionality, concepts, or how-to guides.
+- `search_library_doc`: Use `<search_library_doc>query</search_library_doc>` to search for functionality, concepts, or how-to guides.
+
+IMPORTANT: You MUST ONLY use ONE tool tag (`<search_library_doc>`, `<write_and_run>`, or `<submit>`) in a single response. Do not combine multiple actions or mix searching with testing. 
+The system will only process the FIRST tag it detects if the response is valid, but using multiple tags is discouraged and may lead to errors.
 
 To TEST your code implementation without ending the task, simply output your Rust code inside plain XML tags like this (do NOT use JSON!):
 <write_and_run>
@@ -261,16 +346,23 @@ The system will automatically extract the code, write it to `src/main.rs`, run `
 Once you confirmed that the solution works, you must output your FINAL answer as a complete, fully functioning source code enclosed in a `<submit> ... </submit>` block. You can also provide any necessary explanation.
 Note: Outputting a `<submit> ... </submit>` block will IMMEDIATELY SUBMIT your answer and run the final verification, which will END the task.
 </HowTo>
+
+<ResourceManagement>
+At the end of every tool response, you will see a `[STATUS]` section:
+- `RemainingSearchQuota`: Number of `search_library_doc` calls you can still make. If this reaches 0, further `search_library_doc` calls will return an error and you MUST proceed with current information.
+- `RemainingTurns`: Total number of actions (turns) remaining before the task is forced to end.
+</ResourceManagement>
 """
 
     guidelines = """\
 Verification: Once again, you MUST verify your answer. You should make your best efforts to avoid hallucination and make sure your answer is correct.
 Self-contained: Note your solution has been fully self-contained including both fully functioning source code and explanation.
 Testing Code: Before submitting the final answer, use the `<write_and_run>...</write_and_run>` tags to test code and see outputs. Avoid JSON syntax errors.
+One Action at a Time: You MUST only use one tool tag per turn. Response containing multiple tags (e.g. two searches or a search and a test) will be rejected.
 Code block inclusion: Your final answer MUST include exactly one `<submit>\\n<your_code_here>\\n</submit>` block. Its content will be pasted to main.rs and executed for final verification to END the task.
-Trust Internal Knowledge: Favor your internalized recollections (summarized in your initial thoughts) over repetitive searching. Use the `search` tool only for details you don't already possess.
-Avoid Redundant Search: The number of `search` calls is strictly limited. Avoid repeated or redundant queries for information already provided or recalled in your thoughts.
-Error Reflection: If `<write_and_run>` test fails, analyze the compiler error carefully. If you find your understanding is flawed, use the `search` tool sparingly to fill specific gaps.
+Trust Internal Knowledge: Favor your internalized recollections (summarized in your initial thoughts) over repetitive searching. Use the `search_library_doc` tool only for details you don't already possess.
+Avoid Redundant Search: The number of `search_library_doc` calls is strictly limited. Avoid repeated or redundant queries for information already provided or recalled in your thoughts. Use `<search_library_doc>query</search_library_doc>` directly in your thoughts.
+Error Reflection: If `<write_and_run>` test fails, analyze the compiler error carefully. If you find your understanding is flawed, use the `search_library_doc` tool sparingly to fill specific gaps.
 """
     PROMPT += f"\n<Guidelines>\n{guidelines}\n</Guidelines>"
 
@@ -403,9 +495,6 @@ async def build_simplified_solver_env(
     mutable_state = SimplifiedSolverMutableState(
         remaining_turns=max_turns, total_turns=max_turns
     )
-    tools_list = [
-        SearchTool(search_model, rust_doc_analyzer, knowledge_db, mutable_state),
-    ]
 
     msg_env = SimplifiedSolverEnv(
         initial_state=env_state,
@@ -416,7 +505,7 @@ async def build_simplified_solver_env(
         initial_messages=get_simplified_solver_initial_messages(
             env_state=env_state,
             tree_structure=tree_structure,
-            tools=[t.to_spec() for t in tools_list],
+            tools=[],
             renderer=renderer,
         ),
         reward_fn=LLMAsAJudgeSingleTurn(

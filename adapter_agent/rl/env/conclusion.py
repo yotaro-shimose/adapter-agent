@@ -14,6 +14,7 @@ type SSConclusion = Literal[
     "max_turns_exceeded",
     "not_finished",
     "parse_failed",
+    "multiple_tool_tags",
 ]
 
 
@@ -30,6 +31,7 @@ class SSMetrics(TypedDict):
     max_turns_exceeded: float
     not_finished: float
     parse_failed: float
+    multiple_tool_tags: float
 
 
 def conclusion_to_metrics(conclusion: SSConclusion) -> dict[str, float]:
@@ -50,6 +52,7 @@ def conclusion_to_metrics(conclusion: SSConclusion) -> dict[str, float]:
             max_turns_exceeded=1.0 if conclusion == "max_turns_exceeded" else 0.0,
             not_finished=1.0 if conclusion == "not_finished" else 0.0,
             parse_failed=1.0 if conclusion == "parse_failed" else 0.0,
+            multiple_tool_tags=1.0 if conclusion == "multiple_tool_tags" else 0.0,
         ),
     )
 

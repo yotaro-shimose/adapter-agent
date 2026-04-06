@@ -46,7 +46,7 @@ class SearchTool(Tool):
 
     @property
     def name(self) -> str:
-        return "search"
+        return "search_library_doc"
 
     @property
     def description(self) -> str:
@@ -69,22 +69,41 @@ class SearchTool(Tool):
 
     async def run(self, input: ToolInput) -> ToolResult:
         assert input.call_id is not None
+        query = input.arguments.get("query", "")
+        
+        final_ans, ctx = await self.search(query)
+        
         search_limit = self.mutable_state.total_turns // 2
+        remaining_search_quota = max(0, search_limit - self.mutable_state.search_count)
+        status_suffix = f"\n\n[STATUS]\nRemainingSearchQuota: {remaining_search_quota}\nRemainingTurns: {self.mutable_state.remaining_turns}"
+        
+        output = f"{final_ans}{status_suffix}"
+
+        msg = TinkerMessage(
+            role="tool",
+            content=output,
+            tool_call_id=input.call_id,
+        )
+        # Adding knowledge_id and content as dynamic attributes to track citations
+        cast(dict[str, Any], msg)["knowledge_id"] = ctx.knowledge_id
+        cast(dict[str, Any], msg)["knowledge_title"] = ctx.knowledge_title
+        cast(dict[str, Any], msg)["knowledge_content"] = ctx.final_answer
+        return ToolResult(messages=[msg])
+
+    async def search(self, query: str) -> tuple[str, AgenticSearchContext]:
+        search_limit = self.mutable_state.total_turns // 2
+        
         if self.mutable_state.search_count >= search_limit:
-            output = f"Search limit reached. You have already performed {self.mutable_state.search_count} searches. Please proceed with the information you have or submit your final answer using `<submit>...</submit>`."
-            return ToolResult(
-                messages=[
-                    TinkerMessage(
-                        role="tool",
-                        content=output,
-                        tool_call_id=input.call_id,
-                    )
-                ]
+            output = (
+                f"[SYSTEM ERROR] SEARCH_LIMIT_EXCEEDED\n"
+                f"You have already performed {self.mutable_state.search_count} searches (Limit: {search_limit}).\n"
+                f"Further 'search_library_doc' calls will be IGNORED.\n"
+                f"You MUST proceed with the information you already have.\n"
+                f"Use `<write_and_run>...</write_and_run>` to test code or `<submit>...</submit>` to finish."
             )
+            return output, AgenticSearchContext()
 
         self.mutable_state.search_count += 1
-        query = input.arguments.get("query", "")
-
         ctx = AgenticSearchContext()
 
         # Step 1: Direct Search Execution (KnowledgeDB -> Fallback to RustDocs)
@@ -194,13 +213,14 @@ class SearchTool(Tool):
                 agent = AgentWrapper[str].create(
                     name="RustDocSummarizer",
                     instructions=(
-                        "You are an expert technical summarizer.\\n"
-                        f"The user searched for: '{query}'. Source: Official Rust Documentation.\\n"
-                        "Below are the raw search results. Your task is to:\\n"
-                        "1. Determine the EXACTLY ONE most relevant document from the results.\\n"
-                        "2. Summarize its contents comprehensively. Do NOT lose any technical details, Rust code signatures, or logic patterns.\\n"
-                        "3. Do not formulate the response entirely as a citation ID; instead, provide the raw summary.\\n"
-                        "4. Use the `report_summary` tool to submit."
+                        "You are an expert technical documentation synthesizer specializing in Rust.\\n"
+                        f"The user searched for: '{query}'. Your mission is to provide the user with the exact technical context they need to achieve their goal.\\n"
+                        "### Instructions\\n"
+                        "1. **Identify Relevance**: Select the single most relevant document from the provided search results that best addresses the user's likely intent.\\n"
+                        "2. **Extract API Signatures**: Provide the EXACT and COMPLETE function/struct/trait signatures found in the documentation. Do not hallucinate or omit generic parameters or return types.\\n"
+                        "3. **Synthesize Example Code**: If the documentation provides an example, or if you can confidently derive a minimal, working example from the signatures, include a clean Rust code block. Always prioritize accuracy.\\n"
+                        "4. **Maintain Technical Context**: Focus on return values, common pitfalls, and safety requirements (e.g., Unsafe) if mentioned. Tailor the explanation to be practical and actionable.\\n"
+                        "5. **Submission**: Use the `report_summary` tool to deliver your final report. Do NOT just return a citation ID; provide the full, synthesized technical content."
                     ),
                     model=self.search_model,
                     tools=[report_summary],
@@ -228,17 +248,5 @@ class SearchTool(Tool):
                         ctx.final_answer = f"An unexpected error occurred during documentation search: {str(e)}"
                         break
 
-                final_ans = ctx.final_answer or "Failed to summarize the document."
-
-        output = f"{final_ans}"
-
-        msg = TinkerMessage(
-            role="tool",
-            content=output,
-            tool_call_id=input.call_id,
-        )
-        # Adding knowledge_id and content as dynamic attributes to track citations
-        cast(dict[str, Any], msg)["knowledge_id"] = ctx.knowledge_id
-        cast(dict[str, Any], msg)["knowledge_title"] = ctx.knowledge_title
-        cast(dict[str, Any], msg)["knowledge_content"] = ctx.final_answer
-        return ToolResult(messages=[msg])
+        final_ans = ctx.final_answer or "Failed to summarize the document."
+        return final_ans, ctx

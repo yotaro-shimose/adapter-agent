@@ -8,7 +8,6 @@ from typing import cast
 
 import ray
 import tinker
-import tinker_cookbook.checkpoint_utils
 from dotenv import load_dotenv
 from oai_utils import AgentsSDKModel
 from oai_utils.litellm import litellm_concurrent_limit
@@ -18,9 +17,8 @@ from tinker import AdamParams
 
 from adapter_agent.hierarchical.agent.analyzer import Analyzer
 from adapter_agent.hierarchical.agent.task_verifier import TaskVerifier
-from adapter_agent.hierarchical.gh import Library
+from adapter_agent.hierarchical.gh import Library, load_gh_archive
 from adapter_agent.hierarchical.process.rewire import ss_solve_verify
-from adapter_agent.hierarchical.types import Task
 from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
 from adapter_agent.library.knowledge_db import KnowledgeDB
 from adapter_agent.model_helper import get_gemini
@@ -100,7 +98,7 @@ class StudyActor:
             async with task_manager as current:
                 if is_study(current):
                     task = current.task
-                    logger.debug(
+                    logger.info(
                         f"Study worker {worker_id} processing task: {task.task}"
                     )
                     ret = await ss_solve_verify(
@@ -114,7 +112,7 @@ class StudyActor:
                         knowledge_db=self.knowledge_db,
                     )
 
-                    logger.debug(
+                    logger.info(
                         f"Study worker {worker_id} processing task: {task.task}"
                     )
 
@@ -138,91 +136,91 @@ class StudyActor:
                     raise ValueError(f"Unknown task type: {current}")
 
 
-@dataclass
-class TrainWorker:
-    state: ActorHandle[UniRLState]
-    params: UniRLTrainParams
-    experiment_setting: ExperimentSettings
-    model_loading_settings: ModelLoadingSettings
-    training_client: tinker.TrainingClient = field(init=False, default=None)  # type: ignore
+# @dataclass
+# class TrainWorker:
+#     state: ActorHandle[UniRLState]
+#     params: UniRLTrainParams
+#     experiment_setting: ExperimentSettings
+#     model_loading_settings: ModelLoadingSettings
+#     training_client: tinker.TrainingClient = field(init=False, default=None)  # type: ignore
 
-    def __post_init__(self):
-        logger.info("Train worker init.")
-        setup_base_loglevel()
-        logging.basicConfig(level=logging.DEBUG)
-        self.training_client = setup_training_client(self.model_loading_settings)
+#     def __post_init__(self):
+#         logger.info("Train worker init.")
+#         setup_base_loglevel()
+#         logging.basicConfig(level=logging.DEBUG)
+#         self.training_client = setup_training_client(self.model_loading_settings)
 
-    async def run(self):
-        await self.state.log_info.remote("Train worker main loop started.")
-        step = 0
-        pending_fwd_bwd_future = None
-        pending_optim_future = None
-        while not await self.state.is_finished.remote():
-            batch = await self.state.get_batch.remote()
+#     async def run(self):
+#         await self.state.log_info.remote("Train worker main loop started.")
+#         step = 0
+#         pending_fwd_bwd_future = None
+#         pending_optim_future = None
+#         while not await self.state.is_finished.remote():
+#             batch = await self.state.get_batch.remote()
 
-            if batch is None:
-                await asyncio.sleep(1)
-                continue
-            step += 1
+#             if batch is None:
+#                 await asyncio.sleep(1)
+#                 continue
+#             step += 1
 
-            await self.state.log_info.remote(
-                f"Train worker step: {step}. Starting Forward-Backward..."
-            )
+#             await self.state.log_info.remote(
+#                 f"Train worker step: {step}. Starting Forward-Backward..."
+#             )
 
-            fwd_bwd_future = await self.training_client.forward_backward_async(
-                batch.datum,
-                loss_fn=batch.loss_fn,
-            )
-            optim_future = await self.training_client.optim_step_async(
-                self.params.adam_params
-            )
+#             fwd_bwd_future = await self.training_client.forward_backward_async(
+#                 batch.datum,
+#                 loss_fn=batch.loss_fn,
+#             )
+#             optim_future = await self.training_client.optim_step_async(
+#                 self.params.adam_params
+#             )
 
-            # Wait for previous step's results if pipelining
-            if pending_fwd_bwd_future is not None and pending_optim_future is not None:
-                await self.state.log_info.remote(
-                    f"Awaiting results from step {step - 1}..."
-                )
-                fwd_bwd_result = await pending_fwd_bwd_future.result_async()
-                await pending_optim_future.result_async()
-                await self.state.log_train_metrics.remote(
-                    {
-                        **fwd_bwd_result.metrics,
-                    }
-                )
-                await self.state.log_info.remote(
-                    f"Results from step {step - 1} logged."
-                )
+#             # Wait for previous step's results if pipelining
+#             if pending_fwd_bwd_future is not None and pending_optim_future is not None:
+#                 await self.state.log_info.remote(
+#                     f"Awaiting results from step {step - 1}..."
+#                 )
+#                 fwd_bwd_result = await pending_fwd_bwd_future.result_async()
+#                 await pending_optim_future.result_async()
+#                 await self.state.log_train_metrics.remote(
+#                     {
+#                         **fwd_bwd_result.metrics,
+#                     }
+#                 )
+#                 await self.state.log_info.remote(
+#                     f"Results from step {step - 1} logged."
+#                 )
 
-            pending_fwd_bwd_future = fwd_bwd_future
-            pending_optim_future = optim_future
+#             pending_fwd_bwd_future = fwd_bwd_future
+#             pending_optim_future = optim_future
 
-            # Save checkpoint
-            if step % self.params.save_freq == 0:
-                await self.state.log_info.remote(
-                    f"Saving checkpoint at train step {step}..."
-                )
-                await tinker_cookbook.checkpoint_utils.save_checkpoint_async(
-                    training_client=self.training_client,
-                    name=f"step_{step}",
-                    log_path=str(self.experiment_setting.log_root()),
-                    loop_state={"batch": step},
-                    kind="both",
-                    ttl_seconds=self.experiment_setting.ttl_seconds,
-                )
+#             # Save checkpoint
+#             if step % self.params.save_freq == 0:
+#                 await self.state.log_info.remote(
+#                     f"Saving checkpoint at train step {step}..."
+#                 )
+#                 await tinker_cookbook.checkpoint_utils.save_checkpoint_async(
+#                     training_client=self.training_client,
+#                     name=f"step_{step}",
+#                     log_path=str(self.experiment_setting.log_root()),
+#                     loop_state={"batch": step},
+#                     kind="both",
+#                     ttl_seconds=self.experiment_setting.ttl_seconds,
+#                 )
 
-            # Update latest model for sampling
-            if step % self.params.update_freq == 0:
-                await self.state.log_info.remote(
-                    f"Updating sampling client weights (step {step})..."
-                )
-                new_client = await self.training_client.save_weights_and_get_sampling_client_async()
-                await self.state.log_info.remote(
-                    "Broadcasting new sampling client to UniRLState..."
-                )
-                await self.state.update_sampling_client.remote(new_client)
-                await self.state.log_info.remote(
-                    "Train Worker -> Latest sampling client updated."
-                )
+#             # Update latest model for sampling
+#             if step % self.params.update_freq == 0:
+#                 await self.state.log_info.remote(
+#                     f"Updating sampling client weights (step {step})..."
+#                 )
+#                 new_client = await self.training_client.save_weights_and_get_sampling_client_async()
+#                 await self.state.log_info.remote(
+#                     "Broadcasting new sampling client to UniRLState..."
+#                 )
+#                 await self.state.update_sampling_client.remote(new_client)
+#                 await self.state.log_info.remote(
+#                     "Train Worker -> Latest sampling client updated."
+#                 )
 
 
 def setup_rollout_logging():
@@ -232,20 +230,6 @@ def setup_rollout_logging():
     logging.getLogger("adapter_agent.hierarchical.process.rewire").setLevel(
         logging.WARNING
     )
-
-
-def load_gh_archive() -> list[Task]:
-    import polars as pl
-
-    path = Path("data/easy_benchmark_verified.csv")
-    logger.info(f"Loading verified tasks from {path}...")
-    df = pl.read_csv(path)
-    tasks = [
-        Task.from_instruction(row["problem_statement"])
-        for row in df.iter_rows(named=True)
-    ]
-    logger.info(f"Loaded {len(tasks)} verified tasks.")
-    return tasks
 
 
 def setup_training_client(
@@ -286,7 +270,7 @@ async def main():
             experiment_name=f"unirl_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         ),
         env_params=EnvParams(
-            max_turns=10,
+            max_turns=8,
             library=Library(name="numrs2", local_path=Path("repositories/numrs")),
             dataset_path=Path("data/sft/gen_20260218_182450/sft_dataset.json"),
             qwen_no_think=True,
@@ -300,8 +284,7 @@ async def main():
             lora_rank=32,
         ),
         study_rollout_params=StudyRolloutParams(
-            num_study_actor=1,
-            # num_study_actor=10,
+            num_study_actor=10,
             rollouts_per_actor=8,
         ),
         train_params=UniRLTrainParams(
