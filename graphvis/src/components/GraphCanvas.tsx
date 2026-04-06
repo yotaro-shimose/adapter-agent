@@ -21,7 +21,7 @@ export const GraphCanvasComponent: React.FC = () => {
   // State for view controls
   const [viewMode, setViewMode] = useState<'global' | 'local'>('global');
   const [focusNodeId, setFocusNodeId] = useState<string | null>(null);
-  const [focusDepth, setFocusDepth] = useState<number>(2);
+  const [focusDepth, setFocusDepth] = useState<number>(1);
   const [showKnowledge, setShowKnowledge] = useState<boolean>(true);
   const [selectedNode, setSelectedNode] = useState<CustomNode | null>(null);
 
@@ -123,7 +123,7 @@ export const GraphCanvasComponent: React.FC = () => {
           const m = n.metadata;
           const label = getNodeLabel(n);
           const truncated = truncateText(label, 30);
-          const fontSize = 12 / globalScale;
+          const fontSize = 15 / globalScale;
           const radius = getNodeRadius(n);
           
           ctx.font = `${fontSize}px system-ui`;
@@ -158,7 +158,7 @@ export const GraphCanvasComponent: React.FC = () => {
           ctx.textBaseline = 'middle';
           ctx.fillStyle = '#fff';
           ctx.font = `${fontSize}px system-ui`;
-          ctx.fillText(truncated, n.x!, n.y! + radius + 8);
+          ctx.fillText(truncated, n.x!, n.y! + radius + 10);
           
           const stats = n.type === 'knowledge' 
             ? `Used: ${m.unique_task_success_count}/${m.unique_task_total_count} Tks`
@@ -166,7 +166,7 @@ export const GraphCanvasComponent: React.FC = () => {
             
           ctx.font = `${fontSize * 0.8}px system-ui`;
           ctx.fillStyle = '#aaa';
-          ctx.fillText(stats, n.x!, n.y! + radius + 10 + fontSize);
+          ctx.fillText(stats, n.x!, n.y! + radius + 12 + fontSize);
         }}
         nodePointerAreaPaint={(node, color, ctx) => {
           const n = node as CustomNode;
