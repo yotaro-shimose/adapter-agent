@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(kw_only=True)
 class KnowledgeNormalizer[T: AgentsSDKModel](BaseAgent[T]):
-    async def normalize(self, trajectory: list[TinkerMessage]) -> Knowledge:
+    async def normalize(self, trajectory: list[TinkerMessage]) -> Knowledge | None:
         """
         Extracts "normalized knowledge" from an agent's trajectory log.
         This knowledge is a compact, necessary, and sufficient technical summary of the findings,
@@ -67,40 +67,68 @@ Your article must be concise yet holistic, capturing the entire successful solut
         )
 
         transcript = format_trajectory_transcript(trajectory)
-
-        try:
-            result = await agent.run(
-                f"""\
+        input_prompt = f"""\
 Extract normalized knowledge from the following trajectory:
 <Trajectory>
 {transcript}
 </Trajectory>
-""",
-                run_config=RunConfig(tracing_disabled=True),
+"""
+
+        for attempt in range(2):
+            try:
+                result = await agent.run(
+                    input_prompt,
+                    run_config=RunConfig(tracing_disabled=True),
+                )
+            except AgentRunFailure as e:
+                msg = f"Knowledge extraction failed due to agent run failure: {e.cause}. Original error: {e}"
+                logger.error(msg)
+                return None
+            except InternalServerError as e:
+                msg = f"Knowledge extraction failed due to internal server error: {e}"
+                logger.error(msg)
+                return None
+
+            response_text = result.final_output()
+            title_match = re.search(
+                r"<title>(.*?)</title>", response_text, re.IGNORECASE | re.DOTALL
             )
-        except AgentRunFailure as e:
-            msg = f"Knowledge extraction failed due to agent run failure: {e.cause}. Original error: {e}"
-            logger.error(msg)
-            return Knowledge(title="Extraction Failed", content=msg)
-        except InternalServerError as e:
-            msg = f"Knowledge extraction failed due to internal server error: {e}"
-            logger.error(msg)
-            return Knowledge(title="Extraction Failed", content=msg)
+            knowledge_match = re.search(
+                r"<knowledge>(.*?)</knowledge>", response_text, re.IGNORECASE | re.DOTALL
+            )
 
-        response_text = result.final_output()
-        title_match = re.search(r"<title>(.*?)</title>", response_text, re.DOTALL)
-        knowledge_match = re.search(
-            r"<knowledge>(.*?)</knowledge>", response_text, re.DOTALL
-        )
+            if title_match and knowledge_match:
+                title = title_match.group(1).strip()
+                content = knowledge_match.group(1).strip()
+                return Knowledge(title=title, content=content)
 
-        title = title_match.group(1).strip() if title_match else "Untitled Knowledge"
-        content = (
-            knowledge_match.group(1).strip()
-            if knowledge_match
-            else response_text.strip()
-        )
+            # Missing tags - handle retry or failure
+            missing = []
+            if not title_match:
+                missing.append("<title>")
+            if not knowledge_match:
+                missing.append("<knowledge>")
 
-        return Knowledge(title=title, content=content)
+            if attempt == 0:
+                logger.warning(
+                    f"Knowledge normalization attempt {attempt + 1} failed (missing {missing}). Retrying..."
+                )
+                input_prompt = f"""\
+{input_prompt}
+
+### Previous Attempt
+{response_text}
+
+### Error
+Your previous response was missing the required {', '.join(missing)} XML tags.
+Please re-extract the knowledge and ensure you wrap the title in `<title>...</title>` and the article in `<knowledge>...</knowledge>`.
+"""
+            else:
+                logger.error(
+                    f"Knowledge normalization failed after {attempt + 1} attempts (missing {missing})."
+                )
+
+        return None
 
 
 async def verify_normalized_knowledge(

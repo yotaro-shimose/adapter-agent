@@ -1,7 +1,7 @@
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, List, Literal, Mapping, Self, Sequence
+from typing import Any, Literal, Mapping, Self, Sequence
 
 import ray
 from oai_utils.tinker import TinkerModel
@@ -72,7 +72,7 @@ class UniRLConfig(BaseModel):
 
 
 class TinkerBatch(BaseModel):
-    datum: List[Datum]
+    datum: list[Datum]
     loss_fn: LossFnType
     tasks: dict[str, Counted[Task]]
     batch_type: BatchType
@@ -137,7 +137,7 @@ class TrajectoryReplayBuffer:
 @dataclass
 class MetricManager:
     ml_logger: MLLogger
-    study_metrics_list: List[dict[str, float]]
+    study_metrics_list: list[dict[str, float]]
     log_freq: int
 
     @classmethod

@@ -52,6 +52,15 @@ class RewireSessionResultFailure(RewireSessionResultNormal):
 
 
 @dataclass(kw_only=True)
+class RewireSessionResultRedundant(RewireSessionResultNormal):
+    conclusion: SSConclusion = field(default="redundant", init=False)
+    reward: float = 1.0
+
+    def is_successful(self) -> bool:
+        return True
+
+
+@dataclass(kw_only=True)
 class RewireSessionResultError:
     task: Task
     conclusion: SSConclusion
@@ -61,7 +70,10 @@ class RewireSessionResultError:
 
 
 type RewireSessionResult = (
-    RewireSessionResultSuccess | RewireSessionResultFailure | RewireSessionResultError
+    RewireSessionResultSuccess
+    | RewireSessionResultFailure
+    | RewireSessionResultError
+    | RewireSessionResultRedundant
 )
 
 

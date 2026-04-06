@@ -15,6 +15,8 @@ type SSConclusion = Literal[
     "not_finished",
     "parse_failed",
     "multiple_tool_tags",
+    "knowledge_normalization_failed",
+    "redundant",
 ]
 
 
@@ -32,6 +34,8 @@ class SSMetrics(TypedDict):
     not_finished: float
     parse_failed: float
     multiple_tool_tags: float
+    knowledge_normalization_failed: float
+    redundant: float
 
 
 def conclusion_to_metrics(conclusion: SSConclusion) -> dict[str, float]:
@@ -53,6 +57,10 @@ def conclusion_to_metrics(conclusion: SSConclusion) -> dict[str, float]:
             not_finished=1.0 if conclusion == "not_finished" else 0.0,
             parse_failed=1.0 if conclusion == "parse_failed" else 0.0,
             multiple_tool_tags=1.0 if conclusion == "multiple_tool_tags" else 0.0,
+            knowledge_normalization_failed=1.0
+            if conclusion == "knowledge_normalization_failed"
+            else 0.0,
+            redundant=1.0 if conclusion == "redundant" else 0.0,
         ),
     )
 

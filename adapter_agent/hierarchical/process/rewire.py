@@ -23,10 +23,10 @@ from adapter_agent.rl.env.reward import LLMAsAJudge
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.rl.env.session_result import (
     Citation,
-    Knowledge,
     RewireSessionResult,
     RewireSessionResultError,
     RewireSessionResultFailure,
+    RewireSessionResultRedundant,
     RewireSessionResultSuccess,
 )
 from adapter_agent.rl.env.simplified_solver import (
@@ -124,6 +124,8 @@ async def ss_solve_verify(
                         logs=getattr(step_result, "logs", {}),
                     )
                     transitions.append(transition)
+                    ob = step_result.next_observation
+                    stop = step_result.next_stop_condition
 
                     if step_result.episode_done:
                         break
@@ -136,90 +138,124 @@ async def ss_solve_verify(
                     ),
                 )
 
-                knowledge_obj: Knowledge | None = None
+                return await _process_solve_result(
+                    task=task,
+                    history=msg_env.history,
+                    trajectory=trajectory,
+                    step_result=step_result,
+                    verifier_model=verifier_model,
+                    knowledge_db=knowledge_db,
+                    runtime=runtime,
+                )
 
-                # Extract citations from the trials
-                citations = []
-                for turn_idx, msg in enumerate(msg_env.history):
-                    msg_dict = cast(dict[str, Any], msg)
-                    knowledge_id = msg_dict.get("knowledge_id")
-                    if knowledge_id:
-                        citations.append(
-                            Citation(
-                                knowledge_id=cast(str, knowledge_id),
-                                turn_index=turn_idx,
-                                content=msg_dict.get("knowledge_content"),
-                                title=msg_dict.get("knowledge_title"),
-                            )
-                        )
-
-                if LLMAsAJudge.is_successful_reward(step_result.reward):
-                    # Only attempt to extract normalized knowledge from successful trials
-                    logger.info("Extracting normalized knowledge from trajectory...")
-                    normalizer = KnowledgeNormalizer(model=verifier_model)
-                    knowledge_obj = await normalizer.normalize(msg_env.history)
-
-                    verification_result = await verify_normalized_knowledge(
-                        runtime=runtime,
-                        normalized_knowledge=knowledge_obj.content,
-                        model=verifier_model,
-                    )
-
-                    if not verification_result.success:
-                        logger.warning(
-                            f"Knowledge verification failed: {verification_result.reasoning}"
-                        )
-                        return RewireSessionResultFailure(
-                            task=task,
-                            trials=msg_env.history,
-                            conclusion="verification_failed",
-                            trajectory=trajectory,
-                            reasoning=verification_result.reasoning,
-                            knowledge=knowledge_obj,
-                        )
-
-                    logger.info("Checking for knowledge uniqueness...")
-                    uniqueness_checker = KnowledgeUniquenessChecker(
-                        model=verifier_model
-                    )
-                    (
-                        is_unique,
-                        uniqueness_reasoning,
-                    ) = await uniqueness_checker.check_uniqueness(
-                        new_knowledge=knowledge_obj.content,
-                        task=task,
-                        knowledge_db=knowledge_db,
-                    )
-
-                    if is_unique:
-                        logger.info(
-                            f"Knowledge is unique, reasoning: {uniqueness_reasoning}"
-                        )
-                    else:
-                        logger.info(
-                            f"Skipping redundant knowledge. Reasoning: {uniqueness_reasoning}"
-                        )
-
-                    return RewireSessionResultSuccess(
-                        task=task,
-                        trials=msg_env.history,
-                        knowledge=knowledge_obj,
-                        trajectory=trajectory,
-                        reasoning=verification_result.reasoning,
-                        citations=citations,
-                    )
-                else:
-                    return RewireSessionResultFailure(
-                        task=task,
-                        trials=msg_env.history,
-                        conclusion=step_result.conclusion,
-                        trajectory=trajectory,
-                        knowledge=knowledge_obj,
-                        citations=citations,
-                    )
     except (CodingEnvironmentError, CoderMCPRuntimeError) as e:
         logger.error(f"Environment error: {e}")
         return RewireSessionResultError(
             task=task,
             conclusion="environment_error",
+        )
+
+
+async def _process_solve_result(
+    task: Task,
+    history: list[TinkerMessage],
+    trajectory: Trajectory,
+    step_result: Any, # SimplifiedSolverEnvStepResult
+    verifier_model: AgentsSDKModel,
+    knowledge_db: KnowledgeDB,
+    runtime: Any, # CoderMCPRuntime
+) -> RewireSessionResult:
+    """
+    Handles the post-solve logic: citation extraction, knowledge normalization,
+    verification, and uniqueness checking.
+    """
+    # Extract citations from the trials
+    citations = []
+    for turn_idx, msg in enumerate(history):
+        msg_dict = cast(dict[str, Any], msg)
+        knowledge_id = msg_dict.get("knowledge_id")
+        if knowledge_id:
+            citations.append(
+                Citation(
+                    knowledge_id=cast(str, knowledge_id),
+                    turn_index=turn_idx,
+                    content=msg_dict.get("knowledge_content"),
+                    title=msg_dict.get("knowledge_title"),
+                )
+            )
+
+    if not LLMAsAJudge.is_successful_reward(step_result.reward):
+        return RewireSessionResultFailure(
+            task=task,
+            trials=history,
+            conclusion=step_result.conclusion,
+            trajectory=trajectory,
+            citations=citations,
+        )
+
+    # 1. Normalize Knowledge
+    logger.info("Extracting normalized knowledge from trajectory...")
+    normalizer = KnowledgeNormalizer(model=verifier_model)
+    knowledge_obj = await normalizer.normalize(history)
+
+    if knowledge_obj is None:
+        logger.warning("Knowledge normalization failed.")
+        return RewireSessionResultFailure(
+            task=task,
+            trials=history,
+            conclusion="knowledge_normalization_failed",
+            trajectory=trajectory,
+        )
+
+    # 2. Verify Knowledge
+    verification_result = await verify_normalized_knowledge(
+        runtime=runtime,
+        normalized_knowledge=knowledge_obj.content,
+        model=verifier_model,
+    )
+
+    if not verification_result.success:
+        logger.warning(
+            f"Knowledge verification failed: {verification_result.reasoning}"
+        )
+        return RewireSessionResultFailure(
+            task=task,
+            trials=history,
+            conclusion="verification_failed",
+            trajectory=trajectory,
+            reasoning=verification_result.reasoning,
+            knowledge=knowledge_obj,
+        )
+
+    # 3. Check Uniqueness
+    logger.info("Checking for knowledge uniqueness...")
+    uniqueness_checker = KnowledgeUniquenessChecker(model=verifier_model)
+    (
+        is_unique,
+        uniqueness_reasoning,
+    ) = await uniqueness_checker.check_uniqueness(
+        new_knowledge=knowledge_obj.content,
+        task=task,
+        knowledge_db=knowledge_db,
+    )
+
+    if is_unique:
+        logger.info(f"Knowledge is unique, reasoning: {uniqueness_reasoning}")
+        return RewireSessionResultSuccess(
+            task=task,
+            trials=history,
+            knowledge=knowledge_obj,
+            trajectory=trajectory,
+            reasoning=verification_result.reasoning,
+            citations=citations,
+        )
+    else:
+        logger.info(f"Skipping redundant knowledge. Reasoning: {uniqueness_reasoning}")
+        return RewireSessionResultRedundant(
+            task=task,
+            trials=history,
+            knowledge=knowledge_obj,
+            trajectory=trajectory,
+            reasoning=verification_result.reasoning,
+            citations=citations,
         )

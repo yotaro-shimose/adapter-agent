@@ -192,7 +192,7 @@ async def main():
     verifier_model = get_gemini()
     tasks = load_gh_archive()
 
-    task_network = TaskNetwork(tasks_pool=tasks[30:40])
+    task_network = TaskNetwork(tasks_pool=tasks[:1])
 
     # Initial graph sync to database
     await rl_db.update_graph_json(task_network.to_dict())
