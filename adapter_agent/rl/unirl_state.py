@@ -16,7 +16,7 @@ from tinker_cookbook.utils import ml_log
 from tinker_cookbook.utils.ml_log import Logger as MLLogger
 
 from adapter_agent.hierarchical.agent.task_verifier import TaskVerifier
-from adapter_agent.hierarchical.types import Task
+from adapter_agent.hierarchical.types import Knowledge, Task
 from adapter_agent.library.knowledge_db import KnowledgeDB
 from adapter_agent.rl.config import EnvParams, ExperimentSettings, ModelLoadingSettings
 from adapter_agent.rl.env.conclusion import conclusion_to_metrics
@@ -232,7 +232,8 @@ class UniRLState:
             )
             for k in knowledges:
                 await self.kdb.add_knowledge(
-                    id=k.id, query=k.instruction, title=k.title, content=k.content
+                    knowledge=Knowledge(id=k.id, title=k.title, content=k.content),
+                    query=k.instruction,
                 )
             logger.info("Knowledge sync complete.")
 
@@ -272,10 +273,8 @@ class UniRLState:
                 )
                 # Then index in ES using the Postgres ID
                 await self.kdb.add_knowledge(
-                    id=knowledge_id,
+                    knowledge=result.knowledge,
                     query=result.task.instruction,
-                    title=result.knowledge.title,
-                    content=result.knowledge.content,
                 )
                 # Also update in-memory TaskNetwork knowledge ID for visualization mapping
                 task_meta = self.study_task_queue.nodes[result.task.id]

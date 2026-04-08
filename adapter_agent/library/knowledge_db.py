@@ -2,8 +2,10 @@ import logging
 from typing import TypedDict, cast
 
 from elasticsearch import AsyncElasticsearch
+from adapter_agent.hierarchical.types import Knowledge
 
 logger = logging.getLogger(__name__)
+
 
 class KnowledgeDoc(TypedDict):
     id: str
@@ -75,17 +77,17 @@ class KnowledgeDB:
                 }
             )
 
-    async def add_knowledge(self, id: str, query: str, title: str, content: str) -> str:
+    async def add_knowledge(self, knowledge: Knowledge, query: str) -> str:
         """Add a new knowledge entry using a stable Postgres ID and return the ES document ID."""
-        logger.info(f"Adding knowledge to '{self.index_name}' (id: {id}, title: {title}, query: {query})")
+        logger.info(f"Adding knowledge to '{self.index_name}' (id: {knowledge.id}, title: {knowledge.title}, query: {query})")
         res = await self.client.index(
             index=self.index_name,
-            id=id, # Use Postgres UUID as the stable ES document ID
+            id=knowledge.id, # Use Postgres UUID as the stable ES document ID
 
             document={
                 "query": query,
-                "title": title,
-                "content": content,
+                "title": knowledge.title,
+                "content": knowledge.content,
             }
         )
         # Refresh the index to make the new document immediately searchable
@@ -128,6 +130,37 @@ class KnowledgeDB:
             results.append(doc)
             
         return results
+
+    async def get_all_knowledge(self, limit: int = 100) -> list[KnowledgeDoc]:
+        """Retrieve all knowledge entries from the index."""
+        if not await self.client.indices.exists(index=self.index_name):
+            return []
+
+        response = await self.client.search(
+            index=self.index_name,
+            body={
+                "query": {
+                    "match_all": {}
+                },
+                "size": limit
+            }
+        )
+
+        results = []
+        for hit in response["hits"]["hits"]:
+            doc = cast(KnowledgeDoc, hit["_source"])
+            doc["id"] = hit["_id"]
+            results.append(doc)
+
+        return results
+
+    async def list_knowledge(self, limit: int = 100) -> list[Knowledge]:
+        """Retrieve all knowledge entries from the index and return them as Knowledge objects."""
+        docs = await self.get_all_knowledge(limit=limit)
+        return [
+            Knowledge(id=doc["id"], title=doc["title"], content=doc["content"])
+            for doc in docs
+        ]
 
     async def clear(self) -> None:
         """Delete the index (useful for resetting between learning runs)."""

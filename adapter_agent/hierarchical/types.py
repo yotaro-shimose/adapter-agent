@@ -19,6 +19,11 @@ class Task(Entity):
         return cls(instruction=instruction)
 
 
+class Knowledge(Entity):
+    title: str
+    content: str
+
+
 class Trajectory(BaseModel):
     input_list: list[TResponseInputItem]
 

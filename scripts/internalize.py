@@ -9,6 +9,7 @@ from adapter_agent.hierarchical.pipeline.internalization_pipeline import (
     PipelineConfig,
 )
 from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
+from adapter_agent.library.knowledge_db import KnowledgeDB
 from adapter_agent.model_helper import get_gemini
 from adapter_agent.rl.config import (
     ExperimentSettings,
@@ -17,7 +18,6 @@ from adapter_agent.rl.config import (
     SFTOptimizerParams,
 )
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
-from adapter_agent.rl.env.session_result import Knowledge
 
 # Configure logging
 logging.basicConfig(
@@ -57,24 +57,23 @@ async def main():
     runtime_settings = RuntimeSettings(
         type="docker", image_uri="coder-mcp-numrs2:latest"
     )
-
+    # runtime_settings = RuntimeSettings(
+    #     type="cloudrun",
+    #     image_uri="europe-north1-docker.pkg.dev/dsat2-405406/shimose-repo/coder-mcp-numrs2",
+    # )
     # 4. Pipeline Config
-    k1 = Knowledge(
-        title="numrs2", content=Path("numrs2.md").read_text()
-    )
-    k2 = Knowledge(
-        title="numrs2_exp", content=Path("numrs2_exp.md").read_text()
-    )
-    k3 = Knowledge(
-        title="numrs2_cos", content=Path("numrs2_cos.md").read_text()
-    )
-    k4 = Knowledge(
-        title="numrs2_arithmetic",
-        content=Path("numrs2_arithmetic.md").read_text(),
-    )
+    db = KnowledgeDB.for_experiment("unirl_20260406_102313")
+    async with db:
+        knowledge_list = await db.list_knowledge(limit=4)
+
+    if not knowledge_list:
+        logger.warning("No knowledge found in DB for the specified experiment.")
+        return
+
+    logger.info(f"Loaded {len(knowledge_list)} knowledge items from DB.")
+
     config = PipelineConfig(
-        # knowledge_list=[k1, k2, k3, k4],
-        knowledge_list=[k1],
+        knowledge_list=knowledge_list,
         runtime_settings=runtime_settings,
         model_loading_settings=ModelLoadingSettings(
             model_name="Qwen/Qwen3-8B", lora_rank=32
@@ -82,24 +81,28 @@ async def main():
         sft_optimizer_params=SFTOptimizerParams(
             adam_params=tinker.AdamParams(learning_rate=1e-3),
             batch_size=32,
-            num_epochs=5,
+            num_epochs=1,
         ),
         rl_optimizer_params=OptimizerParams(
-            adam_params=tinker.AdamParams(learning_rate=1e-4),
+            adam_params=tinker.AdamParams(learning_rate=1e-3),
             num_steps=1,
             kl_penalty_coef=0.0,
             kl_discount_factor=0.0,
-            loss_fn="importance_sampling",
+            loss_fn="ppo",
         ),
         experiment_settings=ExperimentSettings.with_prefix(
             "Primitive_SFT_Internalization"
         ),
-        k_sft=8,
+        k_sft=4,
+        k_init_sft=16,
+        init_sft_epochs=6,
         k_rl=4,
         k_rollout=8,
         concurrency=32,
-        max_iterations=10,
+        max_iterations=20,
         max_sft_knowledge=8,
+        task_gen_concurrency=64,
+        stop_at_100=False,
     )
 
     # 5. Pipeline

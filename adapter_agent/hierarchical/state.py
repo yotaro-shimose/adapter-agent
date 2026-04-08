@@ -14,6 +14,8 @@ from adapter_agent.hierarchical.types import Task
 logger = logging.getLogger(__name__)
 
 
+
+
 class RLGroup(BaseModel):
     trajectories: list[Trajectory]
     rewards: list[float]

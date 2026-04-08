@@ -54,12 +54,16 @@ class PipelineConfig:
     sft_threshold: float = 0.5
     max_sft_knowledge: int = 8
     k_sft: int = 16
+    k_init_sft: int = 16
+    init_sft_epochs: int = 6
     k_rl: int = 16
     k_rollout: int = 16
     over_generation_factor: float = 1.5
     max_generation_attempts: int = 3
     concurrency: int = 8
+    task_gen_concurrency: int = 8
     max_iterations: int = 10
+    stop_at_100: bool = True
 
 
 @dataclass
@@ -195,6 +199,9 @@ class InternalizationPipeline:
         self.rust_doc_analyzer = rust_doc_analyzer
         self.library_name = library_name
 
+        # Concurrency
+        self.task_gen_semaphore = asyncio.Semaphore(self.config.task_gen_concurrency)
+
         # Agents
         self.generator = GeneratorAgent(
             model=generator_model, rust_doc_analyzer=rust_doc_analyzer
@@ -213,6 +220,15 @@ class InternalizationPipeline:
         self.performance_map: dict[str, float] = {
             k.id: 0.0 for k in self.config.knowledge_list
         }
+
+        # Knowledge Pools (QRA, RLTrajectory) and Background Generators
+        self.knowledge_pools: dict[str, list[tuple[QRA, RLTrajectory]]] = {
+            k.id: [] for k in self.config.knowledge_list
+        }
+        self.generator_tasks: dict[str, asyncio.Task] = {}
+        self.failed_knowledge: set[str] = set()
+        self.completed_knowledge: set[str] = set()
+        self.initialized_knowledge: set[str] = set()
 
     async def setup(self):
         """
@@ -278,176 +294,341 @@ class InternalizationPipeline:
             f"Starting API internalization for {len(self.config.knowledge_list)} items."
         )
 
+        # 1. Start background generators for all initial knowledge items
+        for k in self.config.knowledge_list:
+            if k.id not in self.generator_tasks:
+                self.generator_tasks[k.id] = asyncio.create_task(
+                    self._run_background_generator(k)
+                )
+
         iteration = 0
-        while iteration < self.config.max_iterations:
-            iteration += 1
-            logger.info(f"--- Iteration {iteration} ---")
+        try:
+            while iteration < self.config.max_iterations:
+                iteration += 1
+                logger.info(f"--- Iteration {iteration} ---")
 
-            # 1. Prepare task pools for all knowledge items IN PARALLEL
-            # If a knowledge item fails to provide enough tasks, it is permanently removed.
-            
-            logger.info(f"Preparing task pools for {len(self.config.knowledge_list)} knowledge items...")
-            
-            pools_results = await asyncio.gather(
-                *[self._prepare_task_pool(k) for k in self.config.knowledge_list]
-            )
-            
-            knowledge_pools: dict[str, list[QRA]] = {}
-            active_knowledge = []
-            
-            for k, pool in zip(self.config.knowledge_list, pools_results):
-                if pool:
-                    knowledge_pools[k.id] = pool
-                    active_knowledge.append(k)
-                else:
-                    logger.error(f"KNOWLEDGE REJECTED: '{k.title}' failed to generate enough valid tasks. Removing permanently.")
-            
-            self.config.knowledge_list = active_knowledge
-            
-            if not self.config.knowledge_list:
-                logger.warning("No knowledge items remaining. Terminating pipeline.")
-                break
+                if not await self._process_iteration(iteration):
+                    break
 
-            # 2. Identify knowledge items needing SFT
-            sft_candidates = [
-                k
-                for k in self.config.knowledge_list
-                if self.performance_map[k.id] < self.config.sft_threshold
-            ]
+        finally:
+            # Cleanup: stop all background generators
+            logger.info("Cleaning up background generators...")
+            for task in self.generator_tasks.values():
+                task.cancel()
+            await asyncio.gather(*self.generator_tasks.values(), return_exceptions=True)
+            self.generator_tasks.clear()
 
-            sft_targets = sft_candidates[: self.config.max_sft_knowledge]
-            sft_result: SFTStepResult | None = None
-
-            if sft_targets:
-                logger.info(f"Selected {len(sft_targets)} items for SFT refinement.")
-                sft_result = await self.execute_sft_step(sft_targets, knowledge_pools)
-
-            # 3. RL Phase: Exploration and Correction for ALL knowledge items in PARALLEL
-            logger.info(
-                f"Running RL Phase for {len(self.config.knowledge_list)} items concurrently."
-            )
-
-            rl_results = await asyncio.gather(
-                *[self.execute_rl_step(k, knowledge_pools[k.id]) for k in self.config.knowledge_list]
-            )
-
-            iteration_metrics = {}
-            total_rl_success = 0
-            total_rl_rollouts = 0
-            total_rl_task_success = 0
-            total_rl_tasks = 0
-
-            for i, (knowledge, rl_result) in enumerate(
-                zip(self.config.knowledge_list, rl_results)
-            ):
-                # Update performance map with the latest task success ratio
-                self.performance_map[knowledge.id] = rl_result.task_success_ratio
-
-                # Accumulate per-knowledge metrics (using same prefix as requested)
-                iteration_metrics[
-                    f"rl/{knowledge.title}/rollout_success_ratio"
-                ] = rl_result.rollout_success_ratio
-                iteration_metrics[
-                    f"rl/{knowledge.title}/task_success_ratio"
-                ] = rl_result.task_success_ratio
-
-                # Accumulate for aggregate metrics
-                total_rl_success += rl_result.total_success
-                total_rl_rollouts += rl_result.total_rollouts
-                total_rl_task_success += rl_result.task_success
-                total_rl_tasks += rl_result.num_tasks
-
-                self._update_wandb_table(iteration, rl_result.sample)
-
-                # Visualization / Logging (for terminal feedback)
-                # Only show header and SFT sample for the first item
-                self._visualize_iteration(
-                    iteration,
-                    sft_result.representative_sample if sft_result else None,
-                    rl_result.sample,
-                    include_header=(i == 0),
-                    include_sft=(i == 0 and sft_result is not None),
-                )
-
-            # 3. Overall Progress
-            if total_rl_rollouts > 0:
-                iteration_metrics["rl/rollout_success_ratio"] = (
-                    total_rl_success / total_rl_rollouts
-                )
-            if total_rl_tasks > 0:
-                iteration_metrics["rl/task_success_ratio"] = (
-                    total_rl_task_success / total_rl_tasks
-                )
-
-            mean_task_success = sum(self.performance_map.values()) / len(
-                self.performance_map
-            )
-            iteration_metrics["rl/mean_task_success"] = mean_task_success
-
-            # Single point for logging all RL-related metrics in this iteration
-            if self.ml_logger:
-                self.ml_logger.log_metrics(iteration_metrics)
-
-            logger.info(
-                f"Iteration {iteration} complete. Mean Task Success: {mean_task_success:.2%}"
-            )
-
-            if mean_task_success >= 1.0:
-                logger.info("All knowledge items internalized successfully!")
-                break
-
-    async def _prepare_task_pool(self, knowledge: Knowledge) -> list[QRA] | None:
+    async def _process_iteration(self, iteration: int) -> bool:
         """
-        Generate a pool of high-quality tasks for both SFT and RL.
-        Includes over-generation and retry logic.
+        Execute a single iteration of SFT and RL.
+        Returns True to continue, False to stop.
         """
-        target_valid_count = self.config.k_sft + self.config.k_rl
-        gen_batch_size = int(target_valid_count * self.config.over_generation_factor)
+        # 1. Synchronize: Wait for all active items to have ready pools
+        await self._wait_for_task_readiness(self.config.knowledge_list)
 
-        valid_pool = []
-        for attempt in range(self.config.max_generation_attempts):
-            logger.info(
-                f"Attempt {attempt + 1}/{self.config.max_generation_attempts}: "
-                f"Generating {gen_batch_size} tasks for '{knowledge.title}'..."
-            )
+        # 2. Filter knowledge: Remove completed or failed items
+        active_knowledge = self._filter_active_knowledge()
+        self.config.knowledge_list = active_knowledge
 
-            # Generate batch
-            tasks = [self.generator.generate_sft(knowledge) for _ in range(gen_batch_size)]
-            tasks_raw_maybe = await gather_with_semaphore(
-                tasks, max_concurrent=self.config.concurrency
-            )
-            tasks_raw = [t for t in tasks_raw_maybe if t is not None]
+        if not self.config.knowledge_list:
+            logger.warning("No knowledge items remaining to process.")
+            return False
 
-            if not tasks_raw:
-                continue
+        # 3. Identify knowledge items needing SFT
+        init_candidates = [
+            k
+            for k in self.config.knowledge_list
+            if k.id not in self.initialized_knowledge
+        ]
+        regular_candidates = [
+            k
+            for k in self.config.knowledge_list
+            if k.id in self.initialized_knowledge
+            and self.performance_map[k.id] < self.config.sft_threshold
+        ]
 
-            # Verify batch
-            verification_tasks = [
-                self._verify_with_execution(qra.question, qra) for qra in tasks_raw
-            ]
-            results: list[RLTrajectory] = await gather_with_semaphore(
-                verification_tasks, max_concurrent=self.config.concurrency
-            )
-
-            # Add successful ones to pool
-            valid_pool.extend(
-                [tasks_raw[i] for i, res in enumerate(results) if res.success]
-            )
-
-            if len(valid_pool) >= target_valid_count:
-                logger.info(
-                    f"Successfully prepared pool with {len(valid_pool)} tasks for '{knowledge.title}'."
-                )
-                return valid_pool
-
-        logger.warning(
-            f"Failed to reach target task count ({target_valid_count}) for '{knowledge.title}' "
-            f"after {self.config.max_generation_attempts} attempts. Only got {len(valid_pool)}."
+        # Prioritize init tasks, then regular tasks, up to max_sft_knowledge
+        sft_targets_init = init_candidates[: self.config.max_sft_knowledge]
+        remaining_slots = self.config.max_sft_knowledge - len(sft_targets_init)
+        sft_targets_regular = (
+            regular_candidates[:remaining_slots] if remaining_slots > 0 else []
         )
-        return None
+
+        sft_result: SFTStepResult | None = None
+
+        # Execute Initial SFT
+        if sft_targets_init:
+            logger.info(
+                f"Selected {len(sft_targets_init)} items for INITIAL SFT (k={self.config.k_init_sft}, epochs={self.config.init_sft_epochs})."
+            )
+            sft_result = await self.execute_sft_step(
+                sft_targets_init, self.knowledge_pools, is_init=True
+            )
+            # Mark as initialized
+            for k in sft_targets_init:
+                self.initialized_knowledge.add(k.id)
+
+        # Execute Regular SFT
+        if sft_targets_regular:
+            logger.info(
+                f"Selected {len(sft_targets_regular)} items for REGULAR SFT (k={self.config.k_sft})."
+            )
+            regular_sft_result = await self.execute_sft_step(
+                sft_targets_regular, self.knowledge_pools, is_init=False
+            )
+            if sft_result is None:
+                sft_result = regular_sft_result
+            else:
+                sft_result.qra_list.extend(regular_sft_result.qra_list)
+
+        # 4. RL Phase: Exploration and Correction for ALL knowledge items in PARALLEL
+        logger.info(
+            f"Running RL Phase for {len(self.config.knowledge_list)} items concurrently."
+        )
+
+        # Collect rollouts from all knowledge items
+        all_task_results_per_knowledge: list[
+            list[TaskRolloutResult]
+        ] = await asyncio.gather(
+            *[
+                self._collect_rl_rollouts(k, self.knowledge_pools[k.id])
+                for k in self.config.knowledge_list
+            ]
+        )
+
+        # Consume RL tasks from pools
+        for k in self.config.knowledge_list:
+            self.knowledge_pools[k.id] = self.knowledge_pools[k.id][
+                self.config.k_rl :
+            ]
+
+        # Flatten all results for a single combined GRPO update
+        all_results_flat = [
+            tr for k_results in all_task_results_per_knowledge for tr in k_results
+        ]
+
+        if self._should_perform_grpo(all_results_flat):
+            await self._perform_grpo_update(all_results_flat)
+
+        # Sync sampling weights once per iteration after the aggregated update
+        await self._sync_sampling_weights()
+
+        # Process metrics and summarized results per knowledge
+        iteration_metrics = {}
+        total_rl_success = 0
+        total_rl_rollouts = 0
+        total_rl_task_success = 0
+        total_rl_tasks = 0
+
+        for i, (knowledge, k_results) in enumerate(
+            zip(self.config.knowledge_list, all_task_results_per_knowledge)
+        ):
+            # Summarize results for this specific knowledge item
+            rl_result = self._summarize_rl_results(k_results)
+
+            # Update performance map with the latest task success ratio
+            self.performance_map[knowledge.id] = rl_result.task_success_ratio
+
+            # Accumulate per-knowledge metrics
+            iteration_metrics[f"rl/{knowledge.title}/rollout_success_ratio"] = (
+                rl_result.rollout_success_ratio
+            )
+            iteration_metrics[f"rl/{knowledge.title}/task_success_ratio"] = (
+                rl_result.task_success_ratio
+            )
+
+            # Accumulate for aggregate metrics
+            total_rl_success += rl_result.total_success
+            total_rl_rollouts += rl_result.total_rollouts
+            total_rl_task_success += rl_result.task_success
+            total_rl_tasks += rl_result.num_tasks
+
+            # self._update_wandb_table(iteration, rl_result.sample)
+
+            # Visualization / Logging (for terminal feedback)
+            # self._visualize_iteration(
+            #     iteration,
+            #     sft_result.representative_sample if sft_result else None,
+            #     rl_result.sample,
+            #     include_header=(i == 0),
+            #     include_sft=(i == 0 and sft_result is not None),
+            # )
+
+        # 5. Overall Progress
+        if total_rl_rollouts > 0:
+            iteration_metrics["rl/rollout_success_ratio"] = (
+                total_rl_success / total_rl_rollouts
+            )
+        if total_rl_tasks > 0:
+            iteration_metrics["rl/task_success_ratio"] = (
+                total_rl_task_success / total_rl_tasks
+            )
+
+        mean_task_success = sum(self.performance_map.values()) / len(
+            self.performance_map
+        )
+        iteration_metrics["rl/mean_task_success"] = mean_task_success
+
+        # Single point for logging all RL-related metrics in this iteration
+        if self.ml_logger:
+            self.ml_logger.log_metrics(iteration_metrics)
+
+        logger.info(
+            f"Iteration {iteration} complete. Mean Task Success: {mean_task_success:.2%}"
+        )
+
+        if not self.config.stop_at_100:
+            return True
+
+        return mean_task_success < 1.0
+
+    def _filter_active_knowledge(self) -> list[Knowledge]:
+        """
+        Filter knowledge items, removing completed or failed ones.
+        """
+        active_knowledge = []
+        for k in self.config.knowledge_list:
+            if self.config.stop_at_100 and self.performance_map.get(k.id, 0.0) >= 1.0:
+                logger.info(f"KNOWLEDGE COMPLETED: '{k.title}' reached 100% success.")
+                self.completed_knowledge.add(k.id)
+                # Stop generator
+                if k.id in self.generator_tasks:
+                    self.generator_tasks[k.id].cancel()
+            elif k.id in self.failed_knowledge:
+                logger.error(
+                    f"KNOWLEDGE REJECTED: '{k.title}' failed to generate enough valid tasks."
+                )
+            else:
+                active_knowledge.append(k)
+        return active_knowledge
+
+    async def _run_background_generator(self, knowledge: Knowledge):
+        """
+        Background loop to continuously replenish the task pool for a specific knowledge item.
+        Exits only when the knowledge is no longer being actively processed.
+        """
+        knowledge_id = knowledge.id
+        logger.info(f"Starting background task generator for '{knowledge.title}'.")
+        consecutive_failures = 0
+
+        try:
+            while True:
+                # 1. Determine target pool size dynamically
+                required_count, target_count = self._get_required_task_counts(knowledge_id)
+
+                current_pool = self.knowledge_pools.get(knowledge_id, [])
+                if len(current_pool) < target_count:
+                    # 2. Generate a small batch to replenish the pool
+                    batch_size = max(4, target_count - len(current_pool))
+                    # Cap batch size to avoid overwhelming with a single item
+                    batch_size = min(batch_size, 8)
+
+                    logger.debug(
+                        f"Replenishing '{knowledge.title}': current={len(current_pool)}, target={target_count}, batch={batch_size}"
+                    )
+
+                    tasks_raw_maybe = await asyncio.gather(
+                        *[
+                            self._generate_qra_with_semaphore(knowledge)
+                            for _ in range(batch_size)
+                        ]
+                    )
+                    tasks_raw = [t for t in tasks_raw_maybe if t is not None]
+
+                    if not tasks_raw:
+                        consecutive_failures += 1
+                    else:
+                        # 3. Verify the generated batch
+                        verification_results = await gather_with_semaphore(
+                            [
+                                self._verify_with_execution(q.question, q)
+                                for q in tasks_raw
+                            ],
+                            max_concurrent=self.config.concurrency,
+                        )
+
+                        valid_tasks = [
+                            (tasks_raw[i], res)
+                            for i, res in enumerate(verification_results)
+                            if res.success
+                        ]
+
+                        if valid_tasks:
+                            self.knowledge_pools[knowledge_id].extend(valid_tasks)
+                            logger.info(
+                                f"Pool for '{knowledge.title}' updated: {len(self.knowledge_pools[knowledge_id])} tasks available (Required: {required_count}, Buffer Target: {target_count})."
+                            )
+                            consecutive_failures = 0
+                        else:
+                            consecutive_failures += 1
+
+                    if consecutive_failures >= self.config.max_generation_attempts:
+                        logger.error(
+                            f"Background generator for '{knowledge.title}' failed repeatedly. Flagging for rejection."
+                        )
+                        self.failed_knowledge.add(knowledge_id)
+                        break
+                await asyncio.sleep(2)
+
+        except asyncio.CancelledError:
+            logger.info(f"Background generator for '{knowledge.title}' cancelled.")
+        except Exception as e:
+            logger.exception(
+                f"Fatal error in background generator for '{knowledge.title}': {e}"
+            )
+        finally:
+            # Cleanup: ensure pool is cleared or marked if knowledge is removed
+            pass
+
+    async def _wait_for_task_readiness(self, active_knowledge: list[Knowledge]):
+        """
+        Wait until all active knowledge items have enough tasks for the current iteration.
+        Returns early if any active knowledge item has failed repeatedly.
+        """
+        logger.info(
+            "Waiting for all active knowledge items to have ready task pools..."
+        )
+        while True:
+            all_ready = True
+            for k in active_knowledge:
+                # 1. Safety check: Did this knowledge item recently fail to generate tasks?
+                if k.id in self.failed_knowledge:
+                    logger.warning(
+                        f"Wait interrupted for '{k.title}' as it was marked as failed."
+                    )
+                    return
+
+                # 2. Check current pool size
+                needs_sft = (
+                    self.performance_map.get(k.id, 0.0) < self.config.sft_threshold
+                )
+                required = (self.config.k_sft if needs_sft else 0) + self.config.k_rl
+
+                if len(self.knowledge_pools.get(k.id, [])) < required:
+                    logger.debug(
+                        f"Waiting for '{k.title}': {len(self.knowledge_pools[k.id])}/{required} tasks."
+                    )
+                    all_ready = False
+                    break
+
+            if all_ready:
+                logger.info("All task pools are ready for the current iteration.")
+                break
+
+            await asyncio.sleep(2)
+
+    async def _generate_qra_with_semaphore(self, knowledge: Knowledge) -> QRA | None:
+        """
+        Generate a QRA triplet for SFT bootstrapping, limited by task_gen_semaphore.
+        """
+        async with self.task_gen_semaphore:
+            return await self.generator.generate_sft(knowledge)
 
     async def execute_sft_step(
-        self, targets: list[Knowledge], pools: dict[str, list[QRA]]
+        self,
+        targets: list[Knowledge],
+        pools: dict[str, list[tuple[QRA, RLTrajectory]]],
+        is_init: bool = False,
     ) -> SFTStepResult:
         """
         Perform supervised fine-tuning across multiple knowledge targets.
@@ -456,27 +637,32 @@ class InternalizationPipeline:
         assert self.training_client is not None, "TrainingClient must be initialized"
 
         combined_qra_list = []
+        representative_sample: RLTrajectory | None = None
+
+        k_val = self.config.k_init_sft if is_init else self.config.k_sft
+        epochs = self.config.init_sft_epochs if is_init else None
+
         for k in targets:
             pool = pools[k.id]
-            # Take k_sft tasks and consume them
-            sft_tasks = pool[: self.config.k_sft]
-            pools[k.id] = pool[self.config.k_sft :]
+            # Take tasks and consume them
+            sft_bundle = pool[:k_val]
+            pools[k.id] = pool[k_val:]
+
+            sft_tasks = [bundle[0] for bundle in sft_bundle]
             combined_qra_list.extend(sft_tasks)
 
+            # Pick a representative sample for visualization (use existing trajectory)
+            if not representative_sample and sft_bundle:
+                representative_sample = sft_bundle[0][1]
+
         if combined_qra_list:
-            # Pick a representative sample (from the first target)
-            representative_sample = await self._verify_with_execution(
-                combined_qra_list[0].question, combined_qra_list[0]
-            )
-            await self._perform_sft_training(combined_qra_list)
-        else:
-            representative_sample = None
+            await self._perform_sft_training(combined_qra_list, num_epochs=epochs)
 
         return SFTStepResult(
             representative_sample=representative_sample, qra_list=combined_qra_list
         )
 
-    async def _perform_sft_training(self, qra_list: list[QRA]):
+    async def _perform_sft_training(self, qra_list: list[QRA], num_epochs: int | None = None):
         logger.info(
             f"Fine-tuning student on {len(qra_list)} total VALID QRA samples..."
         )
@@ -505,10 +691,11 @@ class InternalizationPipeline:
             for qra in qra_list
         ]
 
-        await self._run_sft_training_loop(datums)
+        await self._run_sft_training_loop(datums, num_epochs=num_epochs)
 
-    async def _run_sft_training_loop(self, datums: list):
+    async def _run_sft_training_loop(self, datums: list, num_epochs: int | None = None):
         params = self.config.sft_optimizer_params
+        epochs = num_epochs if num_epochs is not None else params.num_epochs
         batches = list(chunked(datums, params.batch_size))
 
         assert self.training_client is not None
@@ -518,7 +705,7 @@ class InternalizationPipeline:
         )
         optim_future = await self.training_client.optim_step_async(params.adam_params)
 
-        for epoch in range(params.num_epochs):
+        for epoch in range(epochs):
             for step, _ in enumerate(batches):
                 # Enqueue next
                 next_ep, next_st = self._get_next_batch_idx(
@@ -575,28 +762,25 @@ class InternalizationPipeline:
                 f"SFT Epoch {epoch + 1}/{total_epochs}, Step {step + 1}/{num_batches}: loss={loss}"
             )
 
-    async def execute_rl_step(
-        self, knowledge: Knowledge, pool: list[QRA]
-    ) -> RLStepResult:
+    async def _collect_rl_rollouts(
+        self, knowledge: Knowledge, pool: list[tuple[QRA, RLTrajectory]]
+    ) -> list[TaskRolloutResult]:
         """
-        Rollout solutions for pool tasks, verify, and train GRPO.
+        Rollout solutions for pool tasks and verify them.
+        Returns a list of TaskRolloutResults for potential training.
         """
-        logger.info(f"Executing RL Step for '{knowledge.title}'...")
+        logger.info(f"Collecting RL rollouts for '{knowledge.title}'...")
 
         # Use the remaining tasks in the pool for RL (capped at k_rl)
-        tasks = pool[: self.config.k_rl]
-        
+        # We only need the QA part for rollouts
+        tasks = [bundle[0] for bundle in pool[: self.config.k_rl]]
+
         task_results = await gather_with_semaphore(
             [self._rollout_and_verify_task_group(t) for t in tasks],
             max_concurrent=self.config.concurrency,
         )
 
-        if self._should_perform_grpo(task_results):
-            await self._perform_grpo_update(task_results)
-
-        await self._sync_sampling_weights()
-
-        return self._summarize_rl_results(task_results)
+        return task_results
 
     async def _rollout_and_verify_task_group(self, qa: QA) -> TaskRolloutResult:
         assert isinstance(self.solver.model, TinkerModel)
@@ -624,11 +808,7 @@ class InternalizationPipeline:
             msg, success = self.solver.model.renderer.parse_response(ac.tokens)
 
             if not success:
-
-                async def failed_result():
-                    return RLTrajectory.failed(qa.question)
-
-                verification_tasks.append(failed_result())
+                verification_tasks.append(self._wrap_failed_trajectory(qa.question))
                 metadata_list.append(RolloutMetadata(ac=ac, qra=None))
             else:
                 qra = self._parse_qra_from_message(qa.question, msg)
@@ -649,10 +829,11 @@ class InternalizationPipeline:
                     reasoning += part["thinking"]
                 elif part["type"] == "text":
                     answer_text += part["text"]
-            if not reasoning and answer_text:
-                reasoning = answer_text.split("```rust")[0].strip()
         else:
             answer_text = content
+
+        # DRY: Extract reasoning from answer text if thinking part was missing
+        if not reasoning:
             reasoning = answer_text.split("```rust")[0].strip()
 
         return QRA(
@@ -660,6 +841,27 @@ class InternalizationPipeline:
             reasoning=reasoning,
             answer=extract_rust_code(answer_text),
         )
+
+    def _get_required_task_counts(self, knowledge_id: str) -> tuple[int, int]:
+        """
+        Calculate required and target (with buffer) task counts for a knowledge item.
+        """
+        if knowledge_id not in self.initialized_knowledge:
+            required_count = self.config.k_init_sft + self.config.k_rl
+        else:
+            needs_sft = (
+                self.performance_map.get(knowledge_id, 0.0) < self.config.sft_threshold
+            )
+            required_count = (self.config.k_sft if needs_sft else 0) + self.config.k_rl
+
+        target_count = int(required_count * self.config.over_generation_factor)
+        return required_count, target_count
+
+    async def _wrap_failed_trajectory(self, question: str) -> RLTrajectory:
+        """
+        Wrap a failed trajectory creation in an async call for uniform handling.
+        """
+        return RLTrajectory.failed(question)
 
     def _should_perform_grpo(self, task_results: list[TaskRolloutResult]) -> bool:
         return any(tr.group is not None for tr in task_results)
@@ -799,36 +1001,6 @@ Your task is to solve the programming challenge using the `{library_name}` libra
         """
         console = Console()
 
-        def create_sample_panel(sample: RLTrajectory, title: str, color: str):
-            success_tag = (
-                "[bold green]✅ SUCCESS[/bold green]"
-                if sample.success
-                else "[bold red]❌ FAILURE[/bold red]"
-            )
-
-            content = Group(
-                Markdown(f"### Question\n{sample.question}"),
-                Rule(style="dim"),
-                Markdown(f"### Thought\n> {sample.reasoning}"),
-                Rule(style="dim"),
-                Markdown(f"### Solution\n```rust\n{sample.answer}\n```"),
-                Rule(style="dim"),
-                Markdown(
-                    f"### Execution Output\n```text\n{sample.execution_output}\n```"
-                ),
-                Rule(style="dim"),
-                Markdown(
-                    f"### Verification Judgment\n> {sample.verification_reasoning}"
-                ),
-            )
-
-            return Panel(
-                content,
-                title=f"{title} - {success_tag}",
-                border_style=color,
-                expand=False,
-            )
-
         if include_header:
             console.print()
             console.print(
@@ -841,7 +1013,7 @@ Your task is to solve the programming challenge using the `{library_name}` libra
 
         if include_sft and sft_sample:
             console.print(
-                create_sample_panel(
+                self._create_sample_panel(
                     sft_sample, "Phase 1: Teacher (SFT) Sample", "magenta"
                 )
             )
@@ -849,7 +1021,7 @@ Your task is to solve the programming challenge using the `{library_name}` libra
 
         if rl_sample:
             console.print(
-                create_sample_panel(
+                self._create_sample_panel(
                     rl_sample,
                     "Phase 2: Student (RL) Sample",
                     "green" if rl_sample.success else "yellow",
@@ -859,3 +1031,32 @@ Your task is to solve the programming challenge using the `{library_name}` libra
 
         console.print(Rule(style="cyan"))
         console.print()
+
+    def _create_sample_panel(self, sample: RLTrajectory, title: str, color: str) -> Panel:
+        """
+        Create a Rich Panel for a single trajectory sample.
+        """
+        success_tag = (
+            "[bold green]✅ SUCCESS[/bold green]"
+            if sample.success
+            else "[bold red]❌ FAILURE[/bold red]"
+        )
+
+        content = Group(
+            Markdown(f"### Question\n{sample.question}"),
+            Rule(style="dim"),
+            Markdown(f"### Thought\n> {sample.reasoning}"),
+            Rule(style="dim"),
+            Markdown(f"### Solution\n```rust\n{sample.answer}\n```"),
+            Rule(style="dim"),
+            Markdown(f"### Execution Output\n```text\n{sample.execution_output}\n```"),
+            Rule(style="dim"),
+            Markdown(f"### Verification Judgment\n> {sample.verification_reasoning}"),
+        )
+
+        return Panel(
+            content,
+            title=f"{title} - {success_tag}",
+            border_style=color,
+            expand=False,
+        )
