@@ -3,7 +3,10 @@ from dataclasses import dataclass
 from itertools import chain
 from typing import Optional, Self
 
+import ray
 from tinker import SamplingClient
+from tinker_cookbook.utils import ml_log
+from tinker_cookbook.utils.ml_log import Logger as MLLogger
 
 from adapter_agent.data import QRA
 from adapter_agent.hierarchical.state import RLGroup
@@ -21,6 +24,7 @@ from adapter_agent.rl.shared_sampling_client import (
     IndexedSamplingClient,
     SharedSamplingClient,
 )
+from adapter_agent.util.logger_util import setup_base_loglevel
 
 
 @dataclass
@@ -28,10 +32,16 @@ class UsedGroupRolloutResult:
     task_id: str
     trajectories: list[SingleRolloutResult]
     used: bool
+    sampling_version: int
 
     @classmethod
     def from_group_result(cls, result: GroupRolloutResult) -> Self:
-        return cls(task_id=result.task_id, trajectories=result.trajectories, used=False)
+        return cls(
+            task_id=result.task_id,
+            trajectories=result.trajectories,
+            used=False,
+            sampling_version=result.current_sampling_version,
+        )
 
     def to_rlgroup(self) -> RLGroup:
         """Transform this rollout group into an RLGroup for GRPO training."""
@@ -179,6 +189,7 @@ class InternalizationKnowledge:
 class KnowledgeMasteryManager:
     knowledges: dict[str, InternalizationKnowledge]
     mastery_config: MasteryConfig
+    last_reported_version: int = -1
 
     def get_replenishment_plan(self) -> list[tuple[Knowledge, int]]:
         """Calculate how many QRAs to generate for each underperforming knowledge."""
@@ -287,27 +298,104 @@ class KnowledgeMasteryManager:
     def report_qra_generation_end(self, knowledge_id: str) -> None:
         self.knowledges[knowledge_id].decrement_running_qra()
 
+    def get_new_version_stats(
+        self, current_version: int
+    ) -> dict[int, dict[str, float]]:
+        """
+        Calculate metrics for all versions between last_reported_version and current_version.
+        """
+        version_to_groups: dict[int, list[UsedGroupRolloutResult]] = {}
+        for k in self.knowledges.values():
+            for g in k.groups:
+                v = g.sampling_version
+                if self.last_reported_version < v < current_version:
+                    if v not in version_to_groups:
+                        version_to_groups[v] = []
+                    version_to_groups[v].append(g)
+
+        stats: dict[int, dict[str, float]] = {}
+        for v, groups in version_to_groups.items():
+            if not groups:
+                continue
+
+            # Ratio of tasks with at least one success
+            success_tasks = sum(
+                1.0 for g in groups if any(r.success for r in g.trajectories)
+            )
+            task_success_ratio = success_tasks / len(groups)
+
+            # Total success rate across all rollouts
+            total_trajectories = sum(len(g.trajectories) for g in groups)
+            total_successes = sum(
+                1.0 for g in groups for r in g.trajectories if r.success
+            )
+            total_success_rate = (
+                total_successes / total_trajectories if total_trajectories > 0 else 0.0
+            )
+
+            stats[v] = {
+                "overall/task_success_ratio": task_success_ratio,
+                "overall/total_success_rate": total_success_rate,
+            }
+
+        if stats:
+            self.last_reported_version = max(stats.keys())
+
+        return stats
+
 
 @dataclass
 class GlobalState:
     sampling_client: SharedSamplingClient
     knowledge_manager: KnowledgeMasteryManager
+    ml_logger: MLLogger = None  # type: ignore
 
-    async def update_sampling_client(self, sampling_client: SamplingClient) -> None:
-        await self.sampling_client.update_client(sampling_client)
+    def update_sampling_client(self, sampling_client: SamplingClient) -> None:
+        self.sampling_client.update_client(sampling_client)
+        # Automatically log stats for the versions completed after this update
+        self.log_version_stats()
 
-    async def get_sampling_client(self) -> IndexedSamplingClient:
-        return await self.sampling_client.get_client()
+    async def setup_logging(
+        self, log_dir: str, wandb_project: Optional[str], config: Optional[dict]
+    ) -> None:
+        setup_base_loglevel()
+        self.ml_logger = ml_log.setup_logging(
+            log_dir=log_dir,
+            wandb_project=wandb_project,
+            config=config,
+        )
 
-    async def get_replenishment_plan(self) -> list[tuple[Knowledge, int]]:
+    async def log_metrics(self, metrics: dict, step: Optional[int] = None) -> None:
+        self.ml_logger.log_metrics(metrics, step=step)
+
+    async def log_hparams(self, config: dict) -> None:
+        self.ml_logger.log_hparams(config)
+
+    @ray.method
+    def get_current_version(self) -> int:
+        return self.sampling_client.version
+
+    def log_version_stats(self) -> None:
+        stats = self.get_new_version_stats()
+        for version, s in stats.items():
+            self.ml_logger.log_metrics(s, step=version)
+
+    def get_sampling_client(self) -> IndexedSamplingClient:
+        return self.sampling_client.get_client()
+
+    def get_replenishment_plan(self) -> list[tuple[Knowledge, int]]:
         """Calculate how many QRAs to generate for each underperforming knowledge."""
         return self.knowledge_manager.get_replenishment_plan()
 
-    async def get_status_summary(self) -> dict[str, float]:
+    def get_status_summary(self) -> dict[str, float]:
         """Return a mapping of knowledge_id to current success ratio."""
         return self.knowledge_manager.get_status_summary()
 
-    async def report_qra_generation_result(
+    def get_new_version_stats(self) -> dict[int, dict[str, float]]:
+        current_version = self.sampling_client.version
+        return self.knowledge_manager.get_new_version_stats(current_version)
+
+    def report_qra_generation_result(
         self, knowledge_id: str, qra: Optional[QRA] = None
     ) -> None:
         """Report results of a generation task and end its lifecycle."""
@@ -315,21 +403,19 @@ class GlobalState:
             self.knowledge_manager.push_qra(knowledge_id, qra)
         self.knowledge_manager.report_qra_generation_end(knowledge_id)
 
-    async def report_qra_generation_start(self, knowledge_id: str) -> None:
+    def report_qra_generation_start(self, knowledge_id: str) -> None:
         self.knowledge_manager.report_qra_generation_start(knowledge_id)
 
     # --- Rollout Interfaces ---
-    async def pop_rollout_task(self) -> InternalizationTask | None:
+    def pop_rollout_task(self) -> InternalizationTask | None:
         """Get a task from the queue. Called by RemoteWorkers."""
         return self.knowledge_manager.pop_rollout_task()
 
-    async def pop_rl_batch(self, min_batch_size: int) -> list[RLGroup] | None:
+    def pop_rl_batch(self, min_batch_size: int) -> list[RLGroup] | None:
         """Returns results only if the queue size exceeds min_batch_size."""
         return self.knowledge_manager.pop_rl_batch(min_batch_size)
 
-    async def pop_sft_batch(
-        self, min_batch_size: int
-    ) -> list[InternalizationQRA] | None:
+    def pop_sft_batch(self, min_batch_size: int) -> list[InternalizationQRA] | None:
         return self.knowledge_manager.pop_sft_batch(min_batch_size)
 
     async def report_sft_results(self, qras: list[InternalizationQRA]) -> None:

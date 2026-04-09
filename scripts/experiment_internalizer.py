@@ -72,9 +72,7 @@ async def main():
     sampling_client = SharedSamplingClient(tinker_model.sampling_client)
 
     # 6. Runtime Settings
-    runtime_settings = RuntimeSettings(
-        type="docker", image_uri="coder-mcp-numrs2:latest"
-    )
+    runtime_settings = RuntimeSettings.cloudrun_numrs2()
 
     # 7. Start Internalizer
     logger.info("Starting Internalizer and Ray actors...")
@@ -98,6 +96,7 @@ async def main():
         k_rl=4,
         num_workers=4,
         max_iterations=50,
+        generator_concurrency=64,
     )
 
     # 8. Run the Internalization Experiment

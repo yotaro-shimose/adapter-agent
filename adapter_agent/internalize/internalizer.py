@@ -23,8 +23,6 @@ from tinker_cookbook.renderers import (
 from tinker_cookbook.rl import Trajectory
 from tinker_cookbook.rl.types import TokensWithLogprobs, Transition
 from tinker_cookbook.supervised.data import conversation_to_datum
-from tinker_cookbook.utils import ml_log
-from tinker_cookbook.utils.ml_log import Logger as MLLogger
 
 from adapter_agent.data import QRA
 from adapter_agent.hierarchical.agent.verifier import Verifier
@@ -56,6 +54,7 @@ from adapter_agent.rl.shared_sampling_client import (
     IndexedSamplingClient,
     SharedSamplingClient,
 )
+from adapter_agent.util.logger_util import setup_base_loglevel
 from adapter_agent.util.parsing import extract_rust_code
 
 logger = logging.getLogger(__name__)
@@ -77,6 +76,7 @@ class RemoteWorker:
 
     async def setup(self) -> None:
         """Initialize non-picklable components."""
+        setup_base_loglevel()
         if self.verifier is not None:
             return
 
@@ -267,7 +267,6 @@ class Internalizer:
     global_state: ActorProxy[GlobalState]
     workers: list[ActorProxy[RemoteWorker]]
     qra_generator: ActorProxy[QRAGenerator]
-    ml_logger: MLLogger
     training_client: tinker.TrainingClient  # Mandatory
 
     # Training Configuration
@@ -310,6 +309,7 @@ class Internalizer:
         """
         Initialize Ray actors and return a started Internalizer.
         """
+        setup_base_loglevel()
         # 0. Prep Mastery Manager
         mastery_config = MasteryConfig(
             studying_threshold=studying_threshold,
@@ -367,10 +367,10 @@ class Internalizer:
             for _ in range(num_workers)
         ]
 
-        # 4. Logger (W&B)
+        # 4. Logger Setup via GlobalState
         log_dir = Path("logs") / "internalizer" / model_name
         log_dir.mkdir(parents=True, exist_ok=True)
-        ml_logger = ml_log.setup_logging(
+        await global_state.setup_logging.remote(  # type: ignore[attr-defined]
             log_dir=str(log_dir),
             wandb_project="internalization",
             config={
@@ -398,7 +398,6 @@ class Internalizer:
             global_state=global_state,
             workers=workers,
             qra_generator=qra_generator,
-            ml_logger=ml_logger,
             training_client=training_client,
             model_loading_settings=ModelLoadingSettings(
                 model_name=model_name,
@@ -434,9 +433,6 @@ class Internalizer:
             logger.debug(
                 f"--- Monitoring (RL Steps: {self.rl_step_count}/{self.max_iterations}) ---"
             )
-
-            # Overall Status Logging
-            await self.log_status()
 
             # 1. RL Update (Priority): Use pop_rl_batch to ensure efficiency
             rollout_results: (
@@ -478,12 +474,14 @@ class Internalizer:
         self.rl_step_count += 1
 
         # 4. Log metrics
-        self.ml_logger.log_metrics(
+        current_version = await self.global_state.get_current_version.remote()  # type: ignore[attr-defined]
+        await self.global_state.log_metrics.remote(  # type: ignore[attr-defined]
             {
                 "rl/trajectories": total_trajectories,
                 "rl/mean_reward": mean_reward,
                 "rl/total_reward": total_reward,
-            }
+            },
+            step=current_version,
         )
 
     async def sft_step(self, sft_dataset: list[InternalizationQRA]) -> None:
@@ -534,9 +532,10 @@ class Internalizer:
             await optim.result_async()
 
             # Log all available metrics from the server
+            current_version = await self.global_state.get_current_version.remote()
             metrics = {f"sft/{k}": v for k, v in res.metrics.items()}
             metrics["sft/batch_samples"] = len(batch)
-            self.ml_logger.log_metrics(metrics)
+            await self.global_state.log_metrics.remote(metrics, step=current_version)  # type: ignore[attr-defined]
 
         await self._sync_sampling_weights()
 
@@ -562,8 +561,10 @@ class Internalizer:
         await optim_future.result_async()
 
         if hasattr(grpo_res, "metrics"):
-            self.ml_logger.log_metrics(
-                {f"rl/{k}": v for k, v in grpo_res.metrics.items()}
+            current_version = await self.global_state.get_current_version.remote()  # type: ignore[attr-defined]
+            await self.global_state.log_metrics.remote(  # type: ignore[attr-defined]
+                {f"rl/{k}": v for k, v in grpo_res.metrics.items()},
+                step=current_version,
             )
 
         await self._sync_sampling_weights()
@@ -575,13 +576,3 @@ class Internalizer:
             await self.training_client.save_weights_and_get_sampling_client_async()
         )
         await self.global_state.update_sampling_client.remote(new_sampling_client)  # type: ignore[attr-defined]
-
-    async def log_status(self) -> None:
-        status: dict[str, float] = await self.global_state.get_status_summary.remote()  # type: ignore[assignment]
-        mean_success = sum(status.values()) / len(status)
-        self.ml_logger.log_metrics(
-            {
-                "iteration": self.rl_step_count,
-                "overall/mean_task_success": mean_success,
-            }
-        )

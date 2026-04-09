@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Literal, Self
 
 from coder_mcp.runtime import CloudRunRuntime, DockerRuntime, Runtime
 from pydantic import BaseModel
@@ -15,3 +15,14 @@ class RuntimeSettings(BaseModel):
             return DockerRuntime(image_name=self.image_uri)
         else:
             raise ValueError(f"Unknown runtime type: {self.type}")
+
+    @classmethod
+    def cloudrun_numrs2(cls) -> Self:
+        return cls(
+            type="cloudrun",
+            image_uri="europe-north1-docker.pkg.dev/dsat2-405406/shimose-repo/coder-mcp-numrs2",
+        )
+
+    @classmethod
+    def docker_numrs2(cls) -> Self:
+        return cls(type="docker", image_uri="coder-mcp-numrs2:latest")

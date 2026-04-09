@@ -13,6 +13,7 @@ from adapter_agent.internalize.global_state import GlobalState
 from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
 from adapter_agent.model_helper import get_gemini
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
+from adapter_agent.util.logger_util import setup_base_loglevel
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +24,7 @@ class QRAGenerator:
     library: Library
     verifier: Verifier
     runtime_settings: RuntimeSettings
-    num_concurrent_generations: int = 16
+    num_concurrent_generations: int = 64
 
     generator: GeneratorAgent | None = field(init=False, default=None)
     doc_analyzer: AsyncRustDocAnalyzer | None = field(init=False, default=None)
@@ -31,6 +32,7 @@ class QRAGenerator:
 
     async def setup(self) -> None:
         """Initialize generator agent and verifier."""
+        setup_base_loglevel()
         logger.info("Initializing QRAGenerator internal components...")
         self.concurrency_limit = asyncio.Semaphore(self.num_concurrent_generations)
         self.doc_analyzer = await AsyncRustDocAnalyzer.create_from_libdir(
