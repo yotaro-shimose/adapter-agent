@@ -13,7 +13,10 @@ from adapter_agent.internalize.global_state import GlobalState
 from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
 from adapter_agent.model_helper import get_gemini
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
+from adapter_agent.rl.env.runtime_pool import RuntimePool
+from coder_mcp.runtime import Runtime
 from adapter_agent.util.logger_util import setup_base_loglevel
+from adapter_agent.util.parsing import extract_rust_code
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +32,7 @@ class QRAGenerator:
     generator: GeneratorAgent | None = field(init=False, default=None)
     doc_analyzer: AsyncRustDocAnalyzer | None = field(init=False, default=None)
     concurrency_limit: asyncio.Semaphore | None = field(init=False, default=None)
+    runtime_pool: RuntimePool | None = field(init=False, default=None)
 
     async def setup(self) -> None:
         """Initialize generator agent and verifier."""
@@ -43,6 +47,9 @@ class QRAGenerator:
         )
         self.verifier = Verifier(
             model=get_gemini(), rust_doc_analyzer=self.doc_analyzer
+        )
+        self.runtime_pool = RuntimePool(
+            self.runtime_settings, max_size=self.num_concurrent_generations
         )
 
     def __repr__(self) -> str:
@@ -100,24 +107,29 @@ class QRAGenerator:
     async def _verify_generated_qra(self, rollout: QRA) -> VerificationResult:
         """Run Rust code and verify for newly generated tasks."""
         assert self.verifier is not None
-        try:
-            async with self.runtime_settings.build_runtime() as runtime:
-                await runtime.set_content("src/main.rs", rollout.answer)
-                execution_output, exit_success = await runtime.run_cargo()
+        assert self.runtime_pool is not None
+        
+        async def _run(runtime: Runtime) -> VerificationResult:
+            code = extract_rust_code(rollout.answer)
+            await runtime.set_content("src/main.rs", code)
+            execution_output, exit_success = await runtime.run_cargo()
 
-                if not exit_success:
-                    return VerificationResult(
-                        success=False, reasoning="Cargo execution failed."
-                    )
-
-                tree_output = await runtime.tree()
-
-                return await self.verifier.verify(
-                    qa=rollout,
-                    tree_structure=tree_output,
-                    execution_output=execution_output,
-                    main_rs_content=rollout.answer,
+            if not exit_success:
+                return VerificationResult(
+                    success=False, reasoning="Cargo execution failed."
                 )
+
+            tree_output = await runtime.tree()
+
+            return await self.verifier.verify(
+                qa=rollout,
+                tree_structure=tree_output,
+                execution_output=execution_output,
+                main_rs_content=rollout.answer,
+            )
+
+        try:
+            return await self.runtime_pool.execute_with_retry(_run)
         except Exception as e:
             logger.error(f"Execution verification failed during QRA generation: {e}")
             return VerificationResult(success=False, reasoning=str(e))

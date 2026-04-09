@@ -80,7 +80,7 @@ Your task is to generate a high-quality {mode_desc}.
 
 <Objective>
 - Create a realistic coding challenge (Question) that tests the understanding of the API.
-- The code (Answer) must be correct, idiomatic Rust, and the execution results should clearly demonstrate that it works as intended.
+- The Answer should be a natural language explanation of the solution, which MUST include the code enclosed in a ```rust ... ``` code block. The code must be correct, idiomatic Rust, and the execution results should clearly demonstrate that it works as intended.
 {"- The reasoning ($R$) should reflect your internalized thought process, API choices, and logic flow." if is_sft else "- Even in RL mode, you must provide an Answer to ensure the question is definitely solvable."}
 </Objective>
 

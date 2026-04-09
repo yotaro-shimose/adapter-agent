@@ -25,6 +25,7 @@ from tinker_cookbook.rl.types import TokensWithLogprobs, Transition
 from tinker_cookbook.supervised.data import conversation_to_datum
 
 from adapter_agent.data import QRA
+from adapter_agent.hierarchical.agent.rewirer import log_trajectory
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.gh import Library
 from adapter_agent.hierarchical.grpo import compute_grpo_loss
@@ -50,6 +51,8 @@ from adapter_agent.rl.config import (
     OptimizerParams,
 )
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
+from adapter_agent.rl.env.runtime_pool import RuntimePool
+from coder_mcp.runtime import Runtime
 from adapter_agent.rl.shared_sampling_client import (
     IndexedSamplingClient,
     SharedSamplingClient,
@@ -73,6 +76,7 @@ class RemoteWorker:
     rust_doc_analyzer: Optional[AsyncRustDocAnalyzer] = field(init=False, default=None)
     verifier: Optional[Verifier] = field(init=False, default=None)
     renderer: Optional[Renderer] = field(init=False, default=None)
+    runtime_pool: Optional[RuntimePool] = field(init=False, default=None)
 
     async def setup(self) -> None:
         """Initialize non-picklable components."""
@@ -93,6 +97,8 @@ class RemoteWorker:
         # Using setup_tinkermodel as it handles tokenizer/renderer setup canonically.
         _, _, renderer = setup_tinkermodel(self.model_name)
         self.renderer = renderer
+        
+        self.runtime_pool = RuntimePool(self.runtime_settings, max_size=self.k_rollout)
 
     def __repr__(self) -> str:
         return f"RemoteWorker(model={self.model_name})"
@@ -173,8 +179,6 @@ class RemoteWorker:
 
             # Log trajectory for observability
             if success:
-                from adapter_agent.hierarchical.agent.rewirer import log_trajectory
-
                 log_trajectory(messages + [msg])
 
             if not success:
@@ -201,42 +205,47 @@ class RemoteWorker:
     ) -> SingleRolloutResult:
         """Run Rust code and verify."""
         assert self.verifier is not None
-        try:
-            async with self.runtime_settings.build_runtime() as runtime:
-                await runtime.set_content("src/main.rs", rollout.answer)
-                execution_output, exit_success = await runtime.run_cargo()
+        assert self.runtime_pool is not None
+        
+        async def _run(runtime: Runtime) -> SingleRolloutResult:
+            code = extract_rust_code(rollout.answer)
+            await runtime.set_content("src/main.rs", code)
+            execution_output, exit_success = await runtime.run_cargo()
 
-                if not exit_success:
-                    return SingleRolloutResult(
-                        question=rollout.question,
-                        reasoning=rollout.reasoning,
-                        answer=rollout.answer,
-                        execution_output=execution_output,
-                        main_rs_content=rollout.answer,
-                        success=False,
-                        verification_reasoning="Compilation or runtime execution failed.",
-                        trajectory=trajectory,
-                    )
-
-                tree_output = await runtime.tree()
-
-                verification_result = await self.verifier.verify(
-                    qa=rollout,
-                    tree_structure=tree_output,
-                    execution_output=execution_output,
-                    main_rs_content=rollout.answer,
-                )
-
+            if not exit_success:
                 return SingleRolloutResult(
                     question=rollout.question,
                     reasoning=rollout.reasoning,
                     answer=rollout.answer,
                     execution_output=execution_output,
                     main_rs_content=rollout.answer,
-                    success=verification_result.success,
-                    verification_reasoning=verification_result.reasoning,
+                    success=False,
+                    verification_reasoning="Compilation or runtime execution failed.",
                     trajectory=trajectory,
                 )
+
+            tree_output = await runtime.tree()
+
+            verification_result = await self.verifier.verify(
+                qa=rollout,
+                tree_structure=tree_output,
+                execution_output=execution_output,
+                main_rs_content=rollout.answer,
+            )
+
+            return SingleRolloutResult(
+                question=rollout.question,
+                reasoning=rollout.reasoning,
+                answer=rollout.answer,
+                execution_output=execution_output,
+                main_rs_content=rollout.answer,
+                success=verification_result.success,
+                verification_reasoning=verification_result.reasoning,
+                trajectory=trajectory,
+            )
+
+        try:
+            return await self.runtime_pool.execute_with_retry(_run)
         except Exception as e:
             logger.error(f"Rollout verification error: {e}")
             return SingleRolloutResult.parse_failed(rollout.question, trajectory)
@@ -251,6 +260,7 @@ Your task is to solve the programming challenge using the `{self.library.name}` 
 1. Write high-quality, idiomatic Rust code.
 2. Ensure your solution is complete and self-contained.
 3. Ensure that your code produces clear output during execution so that its correctness can be easily verified from the execution results.
+4. Your response should include a natural language explanation, and the complete code MUST be enclosed in a ```rust ... ``` code block.
 </Guidelines>
 """
 
@@ -275,7 +285,7 @@ Your task is to solve the programming challenge using the `{self.library.name}` 
         return QRA(
             question=question,
             reasoning=reasoning,
-            answer=extract_rust_code(answer_text),
+            answer=answer_text,
         )
 
 
