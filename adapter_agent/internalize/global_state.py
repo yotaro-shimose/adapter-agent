@@ -59,6 +59,13 @@ class UsedGroupRolloutResult:
             self.trajectories
         )
 
+    def is_learnable(self) -> bool:
+        """A group is learnable if there is at least one success and one failure."""
+        if not self.trajectories:
+            return False
+        first_success = self.trajectories[0].success
+        return any(res.success != first_success for res in self.trajectories)
+
 
 @dataclass
 class InternalizationKnowledge:
@@ -146,13 +153,16 @@ class InternalizationKnowledge:
         return self.mastery_config.k_sft
 
     def rl_ready_count(self) -> int:
-        return len([g for g in self.groups if not g.used])
+        return len([g for g in self.groups if not g.used and g.is_learnable()])
 
     def pop_rl_groups(self) -> list[RLGroup]:
-        groups = [g.to_rlgroup() for g in self.groups if not g.used]
+        learnable_groups = []
         for g in self.groups:
-            g.used = True
-        return groups
+            if not g.used:
+                if g.is_learnable():
+                    learnable_groups.append(g.to_rlgroup())
+                g.used = True
+        return learnable_groups
 
     def rollout_ready_count(self) -> int:
         num_running_rl = len(self.running_rl)
@@ -161,19 +171,23 @@ class InternalizationKnowledge:
         required_rollout_count = self.mastery_config.k_rl - num_running_rl
         return min(required_rollout_count, len(self.qras))
 
-    def pop_rollout_qra(self) -> InternalizationQRA:
+    def pop_rollout_qra(self) -> tuple[InternalizationQRA, str]:
         qra = self.qras.pop(0)
         task = RLTask(
             knowledge_id=self.knowledge.id,
             instruction=qra.question,
         )
         self.running_rl[task.id] = task
-        return qra
+        return qra, task.id
 
     def push_rollout_result(self, result: GroupRolloutResult) -> None:
         self.running_rl.pop(result.task_id)
         new_group = UsedGroupRolloutResult.from_group_result(result)
         self.groups.append(new_group)
+
+    def report_rollout_failure(self, task_id: str) -> None:
+        if task_id in self.running_rl:
+            self.running_rl.pop(task_id)
 
     def push_qra(self, qra: QRA) -> None:
         internalization_qra = InternalizationQRA(
@@ -190,6 +204,8 @@ class KnowledgeMasteryManager:
     knowledges: dict[str, InternalizationKnowledge]
     mastery_config: MasteryConfig
     last_reported_version: int = -1
+    total_rollout_groups_completed: int = 0
+    total_rollout_groups_successful: int = 0
 
     def get_replenishment_plan(self) -> list[tuple[Knowledge, int]]:
         """Calculate how many QRAs to generate for each underperforming knowledge."""
@@ -261,16 +277,25 @@ class KnowledgeMasteryManager:
             return None
         knowledge_id = random.choice(list(counts.keys()))
         knowledge = self.knowledges[knowledge_id]
-        qra = knowledge.pop_rollout_qra()
+        qra, task_id = knowledge.pop_rollout_qra()
 
         return InternalizationTask(
+            id=task_id,
             knowledge_id=knowledge_id,
             instruction=qra.question,
         )
 
     def push_rollout_result(self, result: GroupRolloutResult) -> None:
+        self.total_rollout_groups_completed += 1
+        if any(r.success for r in result.trajectories):
+            self.total_rollout_groups_successful += 1
+
         knowledge = self.knowledges[result.knowledge_id]
         knowledge.push_rollout_result(result)
+
+    def report_rollout_failure(self, knowledge_id: str, task_id: str) -> None:
+        if knowledge_id in self.knowledges:
+            self.knowledges[knowledge_id].report_rollout_failure(task_id)
 
     def pop_rl_batch(self, min_batch_size: int) -> list[RLGroup] | None:
         available_group_count = sum(
@@ -343,6 +368,39 @@ class KnowledgeMasteryManager:
 
         return stats
 
+    def get_detailed_status(self) -> dict[str, float]:
+        """
+        Calculate and return total status metrics.
+        """
+        active_qras = sum(k.running_qra_generation for k in self.knowledges.values())
+        active_rollouts = sum(len(k.running_rl) for k in self.knowledges.values())
+        sft_ready = sum(k.sft_ready_count() for k in self.knowledges.values())
+        rl_ready = sum(k.rl_ready_count() for k in self.knowledges.values())
+        qra_plan = sum(k.get_required_qra() for k in self.knowledges.values())
+
+        mastery_counts = {"studying": 0, "practicing": 0, "mastered": 0}
+        for k in self.knowledges.values():
+            m = k.mastery
+            if m in mastery_counts:
+                mastery_counts[m] += 1
+
+        return {
+            "status/active_qra_generations": float(active_qras),
+            "status/active_rollouts": float(active_rollouts),
+            "status/sft_ready_qras": float(sft_ready),
+            "status/rl_ready_groups": float(rl_ready),
+            "status/qra_generation_plan_total": float(qra_plan),
+            "status/total_rollout_groups_completed": float(
+                self.total_rollout_groups_completed
+            ),
+            "status/total_rollout_groups_successful": float(
+                self.total_rollout_groups_successful
+            ),
+            "status/studying_count": float(mastery_counts["studying"]),
+            "status/practicing_count": float(mastery_counts["practicing"]),
+            "status/mastered_count": float(mastery_counts["mastered"]),
+        }
+
 
 @dataclass
 class GlobalState:
@@ -379,6 +437,15 @@ class GlobalState:
         stats = self.get_new_version_stats()
         for version, s in stats.items():
             self.ml_logger.log_metrics(s, step=version)
+
+    def report_detailed_status(self) -> None:
+        if self.ml_logger:
+            version = self.sampling_client.version
+            metrics = self.knowledge_manager.get_detailed_status()
+            self.ml_logger.log_metrics(metrics, step=version)
+
+    def __repr__(self) -> str:
+        return f"GlobalState(v={self.sampling_client.version})"
 
     def get_sampling_client(self) -> IndexedSamplingClient:
         return self.sampling_client.get_client()
@@ -423,3 +490,7 @@ class GlobalState:
 
     async def push_rollout_result(self, result: GroupRolloutResult) -> None:
         self.knowledge_manager.push_rollout_result(result)
+
+    @ray.method
+    def report_rollout_failure(self, knowledge_id: str, task_id: str) -> None:
+        self.knowledge_manager.report_rollout_failure(knowledge_id, task_id)

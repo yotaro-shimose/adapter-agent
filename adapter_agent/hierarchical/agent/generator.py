@@ -31,7 +31,9 @@ class GeneratorAgent[T: AgentsSDKModel](BaseAgent[T]):
             output = result.final_output()
             return output
         except Exception as e:
-            logger.error(f"Problem generation (SFT) failed for '{knowledge.title}': {e}")
+            logger.exception(
+                f"Problem generation (SFT) failed for '{knowledge.title}': {e}"
+            )
             return None
 
     async def generate_rl(self, knowledge: Knowledge) -> Optional[QA]:
@@ -48,7 +50,9 @@ class GeneratorAgent[T: AgentsSDKModel](BaseAgent[T]):
             output = result.final_output()
             return output
         except Exception as e:
-            logger.error(f"Problem generation (RL) failed for '{knowledge.title}': {e}")
+            logger.exception(
+                f"Problem generation (RL) failed for '{knowledge.title}': {e}"
+            )
             return None
 
     def _create_agent[OUT: BaseModel](

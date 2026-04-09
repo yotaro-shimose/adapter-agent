@@ -45,14 +45,21 @@ class QRAGenerator:
             model=get_gemini(), rust_doc_analyzer=self.doc_analyzer
         )
 
+    def __repr__(self) -> str:
+        return f"QRAGenerator(lib={self.library.name})"
+
     async def run_loop(self) -> None:
         """
         Background loop: replenishment of task pools.
         """
         await self.setup()
         while True:
-            await self.replenish_all_pools()
-            await asyncio.sleep(5)
+            try:
+                await self.replenish_all_pools()
+                await asyncio.sleep(5)
+            except Exception as e:
+                logger.exception(f"QRAGenerator error: {e}")
+                await asyncio.sleep(10)
 
     async def replenish_all_pools(self) -> None:
         """Analyze pool status and trigger replenishment for all knowledges concurrently."""

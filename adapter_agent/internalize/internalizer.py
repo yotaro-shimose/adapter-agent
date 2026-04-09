@@ -94,30 +94,41 @@ class RemoteWorker:
         _, _, renderer = setup_tinkermodel(self.model_name)
         self.renderer = renderer
 
+    def __repr__(self) -> str:
+        return f"RemoteWorker(model={self.model_name})"
+
     async def run_loop(self) -> None:
         """
         Main loop for the worker: constantly pull tasks from GlobalState and perform rollouts.
         """
         await self.setup()
         while True:
-            # 1. Get current sampling client and version
-            indexed_client: IndexedSamplingClient = (
-                await self.global_state.get_sampling_client.remote()  # type: ignore[assignment]
-            )
+            task: InternalizationTask | None = None
+            try:
+                # 1. Get current sampling client and version
+                indexed_client: IndexedSamplingClient = (
+                    await self.global_state.get_sampling_client.remote()  # type: ignore[assignment]
+                )
 
-            # 2. Pop task
-            task: (
-                InternalizationTask | None
-            ) = await self.global_state.pop_rollout_task.remote()  # type: ignore[assignment]
-            if task is None:
-                await asyncio.sleep(1)
-                continue
+                # 2. Pop task
+                task = await self.global_state.pop_rollout_task.remote()  # type: ignore[assignment]
+                if task is None:
+                    await asyncio.sleep(1)
+                    continue
 
-            # 3. Perform rollout and push
-            result = await self.rollout_task_group(
-                task, indexed_client.client, indexed_client.version
-            )
-            await self.global_state.push_rollout_result.remote(result)  # type: ignore[attr-defined]
+                # 3. Perform rollout and push
+                result = await self.rollout_task_group(
+                    task, indexed_client.client, indexed_client.version
+                )
+                await self.global_state.push_rollout_result.remote(result)  # type: ignore[attr-defined]
+            except Exception as e:
+                logger.exception(f"RemoteWorker error: {e}")
+                if task:
+                    # Notify GlobalState to release the task slot
+                    await self.global_state.report_rollout_failure.remote(  # type: ignore[attr-defined]
+                        task.knowledge_id, task.id
+                    )
+                await asyncio.sleep(5)
 
     async def rollout_task_group(
         self,
@@ -159,6 +170,12 @@ class RemoteWorker:
 
             # Parse results correctly using the student's renderer
             msg, success = self.renderer.parse_response(tokens)
+
+            # Log trajectory for observability
+            if success:
+                from adapter_agent.hierarchical.agent.rewirer import log_trajectory
+
+                log_trajectory(messages + [msg])
 
             if not success:
                 coros.append(self._to_async_parse_failed(task.instruction, trajectory))
@@ -281,6 +298,7 @@ class Internalizer:
     max_iterations: int = 100
     rl_step_count: int = field(init=False, default=0)
     generator_concurrency: int = 16
+    status_log_frequency: int = 5
 
     @classmethod
     async def start(
@@ -305,6 +323,7 @@ class Internalizer:
         num_workers: int = 4,
         max_iterations: int = 50,
         generator_concurrency: int = 16,
+        status_log_frequency: int = 5,
     ) -> Self:
         """
         Initialize Ray actors and return a started Internalizer.
@@ -411,6 +430,7 @@ class Internalizer:
             min_rl_batch_size=min_rl_batch_size,
             max_iterations=max_iterations,
             generator_concurrency=generator_concurrency,
+            status_log_frequency=status_log_frequency,
         )
 
     async def run(self) -> None:
@@ -429,7 +449,11 @@ class Internalizer:
         Main reactive loop for the internalization process.
         Prioritize RL updates for off-policy data, then SFT updates.
         """
+        iteration_count = 0
         while self.rl_step_count < self.max_iterations:
+            if iteration_count % self.status_log_frequency == 0:
+                await self.global_state.report_detailed_status.remote()  # type: ignore[attr-defined]
+
             logger.debug(
                 f"--- Monitoring (RL Steps: {self.rl_step_count}/{self.max_iterations}) ---"
             )
@@ -440,6 +464,7 @@ class Internalizer:
             ) = await self.global_state.pop_rl_batch.remote(self.min_rl_batch_size)  # type: ignore[assignment]
             if rollout_results:
                 await self.rl_step(rollout_results)
+                iteration_count += 1
                 continue
 
             # 2. SFT Update (Secondary): Use pop_sft_batch to ensure efficiency
@@ -448,10 +473,12 @@ class Internalizer:
             ) = await self.global_state.pop_sft_batch.remote(self.min_sft_batch_size)  # type: ignore[assignment]
             if sft_dataset:
                 await self.sft_step(sft_dataset)
+                iteration_count += 1
                 continue
 
             # 3. Idle Phase: Wait if no action was taken
             await asyncio.sleep(5)
+            iteration_count += 1
 
         logger.info("Internalization process complete.")
 
