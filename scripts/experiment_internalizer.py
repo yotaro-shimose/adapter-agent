@@ -33,9 +33,9 @@ async def main():
     logger.info("Initializing Ray...")
     ray.init(
         configure_logging=True,
-        logging_config=ray.LoggingConfig(
-            log_level="INFO", additional_log_standard_attrs=["name"]
-        ),
+        # logging_config=ray.LoggingConfig(
+        #     log_level="INFO", additional_log_standard_attrs=["name"]
+        # ),
         runtime_env={"env_vars": {"RAY_DEBUG": "1"}},
     )
 
@@ -58,7 +58,7 @@ async def main():
     logger.info(f"Fetching knowledge from DB (Exp ID: {source_experiment_id})...")
     db = KnowledgeDB.for_experiment(source_experiment_id)
     async with db:
-        knowledges = await db.list_knowledge(limit=10)
+        knowledges = await db.list_knowledge(limit=12)
 
     if not knowledges:
         logger.error("No knowledge items found in the database. Aborting.")
@@ -83,20 +83,21 @@ async def main():
         model_name=model_name,
         runtime_settings=runtime_settings,
         sft_batch_size=64,
-        sft_adam_params=tinker.AdamParams(learning_rate=1e-3),
-        rl_adam_params=tinker.AdamParams(learning_rate=3e-4),
+        sft_adam_params=tinker.AdamParams(learning_rate=1e-4),
+        rl_adam_params=tinker.AdamParams(learning_rate=1e-4),
         rl_loss_fn="ppo",
         min_sft_batch_size=64,
-        min_rl_batch_size=8,
+        min_rl_batch_size=32,
         k_rollout=8,
-        studying_threshold=0.2,
+        studying_threshold=0.5,
         success_threshold=0.5,
         overgen_factor=1.5,
         k_sft=8,
         k_rl=4,
-        num_workers=4,
+        num_workers=10,
         max_iterations=50,
         generator_concurrency=64,
+        task_per_worker=4,
     )
 
     # 8. Run the Internalization Experiment

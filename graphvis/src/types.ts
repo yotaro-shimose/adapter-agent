@@ -84,3 +84,23 @@ export interface GraphExportData {
   nodes: GraphExportNode[];
   edges: GraphExportEdge[];
 }
+
+export interface SimpleKnowledgeAggr {
+  knowledge_id: string;
+  knowledge_title: string;
+  total_rollouts: number;
+  total_success: number;
+  steps: number[];
+}
+
+export interface SimpleTrajectory {
+  id: number;
+  step: number;
+  question: string;
+  reasoning: string;
+  answer: string;
+  success: boolean;
+  execution_output: string | null;
+  verification_output: string | null;
+  created_at: string | null;
+}

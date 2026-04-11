@@ -70,3 +70,35 @@ model Citation {
   @@map("citations")
 }
 
+model SimpleTrainRun {
+  id              String   @id // simple_train_id
+  created_at      DateTime @default(now())
+  trajectories    SimpleTrajectory[]
+
+  @@map("simple_train_runs")
+}
+
+model SimpleTrajectory {
+  id              Int      @id @default(autoincrement())
+  simple_train_id String
+  simple_train    SimpleTrainRun @relation(fields: [simple_train_id], references: [id], onDelete: Cascade)
+  
+  knowledge_id    String
+  knowledge_title String
+  
+  step            Int
+  question        String
+  reasoning       String
+  answer          String
+  success         Boolean
+  
+  execution_output    String?
+  verification_output String?
+  
+  created_at      DateTime @default(now())
+  
+  @@map("simple_trajectories")
+  @@index([simple_train_id])
+  @@index([knowledge_id])
+}
+

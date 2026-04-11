@@ -3,15 +3,15 @@ from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from adapter_agent.rl.postgres_db import get_db
+from adapter_agent.rl.postgres_db import PostgresDB
+
+_db_manager = PostgresDB()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Initialize DB (Prisma Client)
-    db = await get_db()
+    await _db_manager.connect()
     yield
-    # No explicit disconnect needed here if handled by PostgresDB singleton
-    await db.close()
+    await _db_manager.close()
 
 app = FastAPI(title="AdapterAgent Visualization API (Prisma)", lifespan=lifespan)
 
@@ -31,8 +31,7 @@ async def health():
 @app.get("/api/experiments")
 async def list_experiments():
     try:
-        db = await get_db()
-        client = await db.get_client()
+        client = await _db_manager.get_client()
         experiments = await client.experiment.find_many(
             order={"created_at": "desc"}
         )
@@ -42,8 +41,7 @@ async def list_experiments():
 
 @app.get("/api/{experiment_name}/graph")
 async def get_graph(experiment_name: str):
-    db = await get_db()
-    client = await db.get_client()
+    client = await _db_manager.get_client()
     experiment = await client.experiment.find_unique(
         where={"experiment_name": experiment_name}
     )
@@ -102,8 +100,7 @@ async def get_graph(experiment_name: str):
 
 @app.get("/api/{experiment_name}/trajectory/{task_id}")
 async def get_trajectory(experiment_name: str, task_id: str):
-    db = await get_db()
-    client = await db.get_client()
+    client = await _db_manager.get_client()
     
     # Fetch experiment ID first
     exp = await client.experiment.find_unique(where={"experiment_name": experiment_name})
@@ -141,6 +138,79 @@ async def get_trajectory(experiment_name: str, task_id: str):
             "created_at": t.created_at.isoformat() if t.created_at else None
         }
         for t in trajectories
+    ]
+
+
+@app.get("/api/simple_trains")
+async def list_simple_trains():
+    try:
+        client = await _db_manager.get_client()
+        runs = await client.simpletrainrun.find_many(
+            order={"created_at": "desc"}
+        )
+        return [r.id for r in runs]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+@app.get("/api/simple_train/{simple_train_id}/knowledge")
+async def get_simple_train_knowledge(simple_train_id: str):
+    client = await _db_manager.get_client()
+    
+    # Check if run exists
+    run = await client.simpletrainrun.find_unique(where={"id": simple_train_id})
+    if not run:
+        raise HTTPException(status_code=404, detail="SimpleTrainRun not found")
+        
+    trajectories = await client.simpletrajectory.find_many(
+        where={"simple_train_id": simple_train_id}
+    )
+    
+    # Aggregate by knowledge_id
+    knowledge_map = {}
+    for t in trajectories:
+        if t.knowledge_id not in knowledge_map:
+            knowledge_map[t.knowledge_id] = {
+                "knowledge_id": t.knowledge_id,
+                "knowledge_title": t.knowledge_title,
+                "total_rollouts": 0,
+                "total_success": 0,
+                "steps": set()
+            }
+        km = knowledge_map[t.knowledge_id]
+        km["total_rollouts"] += 1
+        if t.success:
+            km["total_success"] += 1
+        km["steps"].add(t.step)
+        
+    for k in knowledge_map.values():
+        k["steps"] = sorted(list(k["steps"]))
+        
+    return list(knowledge_map.values())
+
+@app.get("/api/simple_train/{simple_train_id}/knowledge/{knowledge_id}/rollouts")
+async def get_simple_train_rollouts(simple_train_id: str, knowledge_id: str):
+    client = await _db_manager.get_client()
+    
+    trajectories = await client.simpletrajectory.find_many(
+        where={
+            "simple_train_id": simple_train_id,
+            "knowledge_id": knowledge_id
+        },
+        order=[{"step": "asc"}, {"created_at": "asc"}]
+    )
+    
+    return [
+        {
+            "id": t.id,
+            "step": t.step,
+            "question": t.question,
+            "reasoning": t.reasoning,
+            "answer": t.answer,
+            "success": t.success,
+            "execution_output": t.execution_output,
+            "verification_output": t.verification_output,
+            "created_at": t.created_at.isoformat() if t.created_at else None
+        } for t in trajectories
     ]
 
 if __name__ == "__main__":
