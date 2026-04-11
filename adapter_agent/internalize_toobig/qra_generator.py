@@ -2,6 +2,7 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 
+from coder_mcp.runtime import Runtime
 from ray.actor import ActorProxy
 
 from adapter_agent.data import QRA
@@ -9,12 +10,11 @@ from adapter_agent.hierarchical.agent.generator import GeneratorAgent
 from adapter_agent.hierarchical.agent.verifier import VerificationResult, Verifier
 from adapter_agent.hierarchical.gh import Library
 from adapter_agent.hierarchical.types import Knowledge
-from adapter_agent.internalize.global_state import GlobalState
+from adapter_agent.internalize_toobig.global_state import GlobalState
 from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
 from adapter_agent.model_helper import get_gemini
-from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.rl.env.runtime_pool import RuntimePool
-from coder_mcp.runtime import Runtime
+from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.util.logger_util import setup_base_loglevel
 from adapter_agent.util.parsing import extract_rust_code
 
@@ -108,7 +108,7 @@ class QRAGenerator:
         """Run Rust code and verify for newly generated tasks."""
         assert self.verifier is not None
         assert self.runtime_pool is not None
-        
+
         async def _run(runtime: Runtime) -> VerificationResult:
             code = extract_rust_code(rollout.answer)
             await runtime.set_content("src/main.rs", code)

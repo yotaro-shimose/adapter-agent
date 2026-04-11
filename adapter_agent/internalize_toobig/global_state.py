@@ -11,7 +11,7 @@ from tinker_cookbook.utils.ml_log import Logger as MLLogger
 from adapter_agent.data import QRA
 from adapter_agent.hierarchical.state import RLGroup
 from adapter_agent.hierarchical.types import Knowledge
-from adapter_agent.internalize.types import (
+from adapter_agent.internalize_toobig.types import (
     GroupRolloutResult,
     InternalizationQRA,
     InternalizationTask,

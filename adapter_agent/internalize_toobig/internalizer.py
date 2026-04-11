@@ -7,6 +7,7 @@ from typing import Optional, Self
 import ray
 import tinker
 from agents.extensions.models.litellm_model import LitellmModel
+from coder_mcp.runtime import Runtime
 from more_itertools import chunked
 from oai_utils.tinker import setup_tinkermodel
 from oai_utils.tinker.model_helper import get_tokenizer_renderer
@@ -25,19 +26,18 @@ from tinker_cookbook.rl.types import TokensWithLogprobs, Transition
 from tinker_cookbook.supervised.data import conversation_to_datum
 
 from adapter_agent.data import QRA
-from adapter_agent.hierarchical.agent.rewirer import log_trajectory
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.gh import Library
 from adapter_agent.hierarchical.grpo import compute_grpo_loss
 from adapter_agent.hierarchical.state import RLGroup
 from adapter_agent.hierarchical.types import Knowledge
-from adapter_agent.internalize.global_state import (
+from adapter_agent.internalize_toobig.global_state import (
     GlobalState,
     InternalizationKnowledge,
     KnowledgeMasteryManager,
 )
-from adapter_agent.internalize.qra_generator import QRAGenerator
-from adapter_agent.internalize.types import (
+from adapter_agent.internalize_toobig.qra_generator import QRAGenerator
+from adapter_agent.internalize_toobig.types import (
     GroupRolloutResult,
     InternalizationQRA,
     InternalizationTask,
@@ -50,9 +50,8 @@ from adapter_agent.rl.config import (
     ModelLoadingSettings,
     OptimizerParams,
 )
-from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.rl.env.runtime_pool import RuntimePool
-from coder_mcp.runtime import Runtime
+from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.rl.shared_sampling_client import (
     IndexedSamplingClient,
     SharedSamplingClient,
@@ -70,6 +69,7 @@ class RemoteWorker:
     model_name: str
     runtime_settings: RuntimeSettings
     k_rollout: int
+    task_per_worker: int
 
     # Non-picklable internal state (initialized in setup)
     verifier_model: Optional[LitellmModel] = field(init=False, default=None)
@@ -97,17 +97,27 @@ class RemoteWorker:
         # Using setup_tinkermodel as it handles tokenizer/renderer setup canonically.
         _, _, renderer = setup_tinkermodel(self.model_name)
         self.renderer = renderer
-        
-        self.runtime_pool = RuntimePool(self.runtime_settings, max_size=self.k_rollout)
+
+        self.runtime_pool = RuntimePool(
+            self.runtime_settings, max_size=self.task_per_worker * self.k_rollout
+        )
 
     def __repr__(self) -> str:
         return f"RemoteWorker(model={self.model_name})"
 
     async def run_loop(self) -> None:
         """
-        Main loop for the worker: constantly pull tasks from GlobalState and perform rollouts.
+        Main loop for the worker: starts multiple concurrent task loops.
         """
         await self.setup()
+        loops = [self._single_run_loop(i) for i in range(self.task_per_worker)]
+        await asyncio.gather(*loops)
+
+    async def _single_run_loop(self, loop_id: int) -> None:
+        """
+        Single task loop: pull tasks from GlobalState and perform rollouts.
+        """
+        logger.info(f"Starting RemoteWorker task loop {loop_id} (actor={self})")
         while True:
             task: InternalizationTask | None = None
             try:
@@ -128,7 +138,7 @@ class RemoteWorker:
                 )
                 await self.global_state.push_rollout_result.remote(result)  # type: ignore[attr-defined]
             except Exception as e:
-                logger.exception(f"RemoteWorker error: {e}")
+                logger.exception(f"RemoteWorker error in loop {loop_id}: {e}")
                 if task:
                     # Notify GlobalState to release the task slot
                     await self.global_state.report_rollout_failure.remote(  # type: ignore[attr-defined]
@@ -177,10 +187,6 @@ class RemoteWorker:
             # Parse results correctly using the student's renderer
             msg, success = self.renderer.parse_response(tokens)
 
-            # Log trajectory for observability
-            if success:
-                log_trajectory(messages + [msg])
-
             if not success:
                 coros.append(self._to_async_parse_failed(task.instruction, trajectory))
             else:
@@ -206,7 +212,7 @@ class RemoteWorker:
         """Run Rust code and verify."""
         assert self.verifier is not None
         assert self.runtime_pool is not None
-        
+
         async def _run(runtime: Runtime) -> SingleRolloutResult:
             code = extract_rust_code(rollout.answer)
             await runtime.set_content("src/main.rs", code)
@@ -304,6 +310,7 @@ class Internalizer:
     rl_loss_fn: LossFnType
     min_sft_batch_size: int
     min_rl_batch_size: int
+    task_per_worker: int = 4
 
     max_iterations: int = 100
     rl_step_count: int = field(init=False, default=0)
@@ -325,6 +332,7 @@ class Internalizer:
         min_sft_batch_size: int,
         min_rl_batch_size: int,
         k_rollout: int = 8,
+        task_per_worker: int = 4,
         studying_threshold: float = 0.2,
         success_threshold: float = 0.5,
         overgen_factor: float = 1.5,
@@ -392,6 +400,7 @@ class Internalizer:
                 model_name=model_name,
                 runtime_settings=runtime_settings,
                 k_rollout=k_rollout,
+                task_per_worker=task_per_worker,
             )
             for _ in range(num_workers)
         ]
@@ -411,6 +420,7 @@ class Internalizer:
                 "overgen_factor": overgen_factor,
                 "k_sft": k_sft,
                 "k_rl": k_rl,
+                "task_per_worker": task_per_worker,
             },
         )
 
@@ -441,6 +451,7 @@ class Internalizer:
             max_iterations=max_iterations,
             generator_concurrency=generator_concurrency,
             status_log_frequency=status_log_frequency,
+            task_per_worker=task_per_worker,
         )
 
     async def run(self) -> None:
