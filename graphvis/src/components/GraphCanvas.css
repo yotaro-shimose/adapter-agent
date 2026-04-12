@@ -1,5 +1,5 @@
 .control-panel {
-  position: fixed;
+  position: absolute;
   top: 20px;
   left: 20px;
   z-index: 2000;
@@ -43,8 +43,8 @@
 }
 
 .detail-panel {
-  position: fixed;
-  top: 80px;
+  position: absolute;
+  top: 20px;
   right: 25px;
   width: 500px;
   max-height: calc(100vh - 120px);
