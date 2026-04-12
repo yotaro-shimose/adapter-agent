@@ -6,10 +6,11 @@ from pathlib import Path
 import tinker
 from dotenv import load_dotenv
 
-from adapter_agent.internalize.simple_pipeline import PipelineConfig, SimplePipeline
 from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
 from adapter_agent.library.knowledge_db import KnowledgeDB
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
+from adapter_agent.rl.config import ModelLoadingSettings
+from adapter_agent.simple_internalizer import PipelineConfig, SimplePipeline
 
 logging.basicConfig(
     level=logging.INFO,
@@ -72,11 +73,20 @@ async def main():
     # 4. Pipeline Configuration
     simple_train_id = f"simple_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     config = PipelineConfig(
+        runtime_pool_size=100,
+        rl_worker_count=48,
+        eval_concurrency=48,
+        generation_concurrency=400,
         simple_train_id=simple_train_id,
         knowledge_list=knowledge_list,
-        model_name="Qwen/Qwen3-8B",
         library_name="numrs2",
         runtime_settings=runtime_settings,
+        model_loading_settings=ModelLoadingSettings(
+            model_name="Qwen/Qwen3-8B",
+            resume_trainer_path=None,
+            resume_sampler_path=None,
+            lora_rank=32,
+        ),
         k_sft=32,
         k_eval=1,
         k_rl=4,
@@ -85,11 +95,13 @@ async def main():
         init_sft_steps=20,
         sft_batch_size=128,
         max_iterations=50,
-        concurrency=400,
         adam_params=tinker.AdamParams(learning_rate=1e-3),
-        rl_adam_params=tinker.AdamParams(learning_rate=1e-5),
+        rl_adam_params=tinker.AdamParams(learning_rate=1e-3),
         rl_loss_fn="ppo",
         extra_eval_suites=EVAL_TREE_TASKS,
+        stop_grpo=False,
+        kl_penalty_coef=0.0,
+        kl_discount_factor=0.0,
     )
 
     pipeline = await SimplePipeline.create(config=config, rust_doc_analyzer=analyzer)

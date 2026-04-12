@@ -11,29 +11,28 @@ from more_itertools import chunked
 from oai_utils.async_utils import gather_with_semaphore
 from oai_utils.tinker import TinkerModel, setup_tinkermodel
 from oai_utils.tinker.model_helper import get_tokenizer_renderer
+from prisma import Prisma
+from tinker.types.loss_fn_type import LossFnType
 from tinker_cookbook.renderers import Message, TextPart, ThinkingPart, TrainOnWhat
+from tinker_cookbook.rl import Trajectory
+from tinker_cookbook.rl.types import TokensWithLogprobs, Transition
 from tinker_cookbook.supervised.data import conversation_to_datum
 from tinker_cookbook.utils import ml_log
 from tinker_cookbook.utils.ml_log import Logger as MLLogger
-from tinker.types.loss_fn_type import LossFnType
 
 from adapter_agent.data import QRA
 from adapter_agent.hierarchical.agent.generator import GeneratorAgent
 from adapter_agent.hierarchical.agent.verifier import Verifier
+from adapter_agent.hierarchical.grpo import compute_grpo_loss
+from adapter_agent.hierarchical.state import RLGroup
 from adapter_agent.hierarchical.types import Knowledge
 from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
 from adapter_agent.model_helper import get_gemini
+from adapter_agent.rl.config import OptimizerParams
 from adapter_agent.rl.env.runtime_pool import RuntimePool
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
-from adapter_agent.util.parsing import extract_rust_code
 from adapter_agent.rl.postgres_db import PostgresDB
-from prisma import Prisma
-
-from adapter_agent.hierarchical.grpo import compute_grpo_loss
-from adapter_agent.hierarchical.state import RLGroup
-from adapter_agent.rl.config import OptimizerParams
-from tinker_cookbook.rl import Trajectory
-from tinker_cookbook.rl.types import TokensWithLogprobs, Transition
+from adapter_agent.util.parsing import extract_rust_code
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +42,37 @@ logging.getLogger("coder_mcp.runtime.runtime").setLevel(logging.WARNING)
 
 
 @dataclass
+class RuntimeExecutionResult:
+    execution_output: str
+    tree_output: str
+    exit_success: bool
+
+
+@dataclass
+class VerificationOutcome:
+    success: bool
+    execution_output: str
+    verification_output: str
+
+
+@dataclass
+class EvalResult:
+    success_count: int
+    total_count: int
+
+
+@dataclass
+class PreparedTasks:
+    sft_qras: list[QRA]
+    eval_tasks: list[tuple[Knowledge, QRA]]
+
+
+@dataclass
 class PipelineConfig:
+    runtime_pool_size: int
+    rl_worker_count: int
+    eval_concurrency: int
+    generation_concurrency: int
     simple_train_id: str
     knowledge_list: list[Knowledge]
     model_name: str
@@ -61,7 +90,6 @@ class PipelineConfig:
     )
     max_iterations: int = 50
     cache_dir: Path = Path(".cache/simple_internalizer")
-    concurrency: int = 32
     k_rl: int = 4
     rl_rollout: int = 8
     rl_adam_params: tinker.AdamParams = field(
@@ -71,6 +99,7 @@ class PipelineConfig:
     rl_batch_size: int = 48
     rl_worker_stagger_s: float = 2.0
     extra_eval_suites: dict[str, list[str]] = field(default_factory=dict)
+    stop_grpo: bool = False
 
 
 class SimplePipeline:
@@ -91,7 +120,7 @@ class SimplePipeline:
         self.cache_dir = config.cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.runtime_pool = RuntimePool(
-            config.runtime_settings, max_size=config.concurrency
+            config.runtime_settings, max_size=config.runtime_pool_size
         )
 
         self.service_client = service_client
@@ -143,10 +172,7 @@ class SimplePipeline:
         client = await db_manager.get_client()
         await client.simpletrainrun.upsert(
             where={"id": config.simple_train_id},
-            data={
-                "create": {"id": config.simple_train_id},
-                "update": {}
-            }
+            data={"create": {"id": config.simple_train_id}, "update": {}},
         )
 
         return cls(
@@ -174,7 +200,7 @@ class SimplePipeline:
 
         logger.info(f"Generating {count} {prefix} QRAs for '{knowledge.title}'...")
         qras: list[QRA] = []
-        sem = asyncio.Semaphore(self.config.concurrency)
+        sem = asyncio.Semaphore(self.config.generation_concurrency)
 
         async def _gen() -> QRA:
             async with sem:
@@ -182,7 +208,7 @@ class SimplePipeline:
                     qra = await self.generator.generate_sft(knowledge)
                     if qra:
                         return qra
-                    await asyncio.sleep(0.1) # Avoid tight loop if generator fails
+                    await asyncio.sleep(0.1)  # Avoid tight loop if generator fails
 
         results = await asyncio.gather(*[_gen() for _ in range(count)])
         qras.extend(results)
@@ -193,59 +219,104 @@ class SimplePipeline:
         return qras
 
     async def run(self) -> None:
-        sft_qras, eval_tasks = await self._prepare_knowledge_tasks()
-        sft_batch_iter = self._create_sft_batch_iterator(sft_qras)
+        prepared = await self._prepare_knowledge_tasks()
+        sft_batch_iter = self._create_sft_batch_iterator(prepared.sft_qras)
 
         logger.info(f"Running initial {self.config.init_sft_steps} steps of SFT...")
         await self._run_sft_steps(sft_batch_iter, self.config.init_sft_steps)
 
-        # Transition to RL: Start workers
+        spawner_task = None
+        worker_tasks = []
+
+        if not self.config.stop_grpo:
+            # Transition to RL: Start workers
+            spawner_task, worker_tasks = await self._start_rl_workers()
+
+        try:
+            for iteration in range(self.config.max_iterations):
+                logger.info(
+                    f"--- Iteration {iteration + 1} (RL{' STOPPED' if self.config.stop_grpo else ''}) ---"
+                )
+
+                # Evaluation (synchronous with start of iteration)
+                await asyncio.gather(
+                    self._run_evaluation(prepared.eval_tasks),
+                    self._run_extra_evaluations(),
+                )
+
+                if self.config.stop_grpo:
+                    continue
+
+                # Batch Collection: Wait for at least one batch
+                batch_groups = await self._collect_rl_batch(self.config.rl_batch_size)
+
+                logger.info("Running RL (GRPO) update on collected batch...")
+                await self._run_grpo_update(batch_groups)
+
+                # Backlog processing: consume all remaining full batches
+                while self.rl_results_queue.qsize() >= self.config.rl_batch_size:
+                    qsize = self.rl_results_queue.qsize()
+                    logger.info(
+                        f"Backlog detected: {qsize} samples in queue. "
+                        f"Draining another batch of {self.config.rl_batch_size}..."
+                    )
+                    batch_groups = []
+                    for _ in range(self.config.rl_batch_size):
+                        batch_groups.append(self.rl_results_queue.get_nowait())
+
+                    await self._run_grpo_update(batch_groups)
+
+        finally:
+            if spawner_task:
+                spawner_task.cancel()
+            for t in worker_tasks:
+                t.cancel()
+
+            tasks_to_wait = []
+            if spawner_task:
+                tasks_to_wait.append(spawner_task)
+            tasks_to_wait.extend(worker_tasks)
+
+            if tasks_to_wait:
+                await asyncio.gather(*tasks_to_wait, return_exceptions=True)
+
+    async def _start_rl_workers(self) -> tuple[asyncio.Task, list[asyncio.Task]]:
+        """Prepares RL tasks and starts background workers with staggering."""
         rl_tasks = await self._prepare_rl_tasks()
         for k, qra in rl_tasks:
             await self.rl_tasks_queue.put((k, qra))
-        
-        num_workers = max(1, self.config.concurrency // self.config.rl_rollout)
-        logger.info(f"Starting {num_workers} RL background workers with {self.config.rl_worker_stagger_s}s stagger...")
+
+        num_workers = self.config.rl_worker_count
+        logger.info(
+            f"Starting {num_workers} RL background workers with {self.config.rl_worker_stagger_s}s stagger..."
+        )
         worker_tasks: list[asyncio.Task] = []
-        
+
         async def _staggered_spawner():
             for i in range(num_workers):
                 worker_tasks.append(asyncio.create_task(self._rl_worker()))
                 if i < num_workers - 1:
                     await asyncio.sleep(self.config.rl_worker_stagger_s)
-                    
+
         spawner_task = asyncio.create_task(_staggered_spawner())
+        return spawner_task, worker_tasks
 
-        try:
-            for iteration in range(self.config.max_iterations):
-                logger.info(f"--- Iteration {iteration + 1} (RL) ---")
-                
-                # Evaluation (synchronous with start of iteration)
-                await asyncio.gather(
-                    self._run_evaluation(eval_tasks),
-                    self._run_extra_evaluations()
+    async def _collect_rl_batch(self, batch_size: int) -> list[RLGroup]:
+        """Collects a specified number of RL groups from the results queue."""
+        logger.info(f"Waiting for a batch of {batch_size} RL groups...")
+        batch_groups = []
+        while len(batch_groups) < batch_size:
+            try:
+                group = await asyncio.wait_for(
+                    self.rl_results_queue.get(), timeout=10.0
                 )
-
-                # Batch Collection: Wait for rl_batch_size results from the results queue
-                logger.info(f"Waiting for a batch of {self.config.rl_batch_size} RL groups...")
-                batch_groups = []
-                while len(batch_groups) < self.config.rl_batch_size:
-                    try:
-                        group = await asyncio.wait_for(self.rl_results_queue.get(), timeout=10.0)
-                        batch_groups.append(group)
-                    except asyncio.TimeoutError:
-                        self.ml_logger.log_metrics(
-                            {"status/collected_rl_groups": len(batch_groups)},
-                            step=self.current_step
-                        )
-                
-                logger.info("Running RL (GRPO) update on collected batch...")
-                await self._run_grpo_update(batch_groups)
-        finally:
-            spawner_task.cancel()
-            for t in worker_tasks:
-                t.cancel()
-            await asyncio.gather(spawner_task, *worker_tasks, return_exceptions=True)
+                batch_groups.append(group)
+            except asyncio.TimeoutError:
+                self.ml_logger.log_metrics(
+                    {"status/collected_rl_groups": len(batch_groups)},
+                    step=self.current_step,
+                )
+        return batch_groups
 
     async def _rl_worker(self) -> None:
         """Background worker that continuously performs rollouts."""
@@ -256,7 +327,7 @@ class SimplePipeline:
                 group = await self._collect_rl_group(system_prompt, qra, k)
                 if group:
                     await self.rl_results_queue.put(group)
-                
+
                 # Always put task back for revolving queue
                 self.rl_tasks_queue.task_done()
                 await self.rl_tasks_queue.put((k, qra))
@@ -275,32 +346,42 @@ class SimplePipeline:
             kl_penalty_coef=0.0,
             kl_discount_factor=0.0,
         )
-        
-        res = await compute_grpo_loss(valid_groups, self.training_client, optimizer_params)
-        
+
+        res = await compute_grpo_loss(
+            valid_groups, self.training_client, optimizer_params
+        )
+
         if res:
-            opt_future = await self.training_client.optim_step_async(self.config.rl_adam_params)
+            opt_future = await self.training_client.optim_step_async(
+                self.config.rl_adam_params
+            )
             await opt_future.result_async()
-            
+
             metrics = {f"rl/{k}": v for k, v in res.metrics.items()}
             metrics["rl/valid_groups"] = len(valid_groups)
             self.ml_logger.log_metrics(metrics, step=self.current_step)
             self.current_step += 1
-            
+
             logger.info("Synchronizing sampling weights...")
-            new_client = await self.training_client.save_weights_and_get_sampling_client_async()
+            new_client = (
+                await self.training_client.save_weights_and_get_sampling_client_async()
+            )
             self.solver_model.sampling_client = new_client
 
-    async def _prepare_knowledge_tasks(self) -> tuple[list[QRA], list[tuple[Knowledge, QRA]]]:
-        logger.info(f"Preparing tasks for {len(self.config.knowledge_list)} knowledge items...")
-        
+    async def _prepare_knowledge_tasks(self) -> PreparedTasks:
+        logger.info(
+            f"Preparing tasks for {len(self.config.knowledge_list)} knowledge items..."
+        )
+
         async def _prep_single(k: Knowledge):
             s_qras = await self._generate_and_cache(k, self.config.k_sft, "sft")
             e_qras = await self._generate_and_cache(k, self.config.k_eval, "eval")
             return s_qras, (k, e_qras[0])
 
-        results = await asyncio.gather(*[_prep_single(k) for k in self.config.knowledge_list])
-        
+        results = await asyncio.gather(
+            *[_prep_single(k) for k in self.config.knowledge_list]
+        )
+
         sft_qras = []
         eval_qras = []
         for s, e in results:
@@ -310,21 +391,24 @@ class SimplePipeline:
         logger.info(
             f"Loaded {len(sft_qras)} SFT tasks and {len(eval_qras)} EVAL tasks."
         )
-        return sft_qras, eval_qras
+        return PreparedTasks(sft_qras=sft_qras, eval_tasks=eval_qras)
 
     async def _prepare_rl_tasks(self) -> list[tuple[Knowledge, QRA]]:
-        logger.info(f"Preparing RL tasks for {len(self.config.knowledge_list)} knowledge items...")
-        
+        logger.info(
+            f"Preparing RL tasks for {len(self.config.knowledge_list)} knowledge items..."
+        )
+
         async def _prep_single(k: Knowledge):
             tasks = await self._generate_and_cache(k, self.config.k_rl, "rl")
             return [(k, t) for t in tasks]
 
-        results = await asyncio.gather(*[_prep_single(k) for k in self.config.knowledge_list])
+        results = await asyncio.gather(
+            *[_prep_single(k) for k in self.config.knowledge_list]
+        )
         rl_tasks = list(itertools.chain.from_iterable(results))
-        
+
         logger.info(f"Prepared {len(rl_tasks)} RL tasks.")
         return rl_tasks
-
 
     async def _collect_rl_group(
         self, system_prompt: str, qra: QRA, knowledge: Knowledge
@@ -346,9 +430,11 @@ class SimplePipeline:
             tokens = seq.tokens
             logprobs = seq.logprobs
             ac = TokensWithLogprobs(tokens=tokens, maybe_logprobs=logprobs)
-            transition = Transition(ob=model_input, ac=ac, reward=0.0, episode_done=True)
+            transition = Transition(
+                ob=model_input, ac=ac, reward=0.0, episode_done=True
+            )
             trajectory = Trajectory(transitions=[transition], final_ob=model_input)
-            
+
             msg, ok = self.solver_model.renderer.parse_response(tokens)
             content = msg.get("content") if ok else None
             is_success = False
@@ -367,17 +453,14 @@ class SimplePipeline:
                 else:
                     answer_text = str(content)
 
-                code = extract_rust_code(answer_text)
-                if code:
-                    try:
-                        async def _run_closure(runtime: Runtime) -> tuple[bool, str, str]:
-                            return await self._verify_rust_code_in_runtime(
-                                runtime, code, qra, reasoning, answer_text
-                            )
-                        is_success, exec_out_str, verif_out_str = await self.runtime_pool.execute_with_retry(_run_closure)
-                    except Exception as e:
-                        logger.error(f"RL verification failed: {e}")
-                        verif_out_str = str(e)
+                outcome = await self._run_execution_and_verification(
+                    qra.question, reasoning, answer_text
+                )
+                is_success, exec_out_str, verif_out_str = (
+                    outcome.success,
+                    outcome.execution_output,
+                    outcome.verification_output,
+                )
             else:
                 verif_out_str = "Parse failed."
 
@@ -403,14 +486,16 @@ class SimplePipeline:
             return trajectory, (1.0 if is_success else 0.0)
 
         # Parallelize the 8 rollouts' verification
-        rollout_results = await asyncio.gather(*[_verify_single_rollout(seq) for seq in sample_results.sequences])
-        
+        rollout_results = await asyncio.gather(
+            *[_verify_single_rollout(seq) for seq in sample_results.sequences]
+        )
+
         trajectories = [r[0] for r in rollout_results]
         rewards = [r[1] for r in rollout_results]
 
         if all(r == rewards[0] for r in rewards):
             return None
-            
+
         return RLGroup(trajectories=trajectories, rewards=rewards)
 
     def _create_sft_batch_iterator(self, sft_qras: list[QRA]):
@@ -479,7 +564,9 @@ class SimplePipeline:
             opt_future = next_opt
 
         logger.info("Synchronizing sampling client with newly trained weights...")
-        new_client = await self.training_client.save_weights_and_get_sampling_client_async()
+        new_client = (
+            await self.training_client.save_weights_and_get_sampling_client_async()
+        )
         self.solver_model.sampling_client = new_client
 
     def _get_solver_system_prompt(self, library_name: str) -> str:
@@ -501,15 +588,15 @@ Your task is to solve the programming challenge using the `{library_name}` libra
         system_prompt = self._get_solver_system_prompt(self.config.library_name)
 
         results = await gather_with_semaphore(
-            [self._evaluate_single_task(system_prompt, qra, k.id, k.title) for k, qra in eval_data],
-            max_concurrent=self.config.concurrency,
+            [
+                self._evaluate_single_task(system_prompt, qra, k.id, k.title)
+                for k, qra in eval_data
+            ],
+            max_concurrent=self.config.eval_concurrency,
         )
 
-        total_success = 0
-        total_rollouts = 0
-        for s, t in results:
-            total_success += s
-            total_rollouts += t
+        total_success = sum(r.success_count for r in results)
+        total_rollouts = sum(r.total_count for r in results)
 
         success_ratio = total_success / total_rollouts if total_rollouts > 0 else 0.0
         self.ml_logger.log_metrics(
@@ -524,32 +611,41 @@ Your task is to solve the programming challenge using the `{library_name}` libra
     async def _run_extra_evaluations(self) -> None:
         if not self.config.extra_eval_suites:
             return
-            
+
         system_prompt = self._get_solver_system_prompt(self.config.library_name)
-        
+
         all_eval_tasks = []
         for suite_name, instructions in self.config.extra_eval_suites.items():
             for instr in instructions:
                 qra = QRA(question=instr, reasoning="", answer="")
                 all_eval_tasks.append((suite_name, qra))
-                
-        logger.info(f"Running extra evaluation for {len(all_eval_tasks)} total tasks across {len(self.config.extra_eval_suites)} suites concurrently...")
 
-        async def _eval_with_suite(s_name: str, q: QRA) -> tuple[str, int, int]:
-            success, rollouts = await self._evaluate_single_task(
-                system_prompt, q, knowledge_id=s_name, knowledge_title=s_name, rollouts=1
+        logger.info(
+            f"Running extra evaluation for {len(all_eval_tasks)} total tasks across {len(self.config.extra_eval_suites)} suites concurrently..."
+        )
+
+        async def _eval_with_suite(s_name: str, q: QRA) -> tuple[str, EvalResult]:
+            res = await self._evaluate_single_task(
+                system_prompt,
+                q,
+                knowledge_id=s_name,
+                knowledge_title=s_name,
+                rollouts=1,
             )
-            return s_name, success, rollouts
+            return s_name, res
 
         results = await gather_with_semaphore(
             [_eval_with_suite(s_name, q) for s_name, q in all_eval_tasks],
-            max_concurrent=self.config.concurrency,
+            max_concurrent=self.config.eval_concurrency,
         )
 
-        suite_metrics = {s: {"success": 0, "rollouts": 0} for s in self.config.extra_eval_suites.keys()}
-        for s_name, s, t in results:
-            suite_metrics[s_name]["success"] += s
-            suite_metrics[s_name]["rollouts"] += t
+        suite_metrics = {
+            s: {"success": 0, "rollouts": 0}
+            for s in self.config.extra_eval_suites.keys()
+        }
+        for s_name, res in results:
+            suite_metrics[s_name]["success"] += res.success_count
+            suite_metrics[s_name]["rollouts"] += res.total_count
 
         metrics_to_log = {}
         for s_name, stats in suite_metrics.items():
@@ -564,8 +660,13 @@ Your task is to solve the programming challenge using the `{library_name}` libra
             self.ml_logger.log_metrics(metrics_to_log, step=self.current_step)
 
     async def _evaluate_single_task(
-        self, system_prompt: str, qra: QRA, knowledge_id: str, knowledge_title: str, rollouts: int | None = None
-    ) -> tuple[int, int]:
+        self,
+        system_prompt: str,
+        qra: QRA,
+        knowledge_id: str,
+        knowledge_title: str,
+        rollouts: int | None = None,
+    ) -> EvalResult:
         model_input = self.solver_model.renderer.build_generation_prompt(
             [
                 Message(role="system", content=system_prompt),
@@ -599,28 +700,16 @@ Your task is to solve the programming challenge using the `{library_name}` libra
             else:
                 answer_text = str(content)
 
-            code = extract_rust_code(answer_text)
-            if not code:
-                continue
-
-            is_success = False
-            exec_out_str = ""
-            verif_out_str = ""
-            try:
-                # Use a closure inline just to pass variables correctly
-                async def _run_closure(runtime: Runtime) -> tuple[bool, str, str]:
-                    return await self._verify_rust_code_in_runtime(
-                        runtime, code, qra, reasoning, answer_text
-                    )
-
-                is_success, exec_out_str, verif_out_str = await self.runtime_pool.execute_with_retry(_run_closure)
-                if is_success:
-                    success_count += 1
-            except Exception as e:
-                logger.error(f"Execution verification failed: {e}")
-                is_success = False
-                exec_out_str = ""
-                verif_out_str = str(e)
+            outcome = await self._run_execution_and_verification(
+                qra.question, reasoning, answer_text
+            )
+            is_success, exec_out_str, verif_out_str = (
+                outcome.success,
+                outcome.execution_output,
+                outcome.verification_output,
+            )
+            if is_success:
+                success_count += 1
 
             try:
                 await self.prisma_client.simpletrajectory.create(
@@ -640,26 +729,59 @@ Your task is to solve the programming challenge using the `{library_name}` libra
             except Exception as e:
                 logger.error(f"Failed to record trajectory: {e}")
 
-        return success_count, num_samples
+        return EvalResult(success_count=success_count, total_count=num_samples)
 
-    async def _verify_rust_code_in_runtime(
-        self, runtime: Runtime, code: str, qra: QRA, reasoning: str, answer_text: str
-    ) -> tuple[bool, str, str]:
+    async def _run_rust_code_in_runtime(
+        self, runtime: Runtime, code: str
+    ) -> RuntimeExecutionResult:
         await runtime.set_content("src/main.rs", code)
         execution_output, exit_success = await runtime.run_cargo()
-        if not exit_success:
-            return False, execution_output, "Compilation or execution failed."
-            
         tree_output = await runtime.tree()
-        ans = QRA(
-            question=qra.question,
-            reasoning=reasoning,
-            answer=answer_text,
-        )
-        res = await self.verifier.verify(
-            qa=ans,
-            tree_structure=tree_output,
+        return RuntimeExecutionResult(
             execution_output=execution_output,
-            main_rs_content=answer_text,
+            tree_output=tree_output,
+            exit_success=exit_success,
         )
-        return res.success, execution_output, res.reasoning
+
+    async def _run_execution_and_verification(
+        self, question: str, reasoning: str, answer_text: str
+    ) -> VerificationOutcome:
+        code = extract_rust_code(answer_text)
+        if not code:
+            return VerificationOutcome(
+                success=False,
+                execution_output="",
+                verification_output="No Rust code block found.",
+            )
+
+        try:
+
+            async def _run_closure(runtime: Runtime) -> RuntimeExecutionResult:
+                return await self._run_rust_code_in_runtime(runtime, code)
+
+            exec_res = await self.runtime_pool.execute_with_retry(_run_closure)
+
+            if not exec_res.exit_success:
+                return VerificationOutcome(
+                    success=False,
+                    execution_output=exec_res.execution_output,
+                    verification_output="Compilation or execution failed.",
+                )
+
+            ans = QRA(question=question, reasoning=reasoning, answer=answer_text)
+            res = await self.verifier.verify(
+                qa=ans,
+                tree_structure=exec_res.tree_output,
+                execution_output=exec_res.execution_output,
+                main_rs_content=answer_text,
+            )
+            return VerificationOutcome(
+                success=res.success,
+                execution_output=exec_res.execution_output,
+                verification_output=res.reasoning,
+            )
+        except Exception as e:
+            logger.error(f"Execution/verification failed: {e}")
+            return VerificationOutcome(
+                success=False, execution_output="", verification_output=str(e)
+            )

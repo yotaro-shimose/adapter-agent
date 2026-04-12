@@ -79,9 +79,7 @@ def trajectory_to_data(
             loss_fn_inputs={
                 "target_tokens": TensorData.from_torch(torch.tensor(target_tokens_T)),
                 "logprobs": TensorData.from_torch(torch.tensor(sampled_logprobs_T)),
-                "advantages": TensorData.from_torch(
-                    torch.tensor(advantages_T) / 1000.0
-                ),
+                "advantages": TensorData.from_torch(torch.tensor(advantages_T)),
                 "mask": TensorData.from_torch(torch.tensor(mask_T)),
             },
         )

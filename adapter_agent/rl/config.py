@@ -15,7 +15,7 @@ from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 class OptimizerParams(BaseModel):
     adam_params: tinker.AdamParams
     loss_fn: LossFnType
-    advantage_regularizer: AdvantageRegularizer = "output_token"
+    advantage_regularizer: AdvantageRegularizer = "group_std"
     num_steps: int
     kl_penalty_coef: float
     kl_discount_factor: float

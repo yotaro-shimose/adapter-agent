@@ -25,6 +25,7 @@ async def compute_grpo_loss(
     groups: list[RLGroup],
     training_client: tinker.TrainingClient,
     optimizer_params: OptimizerParams,
+    kl_reference_client: tinker.SamplingClient | None = None,
 ):
     """
     Computes GRPO-like loss for a list of RLGroups.
@@ -47,10 +48,12 @@ async def compute_grpo_loss(
 
     # Use native prepare_minibatch_simplified
     # It handles internal advantage calculation and data assembly.
-    # Note: KL penalty is disabled here as requested.
     data_D, _metrics = await prepare_minibatch_simplified(
         trajectory_groups=traj_groups,
         regularization=optimizer_params.advantage_regularizer,
+        kl_reference_client=kl_reference_client,
+        kl_penalty_coef=optimizer_params.kl_penalty_coef,
+        kl_discount_factor=optimizer_params.kl_discount_factor,
     )
 
     if not data_D:
@@ -69,4 +72,9 @@ async def compute_grpo_loss(
         data=clean_data_D, loss_fn=optimizer_params.loss_fn
     )
     result = await fwd_bwd_future.result_async()
+
+    # Merge KL metrics into the result
+    if _metrics:
+        result.metrics.update(_metrics)
+
     return result
