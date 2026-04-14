@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { API_BASE } from '../constants';
-import type { SimpleKnowledgeAggr, SimpleTrajectory } from '../types';
+import type { SimpleKnowledgeAggr, SimpleTrajectory, SimpleSftQna } from '../types';
+
 
 export const SimplePipelineVis: React.FC = () => {
   const [trainIds, setTrainIds] = useState<string[]>([]);
@@ -9,8 +10,11 @@ export const SimplePipelineVis: React.FC = () => {
   const [knowledgeList, setKnowledgeList] = useState<SimpleKnowledgeAggr[]>([]);
   const [selectedKnowledge, setSelectedKnowledge] = useState<SimpleKnowledgeAggr | null>(null);
   const [rollouts, setRollouts] = useState<SimpleTrajectory[]>([]);
+  const [sftQnas, setSftQnas] = useState<SimpleSftQna[]>([]);
+  const [activeTab, setActiveTab] = useState<'trajectories' | 'sft' | 'granular'>('trajectories');
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+
 
   const loadTrains = () => {
     return fetch(`${API_BASE}/api/simple_trains`)
@@ -64,11 +68,24 @@ export const SimplePipelineVis: React.FC = () => {
       .catch(e => console.error("Failed to load rollouts:", e));
   };
 
+  const loadSftQnas = (trainId: string, knowledgeId: string) => {
+    return fetch(`${API_BASE}/api/simple_train/${trainId}/knowledge/${knowledgeId}/sft_qnas`)
+      .then(r => r.json())
+      .then(data => {
+        setSftQnas(data);
+        return data;
+      })
+      .catch(e => console.error("Failed to load SFT QRAs:", e));
+  };
+
   const handleSelectKnowledge = (k: SimpleKnowledgeAggr) => {
     setSelectedKnowledge(k);
     setRollouts([]); // clear old
+    setSftQnas([]);   // clear old
     loadRollouts(selectedTrain, k.knowledge_id);
+    loadSftQnas(selectedTrain, k.knowledge_id);
   };
+
 
   const handleRefresh = async () => {
     setRefreshing(true);
@@ -77,7 +94,9 @@ export const SimplePipelineVis: React.FC = () => {
       await loadKnowledge(selectedTrain);
       if (selectedKnowledge) {
         await loadRollouts(selectedTrain, selectedKnowledge.knowledge_id);
+        await loadSftQnas(selectedTrain, selectedKnowledge.knowledge_id);
       }
+
     }
     setRefreshing(false);
   };
@@ -136,10 +155,14 @@ export const SimplePipelineVis: React.FC = () => {
                   onMouseLeave={e => { if (selectedKnowledge?.knowledge_id !== k.knowledge_id) e.currentTarget.style.background = 'rgba(255,255,255,0.03)' }}
                 >
                   <h4 style={{ margin: '0 0 8px 0', fontSize: '0.9rem', color: '#fff', lineHeight: 1.4 }}>{k.knowledge_title}</h4>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', color: '#aaa' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', color: '#aaa', marginTop: '5px' }}>
                     <span>Success: <strong style={{ color: k.total_success > 0 ? '#28a745' : '#ff4d4d' }}>{k.total_success}</strong> / {k.total_rollouts}</span>
-                    <span>{k.steps.length} Steps</span>
+                    <span style={{ color: '#61dafb' }}>{k.sft_count || 0} SFT</span>
                   </div>
+                  <div style={{ fontSize: '0.75rem', color: '#666', marginTop: '5px' }}>
+                    {k.steps.length} Steps
+                  </div>
+
                 </div>
               ))}
             </div>
@@ -156,16 +179,100 @@ export const SimplePipelineVis: React.FC = () => {
         ) : (
           <div style={{ maxWidth: '900px', margin: '0 auto', paddingBottom: '100px' }}>
             <h2 style={{ fontSize: '1.5rem', marginBottom: '10px' }}>{selectedKnowledge.knowledge_title}</h2>
-            <div style={{ marginBottom: '30px', display: 'flex', gap: '15px' }}>
+            <div style={{ marginBottom: '30px', display: 'flex', gap: '15px', alignItems: 'center' }}>
               <span style={{ padding: '4px 10px', background: 'rgba(255,255,255,0.1)', borderRadius: '12px', fontSize: '0.85rem' }}>ID: {selectedKnowledge.knowledge_id}</span>
               <span style={{ padding: '4px 10px', background: 'rgba(97, 218, 251, 0.1)', color: '#61dafb', borderRadius: '12px', fontSize: '0.85rem' }}>Total Rollouts: {selectedKnowledge.total_rollouts}</span>
+              <span style={{ padding: '4px 10px', background: 'rgba(155, 89, 182, 0.1)', color: '#9b59b6', borderRadius: '12px', fontSize: '0.85rem' }}>SFT Records: {selectedKnowledge.sft_count || 0}</span>
+            </div>
+
+            {/* Tabs */}
+            <div style={{ display: 'flex', borderBottom: '1px solid rgba(255,255,255,0.1)', marginBottom: '30px', gap: '20px' }}>
+              <button 
+                onClick={() => setActiveTab('trajectories')}
+                style={{
+                  padding: '10px 20px',
+                  background: 'none',
+                  border: 'none',
+                  color: activeTab === 'trajectories' ? '#61dafb' : '#888',
+                  borderBottom: activeTab === 'trajectories' ? '2px solid #61dafb' : 'none',
+                  cursor: 'pointer',
+                  fontSize: '1rem',
+                  fontWeight: activeTab === 'trajectories' ? 600 : 400
+                }}
+              >
+                Trajectories (RL)
+              </button>
+              <button 
+                onClick={() => setActiveTab('sft')}
+                style={{
+                  padding: '10px 20px',
+                  background: 'none',
+                  border: 'none',
+                  color: activeTab === 'sft' ? '#9b59b6' : '#888',
+                  borderBottom: activeTab === 'sft' ? '2px solid #9b59b6' : 'none',
+                  cursor: 'pointer',
+                  fontSize: '1rem',
+                  fontWeight: activeTab === 'sft' ? 600 : 400
+                }}
+              >
+                SFT Dataset (Static)
+              </button>
+              <button 
+                onClick={() => setActiveTab('granular')}
+                style={{
+                  padding: '10px 20px',
+                  background: 'none',
+                  border: 'none',
+                  color: activeTab === 'granular' ? '#f1c40f' : '#888',
+                  borderBottom: activeTab === 'granular' ? '2px solid #f1c40f' : 'none',
+                  cursor: 'pointer',
+                  fontSize: '1rem',
+                  fontWeight: activeTab === 'granular' ? 600 : 400
+                }}
+              >
+                Granular Insight (Article)
+              </button>
             </div>
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-              {rollouts.map(r => (
-                <RolloutCard key={r.id} rollout={r} />
-              ))}
+              {activeTab === 'trajectories' ? (
+                <>
+                  {rollouts.length === 0 ? (
+                    <div style={{ textAlign: 'center', padding: '40px', color: '#555' }}>No RL trajectories recorded yet.</div>
+                  ) : (
+                    rollouts.map(r => <RolloutCard key={r.id} rollout={r} />)
+                  )}
+                </>
+              ) : activeTab === 'sft' ? (
+                <>
+                  {sftQnas.length === 0 ? (
+                    <div style={{ textAlign: 'center', padding: '40px', color: '#555' }}>No SFT data found for this knowledge item.</div>
+                  ) : (
+                    sftQnas.map(q => <SftQnaCard key={q.id} qna={q} />)
+                  )}
+                </>
+              ) : (
+                <div style={{ 
+                  background: 'rgba(25, 28, 41, 0.7)', 
+                  border: '1px solid rgba(241, 196, 15, 0.3)', 
+                  borderRadius: '10px', 
+                  padding: '30px',
+                  backdropFilter: 'blur(10px)',
+                  boxShadow: '0 4px 15px rgba(0,0,0,0.2)',
+                  textAlign: 'left'
+                }}>
+                   <h5 style={{ margin: '0 0 20px 0', color: '#f1c40f', fontSize: '0.85rem', textTransform: 'uppercase', letterSpacing: '1px' }}>Granular Knowledge Content</h5>
+                   <div className="markdown-body" style={{ color: '#fff', fontSize: '0.95rem', lineHeight: 1.6 }}>
+                      {selectedKnowledge.content ? (
+                        <ReactMarkdown>{selectedKnowledge.content}</ReactMarkdown>
+                      ) : (
+                        <div style={{ color: '#555', fontStyle: 'italic' }}>No granular content available for this node.</div>
+                      )}
+                   </div>
+                </div>
+              )}
             </div>
+
           </div>
         )}
       </div>
@@ -285,6 +392,80 @@ const RolloutCard = ({ rollout }: { rollout: SimpleTrajectory }) => {
               </div>
             </div>
           )}
+        </div>
+      )}
+    </div>
+  );
+};
+const SftQnaCard = ({ qna }: { qna: SimpleSftQna }) => {
+  const [expanded, setExpanded] = useState(false);
+  
+  return (
+    <div style={{ 
+      background: 'rgba(25, 28, 41, 0.7)', 
+      border: '1px solid rgba(155, 89, 182, 0.3)', 
+      borderRadius: '10px', 
+      overflow: 'hidden',
+      backdropFilter: 'blur(10px)',
+      boxShadow: '0 4px 15px rgba(0,0,0,0.2)'
+    }}>
+      <div 
+        onClick={() => setExpanded(!expanded)}
+        style={{ 
+          padding: '15px 20px', 
+          display: 'flex', 
+          justifyContent: 'space-between', 
+          alignItems: 'center',
+          cursor: 'pointer',
+          borderBottom: expanded ? '1px solid rgba(255,255,255,0.05)' : 'none',
+          background: 'linear-gradient(90deg, rgba(155, 89, 182, 0.1), transparent)'
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: '15px' }}>
+          <div style={{ 
+            width: '40px', height: '40px', 
+            borderRadius: '50%', 
+            background: '#9b59b6', 
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            fontWeight: 'bold', color: '#fff', fontSize: '0.8rem',
+            boxShadow: 'inset 0 2px 4px rgba(255,255,255,0.2)'
+          }}>
+            SFT
+          </div>
+          <div>
+            <span style={{ fontWeight: 500, display: 'block' }}>SFT Seed Triple</span>
+            <span style={{ fontSize: '0.75rem', color: '#888' }}>
+              {qna.created_at ? new Date(qna.created_at).toLocaleString() : ''}
+            </span>
+          </div>
+        </div>
+        <div style={{ fontSize: '0.8rem', color: '#9b59b6', fontWeight: 600 }}>
+          {expanded ? 'HIDE DETAILS' : 'VIEW DETAILS'}
+        </div>
+      </div>
+      
+      {expanded && (
+        <div style={{ padding: '0px' }}>
+          <div style={{ padding: '20px', background: 'rgba(0,0,0,0.2)', borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
+            <h5 style={{ margin: '0 0 10px 0', color: '#aaa', fontSize: '0.85rem', textTransform: 'uppercase', letterSpacing: '1px', textAlign: 'left' }}>Question</h5>
+            <div style={{ color: '#e0e0e0', lineHeight: 1.5, fontSize: '0.95rem', whiteSpace: 'pre-wrap', textAlign: 'left' }}>
+              {qna.question.replace(/\\n/g, '\n')}
+            </div>
+          </div>
+          
+          <div style={{ padding: '20px', background: 'rgba(255,255,255,0.02)', borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
+            <h5 style={{ margin: '0 0 10px 0', color: '#9b59b6', fontSize: '0.85rem', textTransform: 'uppercase', letterSpacing: '1px', textAlign: 'left' }}>Golden Reasoning</h5>
+            <div style={{ color: '#b3b3b3', fontSize: '0.9rem', fontStyle: 'italic', whiteSpace: 'pre-wrap', maxHeight: '300px', overflowY: 'auto', paddingRight: '10px', textAlign: 'left' }}>
+              {qna.reasoning.replace(/\\n/g, '\n')}
+            </div>
+          </div>
+          
+          <div style={{ padding: '20px' }}>
+            <h5 style={{ margin: '0 0 10px 0', color: '#61dafb', fontSize: '0.85rem', textTransform: 'uppercase', letterSpacing: '1px', textAlign: 'left' }}>Golden Answer</h5>
+            <div className="markdown-body" style={{ color: '#fff', fontSize: '0.95rem', overflowX: 'auto', textAlign: 'left' }}>
+              <ReactMarkdown>{qna.answer.replace(/\\n/g, '\n')}</ReactMarkdown>
+            </div>
+          </div>
         </div>
       )}
     </div>

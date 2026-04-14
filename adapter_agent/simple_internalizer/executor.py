@@ -8,6 +8,7 @@ from .types import RuntimeExecutionResult, VerificationOutcome
 
 logger = logging.getLogger(__name__)
 
+
 class InternalizeExecutor:
     def __init__(self, runtime_pool: RuntimePool, verifier: Verifier):
         self.runtime_pool = runtime_pool
@@ -24,10 +25,19 @@ class InternalizeExecutor:
                 verification_output="No Rust code block found.",
             )
 
+        question_summary = (question[:80] + "..") if len(question) > 80 else question
+        logger.debug(f"🚀 Executing task: {question_summary}")
+
         try:
             async def _run_closure(runtime: Runtime) -> RuntimeExecutionResult:
+                url = runtime.get_api_url()
+                logger.debug(f"  [Runtime: {url}] Setting content (src/main.rs)...")
                 await runtime.set_content("src/main.rs", code)
+
+                logger.debug(f"  [Runtime: {url}] Running cargo run...")
                 execution_output, exit_success = await runtime.run_cargo()
+                
+                logger.debug(f"  [Runtime: {url}] Execution completed (success={exit_success})")
                 tree_output = await runtime.tree()
                 return RuntimeExecutionResult(
                     execution_output=execution_output,
@@ -38,11 +48,14 @@ class InternalizeExecutor:
             exec_res = await self.runtime_pool.execute_with_retry(_run_closure)
 
             if not exec_res.exit_success:
+                logger.debug(f"  [Result] Execution failed. Output: {exec_res.execution_output[:200]}...")
                 return VerificationOutcome(
                     success=False,
                     execution_output=exec_res.execution_output,
                     verification_output="Compilation or execution failed.",
                 )
+
+            logger.debug(f"  [Result] Execution success. Verifying output length: {len(exec_res.execution_output)}")
 
             qa_data = QRA(question=question, reasoning=reasoning, answer=answer_text)
             res = await self.verifier.verify(

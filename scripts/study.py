@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime
@@ -6,13 +7,16 @@ from pathlib import Path
 import tinker
 from oai_utils import AgentsSDKModel
 from oai_utils.tinker import TinkerModel, setup_tinkermodel
+from prisma import Prisma
 
 from adapter_agent.hierarchical.agent.analyzer import Analyzer
 from adapter_agent.hierarchical.agent.rewirer import log_trajectory
 from adapter_agent.hierarchical.gh import load_gh_archive
 from adapter_agent.hierarchical.process.rewire import ss_solve_verify
+from adapter_agent.internalize.studier import KnowledgeStudier
 from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
 from adapter_agent.library.knowledge_db import KnowledgeDB
+from adapter_agent.library.wiki_manager import WikiManager
 from adapter_agent.model_helper import get_gemini
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.rl.env.session_result import (
@@ -38,9 +42,9 @@ class StudyActor:
     solver_model: TinkerModel
     verifier_model: AgentsSDKModel
     rust_doc_analyzer: AsyncRustDocAnalyzer
-    knowledge_db: KnowledgeDB
+    wiki_manager: WikiManager
     rl_db: RLDatabase
-    vis_path: Path
+    studier: KnowledgeStudier
     json_path: Path
 
     async def run(self):
@@ -75,80 +79,60 @@ class StudyActor:
                 type="docker",
                 image_uri="coder-mcp-numrs2:latest",
             ),
-            knowledge_db=self.knowledge_db,
+            wiki_manager=self.wiki_manager,
         )
 
         if isinstance(ret, RewireSessionResultNormal):
             print("Session completed with conclusion:", ret.conclusion)
             log_trajectory(ret.trials, flip_tag=True)
 
-            # 1. Handle newly discovered knowledge (SSOT)
-            knowledge_id = None
-            if (
-                isinstance(ret, RewireSessionResultNormal)
-                and ret.reward > 0
-                and ret.knowledge
-            ):
-                knowledge_id = await self.rl_db.create_knowledge(
-                    knowledge_id=ret.knowledge.id,
-                    task_id=task.id,
-                    instruction=task.task.instruction,
-                    title=ret.knowledge.title,
-                    content=ret.knowledge.content,
-                )
-                # Update in-memory TaskNetwork knowledge ID for visualization mapping
-                task_meta = self.task_network.nodes[task.id]
-                for k in task_meta.knowledges.values():
-                    # Link to the generated knowledge
-                    if k.id == ret.knowledge.id:
-                        k.knowledge_id = knowledge_id
-
-            # 2. Extract citations
-            citations_data = [
-                {
-                    "knowledge_id": c.knowledge_id,
-                    "turn_index": c.turn_index,
-                    "content": c.content,
-                    "title": c.title,
-                }
-                for c in ret.citations
-            ]
-
-            # 3. Save trajectory
+            # Save trajectory immediately
+            # Note: knowledge_ids is currently empty, will be updated by Studier later
             await self.rl_db.add_trajectory(
                 task_id=task.id,
                 instruction=task.task.instruction,
                 conclusion=ret.conclusion,
                 reward=ret.reward,
                 trajectory=ret.trials,
-                knowledge_id=knowledge_id,
-                final_knowledge=ret.knowledge.content if ret.knowledge else None,
-                final_knowledge_title=ret.knowledge.title if ret.knowledge else None,
-                citations=citations_data,
+                knowledge_ids=[],
+                final_knowledge=None,
+                final_knowledge_title=None,
+                citations=[
+                    {
+                        "knowledge_id": c.knowledge_id,
+                        "turn_index": c.turn_index,
+                        "content": c.content,
+                        "title": c.title,
+                    }
+                    for c in ret.citations
+                ],
             )
 
+            # Enqueue for distillation if successful (and let Studier handle uniqueness & formalization)
+            if ret.reward > 0:
+                await self.studier.enqueue_trajectory(
+                    task_id=task.id,
+                    instruction=task.task.instruction,
+                    reflections=ret.reflections,  # Use reflections instead of knowledges
+                    trajectory=ret.trials,
+                )
+
+        # Mark task as completed IMMEDIATELY in TaskNetwork
         if not task.is_generation or not isinstance(ret, RewireSessionResultFailure):
             current.register_result(task.complete(ret))
-            await self.task_network.save_json(self.json_path)
-            await self.rl_db.update_graph_json(self.task_network.to_dict())
-            return
+        else:
+            try:
+                analyzer = Analyzer(model=get_gemini())
+                subtask = await analyzer.analyze_trajectory(ret.trials)
+                print(f"New Task: {subtask.instruction}")
+                current.register_result(task.complete(ret, new_task=subtask))
+            except Exception as e:
+                current.register_result(task.complete(ret, new_task=None))
+                print(f"Subtask generation failed: {e}")
 
-        try:
-            analyzer = Analyzer(model=get_gemini())
-            subtask = await analyzer.analyze_trajectory(ret.trials)
-            print(f"New Task: {subtask.instruction}")
-
-            current.register_result(task.complete(ret, new_task=subtask))
-
-            await self.task_network.save_json(self.json_path)
-            await self.rl_db.update_graph_json(self.task_network.to_dict())
-            print(f"TaskNetwork Visualized at {self.json_path}")
-            return
-        except Exception as e:
-            current.register_result(task.complete(ret, new_task=None))
-            await self.rl_db.update_graph_json(self.task_network.to_dict())
-            print(f"Subtask generation failed: {e}")
-            return
+        await self.task_network.save_json(self.json_path)
+        await self.rl_db.update_graph_json(self.task_network.to_dict())
+        return
 
 
 async def main():
@@ -165,10 +149,22 @@ async def main():
     # task = Task.from_instruction(
     #     "Implement a function that multiplies two 3x3 matrices using the `numrs2` library. The function should take two 3x3 matrices as input and return their product."
     # )
+
+    parser = argparse.ArgumentParser(description="Wiki-Integrated Learning Pipeline")
+    parser.add_argument("--version", type=str, default=None, help="Wiki version to use (defaults to experiment name)")
+    parser.add_argument(
+        "--reset", action="store_true", help="Reset the Wiki version before starting"
+    )
+    parser.add_argument(
+        "--workers", type=int, default=10, help="Number of concurrent workers"
+    )
+    args = parser.parse_args()
+
     setup_base_loglevel()
 
     # Initialize RLDatabase for visualization
-    experiment_name = f"study_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    experiment_name = f"study_{timestamp}"
     rl_db = RLDatabase()
     await rl_db.connect()
     await rl_db.register_experiment(experiment_name)
@@ -185,22 +181,43 @@ async def main():
         Path("repositories/numrs")
     )
 
-    # Initialize KnowledgeDB once for this experiment (Postgres as SSOT)
+    # Initialize Prisma and WikiManager
+    db = Prisma()
+    await db.connect()
+    wiki_version = args.version or experiment_name
+    wiki_manager = WikiManager(db, version=wiki_version)
+
+    if args.reset:
+        await wiki_manager.reset()
+
+    # Note: KnowledgeDB is kept for metadata/experiment tracking if needed
     knowledge_db = KnowledgeDB.for_experiment(experiment_name)
     await knowledge_db.initialize()
 
     verifier_model = get_gemini()
     tasks = load_gh_archive()
 
-    task_network = TaskNetwork(tasks_pool=tasks[:1])
+    task_network = TaskNetwork(tasks_pool=tasks[:5])
 
     # Initial graph sync to database
     await rl_db.update_graph_json(task_network.to_dict())
 
-    vis_path = Path("data/graphviz/task_net.html")
     json_path = Path("graphvis/public/data.json")
-    launch_interval = 5
-    num_workers = 20
+    launch_interval = 2
+    num_workers = args.workers
+
+    # Initialize KnowledgeStudier
+    studier = KnowledgeStudier(
+        verifier_model=verifier_model,
+        wiki_manager=wiki_manager,
+        rl_db=rl_db,
+        runtime_settings=RuntimeSettings(
+            type="docker",
+            image_uri="coder-mcp-numrs2:latest",
+        ),
+        task_network=task_network,
+    )
+    await studier.start()
 
     tasks = []
     for i in range(num_workers):
@@ -210,9 +227,9 @@ async def main():
             solver_model=model,
             verifier_model=verifier_model,
             rust_doc_analyzer=rust_doc_analyzer,
-            knowledge_db=knowledge_db,
+            wiki_manager=wiki_manager,
             rl_db=rl_db,
-            vis_path=vis_path,
+            studier=studier,
             json_path=json_path,
         )
         tasks.append(asyncio.create_task(study_actor.run()))
@@ -222,6 +239,7 @@ async def main():
     try:
         await asyncio.gather(*tasks)
     finally:
+        await studier.stop()
         await rl_db.close()
 
 

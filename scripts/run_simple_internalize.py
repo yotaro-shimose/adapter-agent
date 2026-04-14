@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import logging
 from datetime import datetime
@@ -5,11 +6,13 @@ from pathlib import Path
 
 import tinker
 from dotenv import load_dotenv
+from prisma import Prisma
 
+from adapter_agent.hierarchical.types import Knowledge
 from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
-from adapter_agent.library.knowledge_db import KnowledgeDB
-from adapter_agent.rl.env.runtime_settings import RuntimeSettings
+from adapter_agent.library.wiki_manager import WikiManager
 from adapter_agent.rl.config import ModelLoadingSettings
+from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.simple_internalizer import PipelineConfig, SimplePipeline
 
 logging.basicConfig(
@@ -42,6 +45,26 @@ EVAL_TREE_TASKS = {
 
 
 async def main():
+    parser = argparse.ArgumentParser(description="Simplified Internalization Pipeline")
+    parser.add_argument(
+        "--version",
+        type=str,
+        # default="study_20260413_145727",
+        default="lab_verification",
+        help="Wiki version to load knowledge from",
+    )
+    parser.add_argument(
+        "--limit", type=int, default=50, help="Number of knowledge items to load"
+    )
+
+    parser.add_argument(
+        "--granular-id",
+        type=str,
+        default="granular_prep_20260414_085004",
+        help="SimpleTrainRun ID for granular knowledge",
+    )
+    args = parser.parse_args()
+
     load_dotenv()
     json_path = Path("repositories/numrs/target/doc/numrs2.json")
 
@@ -59,16 +82,40 @@ async def main():
     runtime_settings = RuntimeSettings.cloudrun_numrs2()
 
     # 3. DB and Knowledge
-    db = KnowledgeDB.for_experiment("unirl_20260406_102313")
-    async with db:
-        # Load up to 12 items as specified.
-        knowledge_list = await db.list_knowledge(limit=12)
+    db = Prisma()
+    await db.connect()
+
+    knowledge_list = []
+    if args.granular_id:
+        logger.info(f"Loading granular knowledge from run ID: {args.granular_id}")
+        granulars = await db.granularknowledge.find_many(
+            where={"simple_train_id": args.granular_id}
+        )
+        for g in granulars:
+            knowledge_list.append(Knowledge(id=g.id, title=g.title, content=g.content))
+    else:
+        wiki_manager = WikiManager(db, version=args.version)
+
+        # Fetch articles starting with "api/"
+        titles = await wiki_manager.ls(path="api/")
+        if args.limit:
+            titles = titles[: args.limit]
+
+        for title in titles:
+            content = await wiki_manager.read(title)
+            if content:
+                knowledge_list.append(Knowledge(title=title, content=content))
 
     if not knowledge_list:
-        logger.error("No knowledge found in DB.")
+        logger.error(
+            f"No knowledge found (options: granular={args.granular}, version={args.version})."
+        )
+        await db.disconnect()
         return
 
-    logger.info(f"Loaded {len(knowledge_list)} knowledge items.")
+    logger.info(
+        f"Loaded {len(knowledge_list)} knowledge items from Wiki version {args.version}."
+    )
 
     # 4. Pipeline Configuration
     simple_train_id = f"simple_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -90,13 +137,14 @@ async def main():
         k_sft=32,
         k_eval=1,
         k_rl=4,
+        sft_epochs=12,
         eval_rollout=4,
         rl_rollout=8,
         init_sft_steps=20,
-        sft_batch_size=128,
+        sft_batch_size=256,
         max_iterations=50,
         adam_params=tinker.AdamParams(learning_rate=1e-3),
-        rl_adam_params=tinker.AdamParams(learning_rate=1e-3),
+        rl_adam_params=tinker.AdamParams(learning_rate=2e-4),
         rl_loss_fn="ppo",
         extra_eval_suites=EVAL_TREE_TASKS,
         stop_grpo=False,
@@ -113,6 +161,8 @@ async def main():
             logger.info("Pipeline executed successfully.")
     except Exception as e:
         logger.exception(f"Pipeline encountered an error: {e}")
+    finally:
+        await db.disconnect()
 
 
 if __name__ == "__main__":

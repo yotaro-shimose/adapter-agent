@@ -73,3 +73,12 @@ class TaskInstruction(BaseModel):
 
 class TaskInstructionList(BaseModel):
     tasks: list[TaskInstruction]
+
+
+class KnowledgeSeed(BaseModel):
+    title: str
+    description: str
+
+
+class SeedList(BaseModel):
+    seeds: list[KnowledgeSeed]

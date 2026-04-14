@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any, Optional, Self
 
 import tinker
-from more_itertools import chunked
 from oai_utils.tinker import TinkerModel, setup_tinkermodel
 from oai_utils.tinker.model_helper import get_tokenizer_renderer
 from prisma import Prisma
@@ -104,7 +103,11 @@ class SimplePipeline:
             path=config.model_loading_settings.resume_sampler_path,
         )
 
-        log_dir = Path("logs") / "simple_internalizer" / config.model_loading_settings.model_name
+        log_dir = (
+            Path("logs")
+            / "simple_internalizer"
+            / config.model_loading_settings.model_name
+        )
         log_dir.mkdir(parents=True, exist_ok=True)
         ml_logger = ml_log.setup_logging(
             log_dir=str(log_dir),
@@ -112,8 +115,7 @@ class SimplePipeline:
             config={
                 "model_name": config.model_loading_settings.model_name,
                 "library": config.library_name,
-                "init_sft_steps": config.init_sft_steps,
-                "iter_sft_steps": config.iter_sft_steps,
+                "sft_epochs": config.sft_epochs,
                 "sft_batch_size": config.sft_batch_size,
                 "lora_rank": config.model_loading_settings.lora_rank,
             },
@@ -152,7 +154,12 @@ class SimplePipeline:
         )
 
     async def _generate_and_cache(
-        self, knowledge: Knowledge, count: int, prefix: str
+        self,
+        knowledge: Knowledge,
+        count: int,
+        prefix: str,
+        verify: bool = True,
+        is_coding: bool = True,
     ) -> list[Any]:
         cache_file = self.cache_dir / f"{knowledge.id}_{prefix}_{count}.pkl"
         if cache_file.exists():
@@ -168,19 +175,86 @@ class SimplePipeline:
         async def _gen():
             async with sem:
                 while True:
-                    qra = await self.generator.generate_sft(knowledge)
-                    if qra:
+                    if is_coding:
+                        qra = await self.generator.generate_sft(knowledge)
+                    else:
+                        qra = await self.generator.generate_sft_noncode(knowledge)
+
+                    if not qra:
+                        await asyncio.sleep(0.1)
+                        continue
+
+                    if not verify:
                         return qra
-                    await asyncio.sleep(0.1)
+
+                    # Verification loop
+                    for attempt in range(self.config.max_fix_attempts + 1):
+                        outcome = await self.executor.run_execution_and_verification(
+                            qra.question, qra.reasoning, qra.answer
+                        )
+                        if outcome.success:
+                            return qra
+
+                        if attempt < self.config.max_fix_attempts:
+                            logger.info(
+                                f"Refining {prefix} QRA for '{knowledge.title}' (attempt {attempt + 1}/{self.config.max_fix_attempts})..."
+                            )
+                            fixed_qra = await self.generator.fix_qra(
+                                knowledge, qra, outcome.verification_output
+                            )
+                            if fixed_qra:
+                                qra = fixed_qra
+                            else:
+                                break  # Model failure during fix
+                        else:
+                            logger.warning(
+                                f"Failed to verify {prefix} QRA for '{knowledge.title}' after {self.config.max_fix_attempts} fix attempts."
+                            )
+
+                    # If we reach here, it failed. Abandon this slot and return None.
+                    return None
 
         results = await asyncio.gather(*[_gen() for _ in range(count)])
-        with open(cache_file, "wb") as f:
-            pickle.dump(results, f)
-        return results
+        valid_results = [r for r in results if r is not None]
+
+        if valid_results:
+            with open(cache_file, "wb") as f:
+                pickle.dump(valid_results, f)
+
+        return valid_results
+
+    def _print_generation_summary(
+        self,
+        knowledge_list: list[Knowledge],
+        prepared_results: list[tuple[list[Any], Any]],
+    ):
+        print("\n" + "=" * 80)
+        print(f"{'Knowledge Title':<50} | {'Target':<6} | {'Success':<7} | {'Status'}")
+        print("-" * 80)
+        for k, (s_qras, e_item) in zip(knowledge_list, prepared_results):
+            # For simplicity, we only track SFT count here as it's the main bulk
+            target = self.config.k_sft
+            success = len(s_qras)
+            if success == target:
+                status = "✅ OK"
+            elif success > 0:
+                status = "⚠️  PARTIAL"
+            else:
+                status = "❌ FAILED"
+
+            # Check eval status
+            if e_item is None:
+                status += " (Eval Failed)"
+
+            title = (k.title[:47] + "...") if len(k.title) > 50 else k.title
+            print(f"{title:<50} | {target:<6} | {success:<7} | {status}")
+        print("=" * 80 + "\n")
 
     async def run(self) -> None:
         prepared = await self._prepare_knowledge_tasks()
-        sft_batch_iter = self._create_sft_batch_iterator(prepared.sft_qras)
+        sft_batch_iter = self._create_sft_batch_iterator(
+            prepared.sft_qras, self.config.sft_epochs
+        )
 
         # Initialize EvaluateWorker
         self.evaluate_worker = EvaluateWorker(
@@ -201,8 +275,8 @@ class SimplePipeline:
                 f"Skipping initial SFT because resume_trainer_path is provided: {self.config.model_loading_settings.resume_trainer_path}"
             )
         else:
-            logger.info(f"Running initial {self.config.init_sft_steps} steps of SFT...")
-            await self._run_sft_steps(sft_batch_iter, self.config.init_sft_steps)
+            logger.info(f"Running initial SFT for {self.config.sft_epochs} epochs...")
+            await self._run_sft_steps(sft_batch_iter)
 
             if self.config.init_sft_steps > 0:
                 logger.info("Saving initial SFT checkpoint...")
@@ -210,15 +284,13 @@ class SimplePipeline:
                     training_client=self.training_client,
                     name="init_sft",
                     log_path=str(self.log_dir),
-                    loop_state={"step": self.config.init_sft_steps},
+                    loop_state={"epochs": self.config.sft_epochs},
                     kind="both",
                     ttl_seconds=self.config.ttl_seconds,
                 )
 
                 # Update reference client to the post-SFT state
-                self.reference_client = (
-                    await self.training_client.save_weights_and_get_sampling_client_async()
-                )
+                self.reference_client = await self.training_client.save_weights_and_get_sampling_client_async()
                 logger.info("Updated reference client to SFT state.")
 
         spawner_task = None
@@ -466,13 +538,11 @@ class SimplePipeline:
             self.shared_sampling_client.update_client(new_client)
             self.eval_trigger.set()
 
-    async def _run_sft_steps(self, batch_iter, num_steps: int) -> None:
-        if num_steps == 0:
-            return
+    async def _run_sft_steps(self, batch_iter) -> None:
         adam_params = self.config.adam_params
-        for i in range(num_steps):
+        for batch in batch_iter:
             fwd_future = await self.training_client.forward_backward_async(
-                data=next(batch_iter), loss_fn="cross_entropy"
+                data=batch, loss_fn="cross_entropy"
             )
             opt_future = await self.training_client.optim_step_async(adam_params)
             fwd_res = await fwd_future.result_async()
@@ -493,20 +563,57 @@ class SimplePipeline:
 
     async def _prepare_knowledge_tasks(self) -> PreparedTasks:
         async def _prep_single(k: Knowledge):
-            s_qras = await self._generate_and_cache(k, self.config.k_sft, "sft")
-            e_qras = await self._generate_and_cache(k, self.config.k_eval, "eval")
-            return s_qras, (k, e_qras[0])
+            s_qras = await self._generate_and_cache(
+                k, self.config.k_sft, "sft", verify=False, is_coding=True
+            )
+            e_qras = await self._generate_and_cache(
+                k, self.config.k_eval, "eval", verify=False, is_coding=True
+            )
+            # If eval fails, we might not have e_qras[0]. Handle it.
+            e_item = (k, e_qras[0]) if e_qras else None
+            return s_qras, e_item
 
         results = await asyncio.gather(
             *[_prep_single(k) for k in self.config.knowledge_list]
         )
+
+        self._print_generation_summary(self.config.knowledge_list, results)
+
+        # Save SFT QRAs to database for visualization
+        for k, (s_qras, _) in zip(self.config.knowledge_list, results):
+            for qra in s_qras:
+                try:
+                    # Check if already exists to avoid duplication on re-runs
+                    existing = await self.prisma_client.simplesftqna.find_first(
+                        where={
+                            "simple_train_id": self.config.simple_train_id,
+                            "knowledge_id": k.id,
+                            "question": qra.question,
+                        }
+                    )
+                    if not existing:
+                        await self.prisma_client.simplesftqna.create(
+                            data={
+                                "simple_train_id": self.config.simple_train_id,
+                                "knowledge_id": k.id,
+                                "knowledge_title": k.title,
+                                "question": qra.question,
+                                "reasoning": qra.reasoning,
+                                "answer": qra.answer,
+                            }
+                        )
+                except Exception as e:
+                    logger.error(f"Failed to record SFT QRA to DB: {e}")
+
         sft_qras = [q for r in results for q in r[0]]
-        eval_tasks = [r[1] for r in results]
+        eval_tasks = [r[1] for r in results if r[1] is not None]
         return PreparedTasks(sft_qras=sft_qras, eval_tasks=eval_tasks)
 
     async def _prepare_rl_tasks(self) -> list[tuple[Knowledge, Any]]:
         async def _prep_single(k: Knowledge):
-            tasks = await self._generate_and_cache(k, self.config.k_rl, "rl")
+            tasks = await self._generate_and_cache(
+                k, self.config.k_rl, "rl", verify=False, is_coding=True
+            )
             return [(k, t) for t in tasks]
 
         results = await asyncio.gather(
@@ -514,7 +621,7 @@ class SimplePipeline:
         )
         return list(itertools.chain.from_iterable(results))
 
-    def _create_sft_batch_iterator(self, sft_qras: list[Any]):
+    def _create_sft_batch_iterator(self, sft_qras: list[Any], num_epochs: int):
         _, renderer = get_tokenizer_renderer(
             self.training_client, self.config.model_loading_settings.model_name
         )
@@ -536,7 +643,21 @@ class SimplePipeline:
             )
             for q in sft_qras
         ]
-        batches = list(chunked(datums, self.config.sft_batch_size))
-        if not batches:
-            raise ValueError("No batches created.")
-        return itertools.cycle(batches)
+        if not datums:
+            return iter([])
+
+        batch_size = self.config.sft_batch_size
+        all_datums = datums * num_epochs
+        num_batches = (len(all_datums) + batch_size - 1) // batch_size
+
+        batches = []
+        for i in range(num_batches):
+            batch = all_datums[i * batch_size : (i + 1) * batch_size]
+            if len(batch) < batch_size:
+                # Pad with wrap-around from the start of the FULL dataset
+                needed = batch_size - len(batch)
+                batch.extend(all_datums[:needed])
+            batches.append(batch)
+
+        logger.info(f"Created {len(batches)} batches for {num_epochs} epochs.")
+        return iter(batches)

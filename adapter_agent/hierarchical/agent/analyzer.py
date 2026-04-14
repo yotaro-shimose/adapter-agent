@@ -21,20 +21,24 @@ class Analyzer[T: AgentsSDKModel](BaseAgent[T]):
         Solverが解けるであろうより小さな問題を生成する。
         """
         PROMPT = """
-You are a Senior Engineer analyzing a Junior Engineer's failure.
-The Junior Engineer tried to solve a task but failed.
-The workspace is a cargo-initialized project.
+You are a Senior Architect analyzing a technical failure in a Rust project.
+A Solver agent attempted a task and failed. Your role is to identify a fundamental, simpler prerequisite that must be achieved to resolve the impasse.
 
-Your goal is to create a *simpler* sub-task that helps bridge the gap.
-The sub-task should be:
-1. Self-contained.
-2. Easier than the original failed task.
-3. Related to the specific failure point.
+### Objectives
+1. Identify the core conceptual or functional hurdle that led to the failure.
+2. Define a "Definition of Done" for a new, smaller sub-task that addresses this hurdle.
 
-Return a new Task with a clear instruction.
+### Sub-task Requirements
+- Focus on outcomes: Describe the functional behavior or state that must be achieved.
+- Implementation Agnostic: Do not specify any library APIs, specific function names, or agent tools (e.g., do not say "use grep" or "call XXX API"). 
+- Logical Atomicity: The sub-task should be the smallest meaningful step towards understanding or fixing the original failure.
+
+The Solver has full autonomy over implementation details and tool usage. Your sub-task must define *what* to solve, not *how* to solve it.
+
 OUTPUT FORMAT:
 Provide your reasoning, and then output the subtask instruction inside a <subtask></subtask> xml block.
 """
+
         # Analyzer doesn't necessarily need runtime tools, but consistency helps.
         # We can run it without coder_mcp if it's just text processing, but let's give it just in case.
         agent = AgentWrapper[str].create(
@@ -43,11 +47,14 @@ Provide your reasoning, and then output the subtask instruction inside a <subtas
             model=self.model,
         )
 
+        # Filter out system messages to avoid tool description pollution
+        filtered_trajectory = [m for m in trajectory if m.get("role") != "system"]
+
         result = await agent.run(
             f"""\
 Analyze the following trajectory and generate a sub-task.
 <Trajectory>
-{format_trajectory_transcript(trajectory)}
+{format_trajectory_transcript(filtered_trajectory)}
 </Trajectory>
 """,
             run_config=RunConfig(tracing_disabled=True),

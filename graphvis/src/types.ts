@@ -91,6 +91,8 @@ export interface SimpleKnowledgeAggr {
   total_rollouts: number;
   total_success: number;
   steps: number[];
+  sft_count: number;
+  content?: string;
 }
 
 export interface SimpleTrajectory {
@@ -104,3 +106,12 @@ export interface SimpleTrajectory {
   verification_output: string | null;
   created_at: string | null;
 }
+
+export interface SimpleSftQna {
+  id: number;
+  question: string;
+  reasoning: string;
+  answer: string;
+  created_at: string | null;
+}
+

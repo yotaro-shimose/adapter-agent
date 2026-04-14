@@ -53,12 +53,12 @@ def format_trajectory_transcript(
                 else:
                     name = call.function.name
                     args = call.function.arguments
-                
-                transcript_lines.append(
-                    f"[Tool Call: {name} - Args: {args}]"
-                )
+
+                transcript_lines.append(f"[Tool Call: {name} - Args: {args}]")
 
             unparsed_tool_calls = msg.get("unparsed_tool_calls", [])
+            if unparsed_tool_calls is None:
+                unparsed_tool_calls = []
             for call in unparsed_tool_calls:
                 if isinstance(call, dict):
                     raw_text = call.get("raw_text", "n/a")

@@ -1,19 +1,24 @@
 import asyncio
 import logging
-from typing import Optional, Any
+from typing import Any, Optional
 
 import tinker
-from prisma import Prisma
-from tinker_cookbook.renderers import Message
-from tinker_cookbook.utils.ml_log import Logger as MLLogger
 from oai_utils.async_utils import gather_with_semaphore
+from prisma import Prisma
+from tinker_cookbook.renderers import Message, Renderer
+from tinker_cookbook.utils.ml_log import Logger as MLLogger
 
 from adapter_agent.data import QRA
-from adapter_agent.rl.shared_sampling_client import SharedSamplingClient, IndexedSamplingClient
-from .types import EvalResult, PipelineConfig
+from adapter_agent.rl.shared_sampling_client import (
+    IndexedSamplingClient,
+    SharedSamplingClient,
+)
+
 from .executor import InternalizeExecutor
+from .types import EvalResult, PipelineConfig
 
 logger = logging.getLogger(__name__)
+
 
 class EvaluateWorker:
     def __init__(
@@ -23,8 +28,8 @@ class EvaluateWorker:
         ml_logger: MLLogger,
         prisma_client: Prisma,
         shared_sampling_client: SharedSamplingClient,
-        renderer, # The tokenizer/renderer
-        eval_tasks: list[tuple[Any, QRA]], # (Knowledge, QRA)
+        renderer: Renderer,
+        eval_tasks: list[tuple[Any, QRA]],  # (Knowledge, QRA)
         extra_eval_suites: dict[str, list[str]],
         trigger: asyncio.Event,
     ):
@@ -61,7 +66,9 @@ Your task is to solve the programming challenge using the `{library_name}` libra
                 self.trigger.clear()
 
                 # Snapshot the current model version
-                snapshot: IndexedSamplingClient = self.shared_sampling_client.get_client()
+                snapshot: IndexedSamplingClient = (
+                    self.shared_sampling_client.get_client()
+                )
                 version = snapshot.version
                 logger.info(f"Starting evaluation cycle for model version {version}...")
 
@@ -78,9 +85,11 @@ Your task is to solve the programming challenge using the `{library_name}` libra
                 logger.exception(f"EvaluateWorker encountered error: {e}")
                 await asyncio.sleep(5)
 
-    async def _run_evaluation(self, snapshot: IndexedSamplingClient, version: int) -> None:
+    async def _run_evaluation(
+        self, snapshot: IndexedSamplingClient, version: int
+    ) -> None:
         logger.info(f"Running standard evaluation on {len(self.eval_tasks)} tasks...")
-        
+
         results = await gather_with_semaphore(
             [
                 self._evaluate_single_task(snapshot, version, qra, k.id, k.title)
@@ -101,7 +110,9 @@ Your task is to solve the programming challenge using the `{library_name}` libra
             }
         )
 
-    async def _run_extra_evaluations(self, snapshot: IndexedSamplingClient, version: int) -> None:
+    async def _run_extra_evaluations(
+        self, snapshot: IndexedSamplingClient, version: int
+    ) -> None:
         if not self.extra_eval_suites:
             return
 
@@ -131,7 +142,9 @@ Your task is to solve the programming challenge using the `{library_name}` libra
             max_concurrent=self.config.eval_concurrency,
         )
 
-        suite_metrics = {s: {"success": 0, "rollouts": 0} for s in self.extra_eval_suites.keys()}
+        suite_metrics = {
+            s: {"success": 0, "rollouts": 0} for s in self.extra_eval_suites.keys()
+        }
         for s_name, res in results:
             suite_metrics[s_name]["success"] += res.success_count
             suite_metrics[s_name]["rollouts"] += res.total_count

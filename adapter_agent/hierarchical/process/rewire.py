@@ -7,18 +7,14 @@ from oai_utils.tinker import TinkerModel
 from tinker_cookbook.renderers.base import Message as TinkerMessage
 from tinker_cookbook.rl.types import TokensWithLogprobs, Trajectory, Transition
 
+from adapter_agent.hierarchical.agent.reflector import Reflector
 from adapter_agent.hierarchical.agent.knowledge_normalizer import (
     AgentsSDKModel,
-    KnowledgeNormalizer,
-    verify_normalized_knowledge,
-)
-from adapter_agent.hierarchical.agent.uniqueness_checker import (
-    KnowledgeUniquenessChecker,
 )
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
-from adapter_agent.library.knowledge_db import KnowledgeDB
+from adapter_agent.library.wiki_manager import WikiManager
 from adapter_agent.rl.env.reward import LLMAsAJudge
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.rl.env.session_result import (
@@ -26,7 +22,6 @@ from adapter_agent.rl.env.session_result import (
     RewireSessionResult,
     RewireSessionResultError,
     RewireSessionResultFailure,
-    RewireSessionResultRedundant,
     RewireSessionResultSuccess,
 )
 from adapter_agent.rl.env.simplified_solver import (
@@ -49,7 +44,7 @@ async def ss_solve_verify(
     task: Task,
     max_turns: int,
     runtime_settings: RuntimeSettings,
-    knowledge_db: KnowledgeDB,
+    wiki_manager: WikiManager,
     qwen_no_think: bool = False,
     internalized_knowledge: str | None = None,
     blocked_knowledge_ids: set[str] | None = None,
@@ -69,7 +64,7 @@ async def ss_solve_verify(
                 verifier=verifier,
                 rust_doc_analyzer=verifier.rust_doc_analyzer,
                 search_model=verifier_model,
-                knowledge_db=knowledge_db,
+                wiki_manager=wiki_manager,
                 max_turns=max_turns,
                 runtime=runtime,
             ) as env:
@@ -144,7 +139,7 @@ async def ss_solve_verify(
                     trajectory=trajectory,
                     step_result=step_result,
                     verifier_model=verifier_model,
-                    knowledge_db=knowledge_db,
+                    wiki_manager=wiki_manager,
                     runtime=runtime,
                 )
 
@@ -162,7 +157,7 @@ async def _process_solve_result(
     trajectory: Trajectory,
     step_result: Any, # SimplifiedSolverEnvStepResult
     verifier_model: AgentsSDKModel,
-    knowledge_db: KnowledgeDB,
+    wiki_manager: WikiManager,
     runtime: Any, # CoderMCPRuntime
 ) -> RewireSessionResult:
     """
@@ -193,69 +188,30 @@ async def _process_solve_result(
             citations=citations,
         )
 
-    # 1. Normalize Knowledge
-    logger.info("Extracting normalized knowledge from trajectory...")
-    normalizer = KnowledgeNormalizer(model=verifier_model)
-    knowledge_obj = await normalizer.normalize(history)
+    # 1. Extract Reflections
+    logger.info("Extracting reflections from trajectory...")
+    reflector = Reflector(model=verifier_model)
+    reflections = await reflector.reflect(history)
 
-    if knowledge_obj is None:
-        logger.warning("Knowledge normalization failed.")
+    if not reflections:
+        logger.warning("No reflections extracted.")
+        # We can still return success if the goal was reached, but knowledge extraction failed.
+        # However, for consistency with the previous logic:
         return RewireSessionResultFailure(
             task=task,
             trials=history,
             conclusion="knowledge_normalization_failed",
             trajectory=trajectory,
+            citations=citations,
         )
 
-    # 2. Verify Knowledge
-    verification_result = await verify_normalized_knowledge(
-        runtime=runtime,
-        normalized_knowledge=knowledge_obj.content,
-        model=verifier_model,
-    )
-
-    if not verification_result.success:
-        logger.warning(
-            f"Knowledge verification failed: {verification_result.reasoning}"
-        )
-        return RewireSessionResultFailure(
-            task=task,
-            trials=history,
-            conclusion="verification_failed",
-            trajectory=trajectory,
-            reasoning=verification_result.reasoning,
-            knowledge=knowledge_obj,
-        )
-
-    # 3. Check Uniqueness
-    logger.info("Checking for knowledge uniqueness...")
-    uniqueness_checker = KnowledgeUniquenessChecker(model=verifier_model)
-    (
-        is_unique,
-        uniqueness_reasoning,
-    ) = await uniqueness_checker.check_uniqueness(
-        new_knowledge=knowledge_obj.content,
+    logger.info(f"Extracted {len(reflections)} reflections for async distillation.")
+    return RewireSessionResultSuccess(
         task=task,
-        knowledge_db=knowledge_db,
+        trials=history,
+        knowledges=[], # Knowledges will be populated by Studier
+        reflections=reflections,
+        trajectory=trajectory,
+        reasoning="Delegated to async KnowledgeStudier",
+        citations=citations,
     )
-
-    if is_unique:
-        logger.info(f"Knowledge is unique, reasoning: {uniqueness_reasoning}")
-        return RewireSessionResultSuccess(
-            task=task,
-            trials=history,
-            knowledge=knowledge_obj,
-            trajectory=trajectory,
-            reasoning=verification_result.reasoning,
-            citations=citations,
-        )
-    else:
-        logger.info(f"Skipping redundant knowledge. Reasoning: {uniqueness_reasoning}")
-        return RewireSessionResultRedundant(
-            task=task,
-            trials=history,
-            knowledge=knowledge_obj,
-            trajectory=trajectory,
-            reasoning=verification_result.reasoning,
-            citations=citations,
-        )

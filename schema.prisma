@@ -23,7 +23,7 @@ model Trajectory {
   experiment            Experiment @relation(fields: [experiment_name], references: [experiment_name], onDelete: Cascade)
   experiment_name       String
   task_id               String
-  knowledge_id          String?    // Changed from Int? to String? for UUID
+  knowledge_ids         String[]   @default([])
   instruction          String?
   conclusion           String?
   reward               Float?
@@ -74,8 +74,27 @@ model SimpleTrainRun {
   id              String   @id // simple_train_id
   created_at      DateTime @default(now())
   trajectories    SimpleTrajectory[]
+  sft_qnas        SimpleSftQna[]
 
   @@map("simple_train_runs")
+  granular_knowledges GranularKnowledge[]
+}
+
+model GranularKnowledge {
+  id              String   @id @default(uuid())
+  simple_train_id String
+  simple_train    SimpleTrainRun @relation(fields: [simple_train_id], references: [id], onDelete: Cascade)
+  
+  title           String
+  content         String
+  
+  created_at      DateTime @default(now())
+  
+  sft_qnas        SimpleSftQna[]
+  trajectories    SimpleTrajectory[]
+
+  @@map("granular_knowledges")
+  @@index([simple_train_id])
 }
 
 model SimpleTrajectory {
@@ -100,5 +119,39 @@ model SimpleTrajectory {
   @@map("simple_trajectories")
   @@index([simple_train_id])
   @@index([knowledge_id])
+
+  granular_knowledge GranularKnowledge? @relation(fields: [knowledge_id], references: [id])
 }
 
+model SimpleSftQna {
+  id              Int      @id @default(autoincrement())
+  simple_train_id String
+  simple_train    SimpleTrainRun @relation(fields: [simple_train_id], references: [id], onDelete: Cascade)
+  
+  knowledge_id    String
+  knowledge_title String
+  
+  question        String
+  reasoning       String
+  answer          String
+  
+  created_at      DateTime @default(now())
+  
+  @@map("simple_sft_qnas")
+  @@index([simple_train_id])
+  @@index([knowledge_id])
+
+  granular_knowledge GranularKnowledge? @relation(fields: [knowledge_id], references: [id])
+}
+
+
+model WikiArticle {
+  version    String
+  title      String
+  content    String
+  updated_at DateTime @updatedAt
+  created_at DateTime @default(now())
+
+  @@id([version, title]) // Compound Primary Key
+  @@map("wiki_articles")
+}

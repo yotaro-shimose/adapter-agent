@@ -4,6 +4,7 @@ from typing import Any
 from tinker_cookbook.renderers.base import Message as TinkerMessage
 from tinker_cookbook.rl.types import Trajectory
 
+from adapter_agent.hierarchical.agent.reflector import Reflection
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.library.knowledge_db import Knowledge
 from adapter_agent.rl.env.conclusion import SSConclusion
@@ -24,7 +25,8 @@ class RewireSessionResultNormal:
     conclusion: SSConclusion
     trajectory: Trajectory
     reward: float
-    knowledge: Knowledge | None = None
+    knowledges: list[Knowledge] = field(default_factory=list)
+    reflections: list[Reflection] = field(default_factory=list)
     reasoning: str | None = None
     citations: list[Citation] = field(default_factory=list)
 

@@ -64,3 +64,5 @@ class PipelineConfig:
     extra_eval_suites: dict[str, list[str]] = field(default_factory=dict)
     stop_grpo: bool = False
     ttl_seconds: int = 604800
+    max_fix_attempts: int = 3
+    sft_epochs: int = 1

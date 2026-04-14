@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import random
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from inspect import isawaitable
@@ -17,11 +17,13 @@ from adapter_agent.data import QRA
 from adapter_agent.rl.env.session_result import (
     RewireSessionResult,
     RewireSessionResultNormal,
-    RewireSessionResultSuccess,
     Citation,
 )
-from adapter_agent.hierarchical.types import Entity, Task
+from adapter_agent.hierarchical.types import Entity, Task, Knowledge
 from adapter_agent.util.exception import AllTasksCompleted
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -36,6 +38,7 @@ class TaskWithMeta:
     sft_conclusions: list[Attempt] = field(default_factory=list)
     knowledges: dict[str, NormalizedKnowledge] = field(default_factory=dict)
     citations: list[Citation] = field(default_factory=list)
+    knowledge_finalized_at: datetime | None = None
     PSEUDO_ROOT_ID: ClassVar[str] = "pseudo_root"
 
     def register_study_result(self, result: RewireSessionResult):
@@ -49,13 +52,10 @@ class TaskWithMeta:
         if isinstance(result, RewireSessionResultNormal):
             self.citations.extend(result.citations)
 
-        if isinstance(result, RewireSessionResultSuccess) and result.knowledge:
-            knowledge = NormalizedKnowledge(
-                task_id=self.item.id, 
-                knowledge=result.knowledge.content,
-                title=result.knowledge.title
-            )
-            self.knowledges[knowledge.id] = knowledge
+        if isinstance(result, RewireSessionResultNormal):
+            # We no longer populate knowledges immediately to support async distillation.
+            # Only citations and conclusions are recorded here.
+            pass
 
     def register_slicing_result(self, knowledge_id: str, slice: QRA | None):
         if slice is not None:
@@ -162,6 +162,7 @@ class GraphNodeMetadata(BaseModel):
     knowledge_content: str | None = None
     knowledge_title: str | None = None
     generated_knowledge_id: str | None = None
+    generated_knowledges: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class GraphExportNode(BaseModel):
@@ -175,6 +176,7 @@ class GraphExportEdge(BaseModel):
     id: str
     source: str
     target: str
+    type: str = "decomposition"
 
 
 class GraphExportData(BaseModel):
@@ -345,6 +347,30 @@ class TaskNetwork:
             else:
                 raise ValueError(f"Unknown task type: {type(completed)}")
 
+    async def mark_knowledge_ready(self, task_id: str, finalized_knowledges: list[Knowledge]):
+        """
+        Called by the KnowledgeStudier when distillation is complete.
+        Updates the task node with the finalized knowledge and marks it as ready for parents.
+        """
+        async with self._lock:
+            if task_id not in self.nodes:
+                logger.warning(f"Task {task_id} not found in nodes during mark_knowledge_ready")
+                return
+            
+            node = self.nodes[task_id]
+            node.knowledge_finalized_at = datetime.now()
+            
+            for k_item in finalized_knowledges:
+                knowledge = NormalizedKnowledge(
+                    id=k_item.id,
+                    task_id=task_id,
+                    knowledge=k_item.content,
+                    title=k_item.title,
+                )
+                node.knowledges[knowledge.id] = knowledge
+            
+            logger.info(f"Task {task_id} knowledge marked as ready. {len(finalized_knowledges)} items added.")
+
     def slicing_task_setup(self, slicing_task: SlicingTask):
         self.executing_slicing[slicing_task.knowledge.id] = (
             self.executing_slicing.get(slicing_task.knowledge.id, 0) + 1
@@ -407,10 +433,11 @@ class TaskNetwork:
         children = self.children_map.get(node_id, [])
         for child_id in children:
             child_node = self.nodes[child_id]
-            for attempt in child_node.sft_conclusions:
-                if attempt.result.is_successful():
-                    if latest_ts is None or attempt.timestamp > latest_ts:
-                        latest_ts = attempt.timestamp
+            # Use knowledge_finalized_at instead of result.is_successful()
+            # to ensure parents are only scheduled after knowledge is ready.
+            if child_node.knowledge_finalized_at:
+                if latest_ts is None or child_node.knowledge_finalized_at > latest_ts:
+                    latest_ts = child_node.knowledge_finalized_at
         return latest_ts
 
     def _should_prioritize_parent(self, node_id: str) -> bool:
@@ -459,23 +486,9 @@ class TaskNetwork:
         knowledges = []
         for child_id in self.children_map.get(node_id, []):
             child_node = self.nodes[child_id]
-            successful_attempts = [
-                attempt
-                for attempt in child_node.sft_conclusions
-                if isinstance(attempt.result, RewireSessionResultSuccess)
-            ]
-            if len(successful_attempts) > 0:
-                attempt = random.choice(successful_attempts)
-                assert isinstance(attempt.result, RewireSessionResultSuccess)
-                if attempt.result.knowledge:
-                    knowledges.append(attempt.result.knowledge.content)
-
-            for attempt in child_node.sft_conclusions:
-                if (
-                    isinstance(attempt.result, RewireSessionResultSuccess)
-                    and attempt.result.knowledge
-                ):
-                    knowledges.append(attempt.result.knowledge.content)
+            if child_node.knowledge_finalized_at:
+                for k in child_node.knowledges.values():
+                    knowledges.append(k.knowledge)
         return knowledges
 
     def to_pyvis(
@@ -568,9 +581,12 @@ class TaskNetwork:
                 if node_ids is None or (parent_id in node_ids and child_id in node_ids):
                     net.add_edge(parent_id, child_id)
         return net
-
     def to_dict(self):
         nodes_exported = []
+        edges_exported = []
+        exported_knowledge_ids = set()
+
+        # 1. Export Task Nodes
         for node in self.nodes.values():
             success_count = sum(
                 1 for c in node.sft_conclusions if c.result.is_successful()
@@ -594,12 +610,51 @@ class TaskNetwork:
             knowledge_content = None
             knowledge_title = None
             generated_knowledge_id = None
-            if node.is_sft_solved:
-                for k in node.knowledges.values():
+            generated_knowledges = []
+            for k in node.knowledges.values():
+                if knowledge_content is None:
                     knowledge_content = k.knowledge
                     knowledge_title = k.title
                     generated_knowledge_id = k.knowledge_id or k.id
-                    break
+                generated_knowledges.append({
+                    "id": k.knowledge_id or k.id,
+                    "title": k.title,
+                    "content": k.knowledge
+                })
+
+                # Export Knowledge node if not already exported
+                k_export_id = k.knowledge_id or k.id
+                if k_export_id not in exported_knowledge_ids:
+                    nodes_exported.append(
+                        GraphExportNode(
+                            id=k_export_id,
+                            label=k.title,
+                            type="knowledge",
+                            metadata=GraphNodeMetadata(
+                                instruction="",
+                                success_count=0,
+                                total_count=0,
+                                is_solved=True,
+                                is_executing=False,
+                                slice_count=len(k.slices),
+                                gen_count=0,
+                                knowledge_content=k.knowledge,
+                                knowledge_title=k.title,
+                                generator_task_id=node.item.id
+                            )
+                        )
+                    )
+                    exported_knowledge_ids.add(k_export_id)
+                
+                # Add generation edge
+                edges_exported.append(
+                    GraphExportEdge(
+                        id=f"{node.item.id}-{k_export_id}-gen",
+                        source=node.item.id,
+                        target=k_export_id,
+                        type="generation"
+                    )
+                )
 
             metadata = GraphNodeMetadata(
                 instruction=node.item.instruction,
@@ -622,6 +677,7 @@ class TaskNetwork:
                 knowledge_content=knowledge_content,
                 knowledge_title=knowledge_title,
                 generated_knowledge_id=generated_knowledge_id,
+                generated_knowledges=generated_knowledges,
             )
 
             nodes_exported.append(
@@ -633,7 +689,19 @@ class TaskNetwork:
                 )
             )
 
-        edges_exported = []
+            # Export Citation edges
+            for c in node.citations:
+                if c.knowledge_id:
+                    edges_exported.append(
+                        GraphExportEdge(
+                            id=f"{node.item.id}-{c.knowledge_id}-citation",
+                            source=node.item.id,
+                            target=c.knowledge_id,
+                            type="citation"
+                        )
+                    )
+
+        # 2. Export Decomposition Edges
         for parent_id, children in self.children_map.items():
             for child_id in children:
                 edges_exported.append(
@@ -641,6 +709,7 @@ class TaskNetwork:
                         id=f"{parent_id}-{child_id}",
                         source=parent_id,
                         target=child_id,
+                        type="decomposition"
                     )
                 )
 

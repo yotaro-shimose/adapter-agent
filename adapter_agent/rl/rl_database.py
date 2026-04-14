@@ -108,7 +108,7 @@ class RLDatabase:
         conclusion: str | None,
         reward: float | None,
         trajectory: List[TinkerMessage],
-        knowledge_id: str | None = None,
+        knowledge_ids: List[str] | None = None,
         final_knowledge: str | None = None,
         final_knowledge_title: str | None = None,
         citations: List[Dict[str, Any]] | None = None,
@@ -123,7 +123,7 @@ class RLDatabase:
                 data={
                     "experiment_name": self.experiment_name,
                     "task_id": task_id,
-                    "knowledge_id": knowledge_id,
+                    "knowledge_ids": knowledge_ids or [],
                     "instruction": instruction,
                     "conclusion": conclusion,
                     "reward": reward,
@@ -200,7 +200,7 @@ class RLDatabase:
                 results.append(
                     {
                         "task_id": t.task_id,
-                        "knowledge_id": t.knowledge_id,
+                        "knowledge_ids": t.knowledge_ids,
                         "messages": messages,
                         "usage_count": new_usage,
                     }

@@ -22,7 +22,6 @@ from adapter_agent.rl.config import EnvParams, ExperimentSettings, ModelLoadingS
 from adapter_agent.rl.env.conclusion import conclusion_to_metrics
 from adapter_agent.rl.env.session_result import (
     RewireSessionResultNormal,
-    RewireSessionResultSuccess,
 )
 from adapter_agent.rl.rl_database import RLDatabase
 from adapter_agent.rl.shared_sampling_client import SharedSamplingClient
@@ -261,25 +260,27 @@ class UniRLState:
 
         if result.reward > 0 or True:  # Save all trajectories for visualization SSOT
             # 1. Handle newly discovered knowledge (SSOT)
-            knowledge_id = None
-            if isinstance(result, RewireSessionResultSuccess) and result.knowledge:
+            knowledge_ids = []
+            for knowledge in result.knowledges:
                 # Save to Postgres first
-                knowledge_id = await self.db.create_knowledge(
-                    knowledge_id=result.knowledge.id,
+                k_id = await self.db.create_knowledge(
+                    knowledge_id=knowledge.id,
                     task_id=result.task.id,
                     instruction=result.task.instruction,
-                    title=result.knowledge.title,
-                    content=result.knowledge.content,
+                    title=knowledge.title,
+                    content=knowledge.content,
                 )
+                knowledge_ids.append(k_id)
                 # Then index in ES using the Postgres ID
                 await self.kdb.add_knowledge(
-                    knowledge=result.knowledge,
+                    knowledge=knowledge,
                     query=result.task.instruction,
                 )
                 # Also update in-memory TaskNetwork knowledge ID for visualization mapping
                 task_meta = self.study_task_queue.nodes[result.task.id]
                 for k in task_meta.knowledges.values():
-                    k.knowledge_id = knowledge_id
+                    if k.id == knowledge.id:
+                        k.knowledge_id = k_id
 
             # 2. Extract citations
             citations_data = [
@@ -299,10 +300,10 @@ class UniRLState:
                 conclusion=result.conclusion,
                 reward=result.reward,
                 trajectory=result.trials,
-                knowledge_id=knowledge_id,
-                final_knowledge=result.knowledge.content if result.knowledge else None,
-                final_knowledge_title=result.knowledge.title
-                if result.knowledge
+                knowledge_ids=knowledge_ids,
+                final_knowledge=result.knowledges[0].content if result.knowledges else None,
+                final_knowledge_title=result.knowledges[0].title
+                if result.knowledges
                 else None,
                 citations=citations_data,
             )

@@ -21,7 +21,7 @@ from typing_extensions import AsyncGenerator
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
-from adapter_agent.library.knowledge_db import KnowledgeDB
+from adapter_agent.library.wiki_manager import WikiManager
 from adapter_agent.rl.env.conclusion import SSConclusion
 from adapter_agent.rl.env.injection import _inject_tools_into_prompt
 from adapter_agent.rl.env.reward import LLMAsAJudgeSingleTurn
@@ -87,7 +87,7 @@ class SimplifiedSolverEnv(MessageEnv):
     initial_state: SimplifiedSolverEnvState
     rust_env: Runtime
     search_model: Any
-    knowledge_db: KnowledgeDB
+    wiki_manager: WikiManager
     rust_doc_analyzer: AsyncRustDocAnalyzer
     initial_messages: list[TinkerMessage]
     reward_fn: LLMAsAJudgeSingleTurn
@@ -96,11 +96,9 @@ class SimplifiedSolverEnv(MessageEnv):
 
     def __post_init__(self):
         self.search_tool = SearchTool(
-            self.search_model,
             self.rust_doc_analyzer,
-            self.knowledge_db,
+            self.wiki_manager,
             self.mutable_state,
-            blocked_knowledge_ids=self.initial_state.blocked_knowledge_ids,
         )
         self.tools = {}
 
@@ -150,7 +148,7 @@ class SimplifiedSolverEnv(MessageEnv):
 
                 # Detect if the agent tried to use multiple tool tags at once
                 all_tags = re.findall(
-                    r"<(search_library_doc|write_and_run|submit)>",
+                    r"<(wiki_ls|wiki_read|search_library_doc|write_and_run|submit)>",
                     text_content,
                     re.DOTALL,
                 )
@@ -217,6 +215,39 @@ class SimplifiedSolverEnv(MessageEnv):
                         conclusion="not_finished",
                     )
 
+                # Check for Wiki Exploration Tools
+                ls_match = re.search(r"<wiki_ls\s*/>", text_content)
+                if ls_match:
+                    titles = await self.wiki_manager.ls()
+                    title_list = "\n".join([f"- [[{t}]]" for t in titles]) if titles else "No articles found."
+                    content = (
+                        f"## Wiki Article List (Version: {self.wiki_manager.version})\n"
+                        f"{title_list}\n\n"
+                        f"[STATUS]\n"
+                        f"RemainingTurns: {self.mutable_state.remaining_turns}"
+                    )
+                    new_message = TinkerMessage(role="user", content=content)
+                    self.history.append(new_message)
+                    return SSStepResult(reward=0.0, episode_done=False, next_messages=self.history, conclusion="not_finished")
+
+                read_match = re.search(r"<wiki_read>(.*?)</wiki_read>", text_content, re.DOTALL)
+                if read_match:
+                    title = read_match.group(1).strip()
+                    article_content = await self.wiki_manager.read(title)
+                    if article_content:
+                        res_content = f"## Wiki Article: {title}\n\n{article_content}"
+                    else:
+                        res_content = f"Error: Article '{title}' not found."
+                    
+                    content = (
+                        f"{res_content}\n\n"
+                        f"[STATUS]\n"
+                        f"RemainingTurns: {self.mutable_state.remaining_turns}"
+                    )
+                    new_message = TinkerMessage(role="user", content=content)
+                    self.history.append(new_message)
+                    return SSStepResult(reward=0.0, episode_done=False, next_messages=self.history, conclusion="not_finished")
+
                 # Check for XML search tool
                 search_match = re.search(
                     r"<search_library_doc>(.*?)</search_library_doc>",
@@ -240,15 +271,6 @@ class SimplifiedSolverEnv(MessageEnv):
                     )
 
                     new_message = TinkerMessage(role="user", content=content)
-                    # Adding knowledge_id and content as dynamic attributes to track citations
-                    cast(dict[str, Any], new_message)["knowledge_id"] = ctx.knowledge_id
-                    cast(dict[str, Any], new_message)[
-                        "knowledge_title"
-                    ] = ctx.knowledge_title
-                    cast(dict[str, Any], new_message)[
-                        "knowledge_content"
-                    ] = ctx.final_answer
-
                     self.history.append(new_message)
 
                     if self.mutable_state.remaining_turns <= 0:
@@ -330,9 +352,11 @@ Note `{env_state.library_name}` is a new library you should be unfamilier with.
 
 <HowTo>
 You have a simplified coding environment with the following tools:
-- `search_library_doc`: Use `<search_library_doc>query</search_library_doc>` to search for functionality, concepts, or how-to guides.
+- `wiki_ls`: Use `<wiki_ls />` to list all available Wiki articles.
+- `wiki_read`: Use `<wiki_read>Article_Title</wiki_read>` to read specific knowledge.
+- `search_library_doc`: Use `<search_library_doc>query</search_library_doc>` to search official Rust documentation for specific API signatures or error details.
 
-IMPORTANT: You MUST ONLY use ONE tool tag (`<search_library_doc>`, `<write_and_run>`, or `<submit>`) in a single response. Do not combine multiple actions or mix searching with testing. 
+IMPORTANT: You MUST ONLY use ONE tool tag (`<wiki_ls />`, `<wiki_read>`, `<search_library_doc>`, `<write_and_run>`, or `<submit>`) in a single response. Do not combine multiple actions or mix searching with testing. 
 The system will only process the FIRST tag it detects if the response is valid, but using multiple tags is discouraged and may lead to errors.
 
 To TEST your code implementation without ending the task, simply output your Rust code inside plain XML tags like this (do NOT use JSON!):
@@ -349,7 +373,7 @@ Note: Outputting a `<submit> ... </submit>` block will IMMEDIATELY SUBMIT your a
 
 <ResourceManagement>
 At the end of every tool response, you will see a `[STATUS]` section:
-- `RemainingSearchQuota`: Number of `search_library_doc` calls you can still make. If this reaches 0, further `search_library_doc` calls will return an error and you MUST proceed with current information.
+- `RemainingSearchQuota`: Number of `search_library_doc` calls you can still make. Wiki exploration tools (`wiki_ls`, `wiki_read`) do NOT consume this quota.
 - `RemainingTurns`: Total number of actions (turns) remaining before the task is forced to end.
 </ResourceManagement>
 """
@@ -360,9 +384,9 @@ Self-contained: Note your solution has been fully self-contained including both 
 Testing Code: Before submitting the final answer, use the `<write_and_run>...</write_and_run>` tags to test code and see outputs. Avoid JSON syntax errors.
 One Action at a Time: You MUST only use one tool tag per turn. Response containing multiple tags (e.g. two searches or a search and a test) will be rejected.
 Code block inclusion: Your final answer MUST include exactly one `<submit>\\n<your_code_here>\\n</submit>` block. Its content will be pasted to main.rs and executed for final verification to END the task.
-Trust Internal Knowledge: Favor your internalized recollections (summarized in your initial thoughts) over repetitive searching. Use the `search_library_doc` tool only for details you don't already possess.
-Avoid Redundant Search: The number of `search_library_doc` calls is strictly limited. Avoid repeated or redundant queries for information already provided or recalled in your thoughts. Use `<search_library_doc>query</search_library_doc>` directly in your thoughts.
-Error Reflection: If `<write_and_run>` test fails, analyze the compiler error carefully. If you find your understanding is flawed, use the `search_library_doc` tool sparingly to fill specific gaps.
+Wiki Exploration: Always check the internal Wiki (`wiki_ls`, `wiki_read`) first for high-quality, project-specific knowledge.
+Documentation Fallback: Use `search_library_doc` only if the Wiki does not contain the necessary information. Note that this tool provides raw technical details from the crate's official documentation.
+Error Reflection: If `<write_and_run>` test fails, analyze the compiler error carefully. Check the Wiki or documentation for specific causes of the error code (e.g., E0308).
 """
     PROMPT += f"\n<Guidelines>\n{guidelines}\n</Guidelines>"
 
@@ -485,7 +509,7 @@ async def build_simplified_solver_env(
     rust_doc_analyzer: AsyncRustDocAnalyzer,
     runtime: Runtime,
     search_model: Any,
-    knowledge_db: KnowledgeDB,
+    wiki_manager: WikiManager,
     max_trajectory_tokens: int = 32 * 1024,
     max_turns: int = 10,
 ) -> AsyncGenerator[SimplifiedSolverTokenEnv, None]:
@@ -500,7 +524,7 @@ async def build_simplified_solver_env(
         initial_state=env_state,
         rust_env=runtime,
         search_model=search_model,
-        knowledge_db=knowledge_db,
+        wiki_manager=wiki_manager,
         rust_doc_analyzer=rust_doc_analyzer,
         initial_messages=get_simplified_solver_initial_messages(
             env_state=env_state,
