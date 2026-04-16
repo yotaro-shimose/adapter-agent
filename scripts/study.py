@@ -1,4 +1,3 @@
-import argparse
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime
@@ -10,7 +9,6 @@ from oai_utils.tinker import TinkerModel, setup_tinkermodel
 from prisma import Prisma
 
 from adapter_agent.hierarchical.agent.analyzer import Analyzer
-from adapter_agent.hierarchical.agent.rewirer import log_trajectory
 from adapter_agent.hierarchical.gh import load_gh_archive
 from adapter_agent.hierarchical.process.rewire import ss_solve_verify
 from adapter_agent.internalize.studier import KnowledgeStudier
@@ -84,7 +82,6 @@ class StudyActor:
 
         if isinstance(ret, RewireSessionResultNormal):
             print("Session completed with conclusion:", ret.conclusion)
-            log_trajectory(ret.trials, flip_tag=True)
 
             # Save trajectory immediately
             # Note: knowledge_ids is currently empty, will be updated by Studier later
@@ -136,34 +133,12 @@ class StudyActor:
 
 
 async def main():
-    # task = Task.from_instruction(
-    #     "Please implement a three layer neural network with ReLU activation function and 100 units in each layer. Only the forward path should be implemented."
-    # )
-    # task = Task.from_instruction(
-    #     instruction="Create a function which does 3d rotate operation of vectors around given point. The input should be N x 3 Array object and your function should return the array of the same shape but with rotated coordinates."
-    # )
-
-    # task = Task.from_instruction(
-    #     "Task 1: Write a function that applies a simple 3D rotation matrix to a single vector using `numrs2` library."
-    # )
-    # task = Task.from_instruction(
-    #     "Implement a function that multiplies two 3x3 matrices using the `numrs2` library. The function should take two 3x3 matrices as input and return their product."
-    # )
-
-    parser = argparse.ArgumentParser(description="Wiki-Integrated Learning Pipeline")
-    parser.add_argument("--version", type=str, default=None, help="Wiki version to use (defaults to experiment name)")
-    parser.add_argument(
-        "--reset", action="store_true", help="Reset the Wiki version before starting"
-    )
-    parser.add_argument(
-        "--workers", type=int, default=10, help="Number of concurrent workers"
-    )
-    args = parser.parse_args()
-
+    reset = True
+    num_workers = 20
     setup_base_loglevel()
 
     # Initialize RLDatabase for visualization
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     experiment_name = f"study_{timestamp}"
     rl_db = RLDatabase()
     await rl_db.connect()
@@ -184,10 +159,10 @@ async def main():
     # Initialize Prisma and WikiManager
     db = Prisma()
     await db.connect()
-    wiki_version = args.version or experiment_name
+    wiki_version = experiment_name
     wiki_manager = WikiManager(db, version=wiki_version)
 
-    if args.reset:
+    if reset:
         await wiki_manager.reset()
 
     # Note: KnowledgeDB is kept for metadata/experiment tracking if needed
@@ -197,24 +172,20 @@ async def main():
     verifier_model = get_gemini()
     tasks = load_gh_archive()
 
-    task_network = TaskNetwork(tasks_pool=tasks[:5])
+    task_network = TaskNetwork(tasks_pool=tasks[:10])
 
     # Initial graph sync to database
     await rl_db.update_graph_json(task_network.to_dict())
 
     json_path = Path("graphvis/public/data.json")
     launch_interval = 2
-    num_workers = args.workers
 
     # Initialize KnowledgeStudier
     studier = KnowledgeStudier(
         verifier_model=verifier_model,
         wiki_manager=wiki_manager,
         rl_db=rl_db,
-        runtime_settings=RuntimeSettings(
-            type="docker",
-            image_uri="coder-mcp-numrs2:latest",
-        ),
+        runtime_settings=RuntimeSettings.docker_numrs2(),
         task_network=task_network,
     )
     await studier.start()

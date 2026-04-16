@@ -48,6 +48,7 @@ async def ss_solve_verify(
     qwen_no_think: bool = False,
     internalized_knowledge: str | None = None,
     blocked_knowledge_ids: set[str] | None = None,
+    include_wiki: bool = True,
 ) -> RewireSessionResult:
     verifier = Verifier(model=verifier_model, rust_doc_analyzer=rust_doc_analyzer)
     ss_state = SimplifiedSolverEnvState.numrs2(
@@ -67,6 +68,7 @@ async def ss_solve_verify(
                 wiki_manager=wiki_manager,
                 max_turns=max_turns,
                 runtime=runtime,
+                include_wiki=include_wiki,
             ) as env:
                 # Use TokenEnv directly to handle prefilling
                 ob, stop = await env.initial_observation()

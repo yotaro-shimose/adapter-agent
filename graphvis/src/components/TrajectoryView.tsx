@@ -100,7 +100,7 @@ export const TrajectoryView: React.FC<TrajectoryViewProps> = ({
                       {turn.tool_calls.map((tc, idx) => (
                         <div key={idx} style={{ background: 'rgba(97, 218, 251, 0.1)', padding: '8px', borderRadius: '6px', border: '1px solid rgba(97, 218, 251, 0.2)' }}>
                           <div style={{ fontSize: '10px', color: '#61dafb', fontWeight: 'bold', marginBottom: '4px' }}>🛠 CALL: {tc.function?.name}</div>
-                          <pre style={{ margin: 0 }}>{typeof tc.function?.arguments === 'string' ? tc.function.arguments : JSON.stringify(tc.function?.arguments, null, 2)}</pre>
+                          <pre>{typeof tc.function?.arguments === 'string' ? tc.function.arguments : JSON.stringify(tc.function?.arguments, null, 2)}</pre>
                         </div>
                       ))}
                     </div>

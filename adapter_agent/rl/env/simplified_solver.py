@@ -2,7 +2,7 @@ import asyncio
 import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, Self, cast
+from typing import Any, Self
 
 import tinker
 from coder_mcp.runtime import (

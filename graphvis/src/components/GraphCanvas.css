@@ -46,7 +46,7 @@
   position: absolute;
   top: 20px;
   right: 25px;
-  width: 500px;
+  width: 750px;
   max-height: calc(100vh - 120px);
   background: rgba(20, 20, 20, 0.95);
   color: white;
@@ -66,10 +66,10 @@
 .detail-panel::-webkit-scrollbar-thumb { background: #555; border-radius: 3px; }
 .detail-panel::-webkit-scrollbar-thumb:hover { background: #777; }
 
-.markdown-content { text-align: left; }
+.markdown-content { text-align: left; word-break: break-word; overflow-wrap: break-word; }
 .markdown-content p { margin: 8px 0; }
 .markdown-content code { background: rgba(255,255,255,0.1); padding: 2px 4px; border-radius: 4px; font-family: monospace; }
-.markdown-content pre { background: rgba(0,0,0,0.3); padding: 12px; border-radius: 8px; overflow-x: auto; margin: 12px 0; border: 1px solid #444; font-size: 12px; }
+.markdown-content pre { background: rgba(0,0,0,0.3); padding: 12px; border-radius: 8px; overflow-x: auto; margin: 12px 0; border: 1px solid #444; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
 .markdown-content pre code { background: transparent; padding: 0; }
 .markdown-content ul, .markdown-content ol { padding-left: 20px; margin: 8px 0; }
 
@@ -86,6 +86,19 @@
   border: 1px solid #333;
   text-align: left;
   font-size: 13px;
+  word-break: break-word;
+  overflow-wrap: break-word;
+}
+
+.trajectory-card pre {
+  white-space: pre-wrap;
+  word-break: break-all;
+  background: rgba(0,0,0,0.2);
+  padding: 8px;
+  border-radius: 4px;
+  margin: 8px 0;
+  font-family: inherit;
+  font-size: 12px;
 }
 
 .trajectory-card.assistant { background: rgba(255, 255, 255, 0.03); }

@@ -108,14 +108,7 @@ class SearchTool(Tool):
         self.mutable_state.search_count += 1
         
         # In the new strategy, SearchTool focus strictly on Doc Fallback.
-        # However, we can also perform a quick keyword search on the Wiki for convenience.
-        wiki_hits = await self.wiki_manager.search(query, limit=3)
         wiki_part = ""
-        if wiki_hits:
-            wiki_part = "## Wiki Matches (Preliminary)\n"
-            for hit in wiki_hits:
-                wiki_part += f"- [[{hit['title']}]] (Use `<wiki_read>{hit['title']}</wiki_read>` for details)\n"
-            wiki_part += "\n---\n\n"
 
         # Official Doc Search
         doc_results = await self.analyzer.search(query, limit=5)
