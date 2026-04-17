@@ -7,19 +7,43 @@ requires-python = ">=3.12"
 dependencies = [
     "loguru>=0.7.3",
     "mcp>=1.25.0",
-    "openai>=1.0.0",
-    "openai-agents>=0.6.4",
     "peft>=0.18.1",
     "polars>=1.37.1",
     "python-dotenv>=1.0.0",
     "rich>=14.2.0",
-    "torch>=2.9.0",
-    "transformers>=4.57.3",
+    "transformers>=4.56.0",
     "trl>=0.26.2",
     "flash-attn",
     "vllm>=0.13.0",
-    "coder-mcp",
+    "litellm==1.81",
+    "openai>=2.14.0",
+    "chz>=0.4.0",
+    "tinker-cookbook",
     "oai-utils",
+    "wandb>=0.24.1",
+    "tinker>=0.9.0",
+    "seaborn>=0.13.2",
+    "weave>=0.52.28",
+    "more-itertools>=10.8.0",
+    "torch>=2.9.0",
+    "coder-mcp",
+    "ray[default]>=2.54.0",
+    "debugpy>=1.8.20",
+    "requests>=2.32.5",
+    "urllib3>=2.6.3",
+    "chardet~=5.0",
+    "pyvis>=0.3.2",
+    "networkx>=3.6.1",
+    "streamlit>=1.55.0",
+    "elasticsearch<9.0.0",
+    "fastapi>=0.135.2",
+    "uvicorn>=0.42.0",
+    "aiosqlite>=0.22.1",
+    "asyncpg>=0.29.0",
+    "prisma>=0.15.0",
+    "fastmcp>=3.2.3",
+    "openai-agents>=0.14.1",
+    "orjson>=3.11.8",
 ]
 
 [build-system]
@@ -32,14 +56,12 @@ no-build-isolation-package = ["flash-attn"]
 index-strategy = "unsafe-best-match"
 
 [tool.uv.sources]
-coder-mcp = { path = "../coder-mcp" }
-oai-utils = { path = "../oai_utils", editable = true }
-torch = [
-    { index = "pytorch-cu130" }
-]
 vllm = [
     { index = "vllm-cu130" }
 ]
+tinker-cookbook = { git = "https://github.com/thinking-machines-lab/tinker-cookbook" }
+oai-utils = { path = "../oai_utils", editable = true }
+coder-mcp = { path = "../coder-mcp", editable = true }
 [project.optional-dependencies]
 test = [
     "pytest>=8.0.0",
@@ -51,7 +73,9 @@ test = [
 [[tool.uv.index]]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
+explicit = true
 
 [[tool.uv.index]]
 name = "vllm-cu130"
 url = "https://wheels.vllm.ai/0.13.0/cu130"
+explicit = true

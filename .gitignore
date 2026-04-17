@@ -23,3 +23,8 @@ training_logs
 .pytest_cache
 repositories
 .sccache
+logs
+experiments
+.vscode
+temp
+.cache

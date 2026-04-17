@@ -1,0 +1,157 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider             = "prisma-client-py"
+  recursive_type_depth = -1
+}
+
+model Experiment {
+  experiment_name String       @id
+  graph_json      Json?        @default("{}")
+  created_at      DateTime     @default(now())
+  trajectories    Trajectory[]
+  knowledges      Knowledge[]
+
+  @@map("experiments")
+}
+
+model Trajectory {
+  id                    Int        @id @default(autoincrement())
+  experiment            Experiment @relation(fields: [experiment_name], references: [experiment_name], onDelete: Cascade)
+  experiment_name       String
+  task_id               String
+  knowledge_ids         String[]   @default([])
+  instruction          String?
+  conclusion           String?
+  reward               Float?
+  trials_json          Json?
+  final_knowledge      String?
+  final_knowledge_title String?
+  is_sft_candidate     Boolean    @default(false)
+  usage_count          Int        @default(0)
+  last_used_at         DateTime   @default(now())
+  created_at           DateTime   @default(now())
+  citations            Citation[]
+
+  @@map("trajectories")
+  @@index([task_id])
+  @@index([experiment_name])
+}
+
+model Knowledge {
+  id            String       @id // Changed from Int to String for UUID
+  experiment    Experiment   @relation(fields: [experiment_name], references: [experiment_name], onDelete: Cascade)
+  experiment_name String
+  task_id       String
+  instruction   String
+  title         String
+  content       String
+  created_at    DateTime     @default(now())
+  citations     Citation[]   @relation("KnowledgeToCitation")
+
+  @@map("knowledge_base")
+  @@index([experiment_name])
+}
+
+model Citation {
+  id             Int        @id @default(autoincrement())
+  trajectory     Trajectory @relation(fields: [trajectory_id], references: [id], onDelete: Cascade)
+  trajectory_id  Int
+  knowledge_id   String     // Changed from Int? to String and made it required
+  knowledge      Knowledge  @relation("KnowledgeToCitation", fields: [knowledge_id], references: [id])
+  content        String?
+  title          String?
+  turn_index     Int        @default(0)
+  created_at     DateTime   @default(now())
+
+  @@map("citations")
+}
+
+model SimpleTrainRun {
+  id              String   @id // simple_train_id
+  created_at      DateTime @default(now())
+  trajectories    SimpleTrajectory[]
+  sft_qnas        SimpleSftQna[]
+
+  @@map("simple_train_runs")
+  granular_knowledges GranularKnowledge[]
+}
+
+model GranularKnowledge {
+  id              String   @id @default(uuid())
+  simple_train_id String
+  simple_train    SimpleTrainRun @relation(fields: [simple_train_id], references: [id], onDelete: Cascade)
+  
+  title           String
+  content         String
+  
+  created_at      DateTime @default(now())
+  
+  sft_qnas        SimpleSftQna[]
+  trajectories    SimpleTrajectory[]
+
+  @@map("granular_knowledges")
+  @@index([simple_train_id])
+}
+
+model SimpleTrajectory {
+  id              Int      @id @default(autoincrement())
+  simple_train_id String
+  simple_train    SimpleTrainRun @relation(fields: [simple_train_id], references: [id], onDelete: Cascade)
+  
+  knowledge_id    String
+  knowledge_title String
+  
+  step            Int
+  question        String
+  reasoning       String
+  answer          String
+  success         Boolean
+  
+  execution_output    String?
+  verification_output String?
+  
+  created_at      DateTime @default(now())
+  
+  @@map("simple_trajectories")
+  @@index([simple_train_id])
+  @@index([knowledge_id])
+
+  granular_knowledge GranularKnowledge? @relation(fields: [knowledge_id], references: [id])
+}
+
+model SimpleSftQna {
+  id              Int      @id @default(autoincrement())
+  simple_train_id String
+  simple_train    SimpleTrainRun @relation(fields: [simple_train_id], references: [id], onDelete: Cascade)
+  
+  knowledge_id    String
+  knowledge_title String
+  
+  question        String
+  reasoning       String
+  answer          String
+  
+  created_at      DateTime @default(now())
+  
+  @@map("simple_sft_qnas")
+  @@index([simple_train_id])
+  @@index([knowledge_id])
+
+  granular_knowledge GranularKnowledge? @relation(fields: [knowledge_id], references: [id])
+}
+
+
+model WikiArticle {
+  version    String
+  title      String
+  content    String
+  updated_at DateTime @updatedAt
+  created_at DateTime @default(now())
+
+  @@id([version, title]) // Compound Primary Key
+  @@map("wiki_articles")
+}

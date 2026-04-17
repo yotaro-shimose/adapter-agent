@@ -1,0 +1,143 @@
+from datetime import datetime
+from pathlib import Path
+from typing import Self
+
+import tinker
+from pydantic import BaseModel
+from tinker.types.loss_fn_type import LossFnType
+
+from adapter_agent.data import QASFTDataset, TinkerMessagesDataset
+from adapter_agent.hierarchical.gh import Library
+from adapter_agent.rl.advantage import AdvantageRegularizer
+from adapter_agent.rl.env.runtime_settings import RuntimeSettings
+
+
+class OptimizerParams(BaseModel):
+    adam_params: tinker.AdamParams
+    loss_fn: LossFnType
+    advantage_regularizer: AdvantageRegularizer = "group_std"
+    num_steps: int
+    kl_penalty_coef: float
+    kl_discount_factor: float
+    num_groups_per_batch: int = 2
+
+
+class SFTOptimizerParams(BaseModel):
+    adam_params: tinker.AdamParams
+    batch_size: int
+    num_epochs: int
+
+
+class RewireSFTOptimizerParams(BaseModel):
+    adam_params: tinker.AdamParams
+    batch_size: int
+    num_epochs: int
+    update_freq: int  # Updates every `update_freq` samples
+
+
+class RolloutParams(BaseModel):
+    num_rollout_workers: int
+    rollouts_per_question: int
+    per_group_concurrency: int
+    temperature: float = 0.7
+
+
+class EnvParams(BaseModel):
+    max_turns: int
+    library: Library
+    dataset_path: Path
+    runtime_settings: RuntimeSettings
+    qwen_no_think: bool
+
+    @classmethod
+    def numrs2(
+        cls,
+        max_turns: int,
+        dataset_path: Path,
+        runtime_settings: RuntimeSettings | None = None,
+        qwen_no_think: bool = True,
+    ) -> Self:
+        if runtime_settings is None:
+            runtime_settings = RuntimeSettings(
+                type="docker",
+                image_uri="coder-mcp-numrs2:latest",
+            )
+        return cls(
+            max_turns=max_turns,
+            library=Library(name="numrs2", local_path=Path("repositories/numrs")),
+            dataset_path=dataset_path,
+            runtime_settings=runtime_settings,
+            qwen_no_think=qwen_no_think,
+        )
+
+
+class ExperimentSettings(BaseModel):
+    experiment_name: str
+    wandb_project: str | None
+    ttl_seconds: int = 604800  # 7 days
+
+    def log_root(self) -> Path:
+        return Path("logs") / "Adapter_Agent" / self.experiment_name
+
+    @classmethod
+    def with_prefix(cls, prefix: str) -> Self:
+        return cls(
+            experiment_name=f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            wandb_project=prefix,
+        )
+
+
+class ModelLoadingSettings(BaseModel):
+    model_name: str
+    resume_trainer_path: str | None = None
+    resume_sampler_path: str | None = None
+    lora_rank: int = 32
+
+
+class RLConfig(BaseModel):
+    experiment_setting: ExperimentSettings
+    optimizer_params: OptimizerParams
+    rollout_params: RolloutParams
+    env_params: EnvParams
+    model_loading_settings: ModelLoadingSettings
+
+
+class SFTConfig(BaseModel):
+    experiment_setting: ExperimentSettings
+    optimizer_params: SFTOptimizerParams
+    rollout_params: RolloutParams
+    env_params: EnvParams
+    model_loading_settings: ModelLoadingSettings
+
+
+class QADataConfig(BaseModel):
+    data_path: Path
+    train_ratio: float
+    test_ratio: float
+
+    def train_test_split(self, seed: int) -> tuple[QASFTDataset, QASFTDataset]:
+        ds = QASFTDataset.load(self.data_path)
+        train, test = ds.train_test_split(self.train_ratio, seed=seed)
+        return train, test
+
+
+class TrajectorySFTDataConfig(BaseModel):
+    data_path: Path
+    train_ratio: float
+    test_ratio: float
+
+    def train_test_split(
+        self, seed: int = 42
+    ) -> tuple[TinkerMessagesDataset, TinkerMessagesDataset]:
+        ds = TinkerMessagesDataset.load(self.data_path)
+        uniqued = ds.id_unique()
+        train, test = uniqued.train_test_split(self.train_ratio, seed=seed)
+        return train, test
+
+
+class RewireSFTConfig(BaseModel):
+    experiment_setting: ExperimentSettings
+    optimizer_params: RewireSFTOptimizerParams
+    rollout_params: RolloutParams
+    env_params: EnvParams
+    model_loading_settings: ModelLoadingSettings

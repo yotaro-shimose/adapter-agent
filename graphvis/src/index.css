@@ -1,0 +1,23 @@
+body {
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background-color: #000;
+}
+
+#root {
+  width: 100vw;
+  height: 100vh;
+}
+
+.markdown-body pre {
+  background: #0d1117;
+  padding: 16px;
+  border-radius: 8px;
+  overflow: auto;
+  border: 1px solid #30363d;
+}
+.markdown-body code {
+  font-family: source-code-pro, Menlo, Monaco, Consolas, "Courier New", monospace;
+  font-size: 0.9em;
+}
