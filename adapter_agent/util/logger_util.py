@@ -1,5 +1,6 @@
 import logging
 import os
+import warnings
 
 
 class TruncatingLogFilter(logging.Filter):
@@ -66,6 +67,7 @@ def setup_base_loglevel():
     logging.getLogger("elastic_transport.transport").setLevel(logging.WARNING)
     logging.getLogger("adapter_agent.hierarchical.process.rewire").setLevel(logging.WARNING)
     os.environ["WEAVE_LOG_LEVEL"] = "ERROR"
+    warnings.filterwarnings("ignore", message=".*PydanticSerializationUnexpectedValue.*")
 
     # Suppress the specific extension warning from tinker_cookbook
     SuppressExtensionWarning.suppress_trainonwhat_warning()

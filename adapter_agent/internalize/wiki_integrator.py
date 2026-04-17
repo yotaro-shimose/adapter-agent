@@ -114,9 +114,12 @@ class WikiIntegrator:
                 "2. **Verify**: If the insight involves code patterns or APIs, Use `run_cargo` to verify the code works as expected. You can iteratively use the tool to test different code snippets. Edit wiki only if your code is verified.\n"
                 "3. **Synthesize**: \n"
                 "   - If it's a perfect match or minor improvement to an atomic topic, use `str_replace` to update existing articles.\n"
-                "   - If it's a new sub-topic or requires splitting an existing note, create new articles with `write_file` using hierarchical paths and link them in 'MOC.md'.\n"
-                "   - ALWAYS ensure 'MOC.md' is up to date if you create a new file.\n"
-                "4. **Finish**: Once you have integrated the knowledge, you MUST call the `finish` tool to conclude.\n"
+                "   - If it's a new sub-topic or requires splitting an existing note, create new articles with `write_file` using hierarchical paths.\n"
+                "   - **MOC Maintenance**: You MUST keep 'MOC.md' (Map of Content) up to date whenever you create or update knowledge. For each link in 'MOC.md', do not just provide the title. You MUST include:\n"
+                "     a) A concise summary of the knowledge provided by the article.\n"
+                "     b) Usage Guidelines: Clearly state in what situations or for what types of problems an agent should refer to this article.\n"
+                "   - This applies to both newly created articles and existing articles whose content you have significantly improved.\n"
+                "4. **Finish**: Once you have integrated the knowledge and ensured the MOC is appropriately descriptive, you MUST call the `finish` tool to conclude.\n"
             ),
             model=self.model,
             model_settings=ModelSettings(

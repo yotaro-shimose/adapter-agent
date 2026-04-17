@@ -34,7 +34,7 @@ vis:
     @echo "Generating Prisma Client..."
     uv run prisma generate --schema=schema.prisma
     @echo "Starting visualization backend (8000) and frontend (5173)..."
-    npx -y concurrently -n "backend,frontend" -c "blue,green" "uv run scripts/vis_server.py" "cd graphvis && npm run dev"
+    npx -y concurrently -n "backend,frontend" -c "blue,green" "uv run scripts/vis_server.py" "cd graphvis && npm run dev -- --host 127.0.0.1"
 
 # View combined infrastructure logs (Postgres, ES)
 logs:

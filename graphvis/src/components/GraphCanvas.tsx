@@ -117,7 +117,37 @@ export const GraphCanvasComponent: React.FC = () => {
         ref={fgRef}
         graphData={displayData || { nodes: [], links: [] }}
         onNodeClick={(node) => handleNodeSelect(node as CustomNode)}
-        nodeLabel="name"
+        nodeLabel={(node) => {
+          const n = node as CustomNode;
+          const label = getNodeLabel(n);
+          return `
+            <div style="
+              background: rgba(15, 15, 20, 0.95);
+              border: 1px solid rgba(255, 255, 255, 0.15);
+              border-radius: 10px;
+              padding: 12px 16px;
+              max-width: 480px;
+              color: #fff;
+              font-family: inherit;
+              box-shadow: 0 10px 30px rgba(0,0,0,0.6);
+              backdrop-filter: blur(10px);
+            ">
+              <div style="font-weight: 800; color: ${n.type === 'knowledge' ? COLORS.KNOWLEDGE_NODE : COLORS.PRIMARY_ACCENT}; margin-bottom: 6px; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; opacity: 0.8;">
+                ${n.type === 'knowledge' ? '📚 Verified Knowledge' : '⚡ Task Instruction'}
+              </div>
+              <div style="font-size: 14px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; font-weight: 400; color: #eee;">
+                ${label}
+              </div>
+              <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.1); font-size: 11px; color: #888; display: flex; justify-content: space-between; align-items: center;">
+                <div style="display: flex; gap: 10px;">
+                  <span>Success: <b style="color: #fff">${n.metadata.success_count}/${n.metadata.total_count}</b></span>
+                  ${n.type === 'task' && n.metadata.gen_count > 0 ? `<span>Generated: <b style="color: #fff">${n.metadata.gen_count}</b></span>` : ''}
+                </div>
+                <span style="font-family: monospace; opacity: 0.6;">${n.id}</span>
+              </div>
+            </div>
+          `;
+        }}
         nodeCanvasObject={(node, ctx, globalScale) => {
           const n = node as CustomNode;
           const m = n.metadata;

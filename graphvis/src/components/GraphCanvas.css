@@ -115,6 +115,15 @@
   animation: spin 1s ease-in-out infinite;
 }
 
+
+.graph-tooltip {
+  background: transparent !important;
+  border: none !important;
+  padding: 0 !important;
+  box-shadow: none !important;
+}
+
 @keyframes spin {
   to { transform: rotate(360deg); }
 }
+

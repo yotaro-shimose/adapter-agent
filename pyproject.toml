@@ -42,6 +42,8 @@ dependencies = [
     "asyncpg>=0.29.0",
     "prisma>=0.15.0",
     "fastmcp>=3.2.3",
+    "openai-agents>=0.14.1",
+    "orjson>=3.11.8",
 ]
 
 [build-system]

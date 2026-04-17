@@ -17,6 +17,7 @@ type SSConclusion = Literal[
     "multiple_tool_tags",
     "knowledge_normalization_failed",
     "redundant",
+    "quota_exceeded",
 ]
 
 
@@ -36,6 +37,7 @@ class SSMetrics(TypedDict):
     multiple_tool_tags: float
     knowledge_normalization_failed: float
     redundant: float
+    quota_exceeded: float
 
 
 def conclusion_to_metrics(conclusion: SSConclusion) -> dict[str, float]:
@@ -61,6 +63,7 @@ def conclusion_to_metrics(conclusion: SSConclusion) -> dict[str, float]:
             if conclusion == "knowledge_normalization_failed"
             else 0.0,
             redundant=1.0 if conclusion == "redundant" else 0.0,
+            quota_exceeded=1.0 if conclusion == "quota_exceeded" else 0.0,
         ),
     )
 
