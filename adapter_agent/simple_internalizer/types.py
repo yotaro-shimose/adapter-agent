@@ -66,3 +66,4 @@ class PipelineConfig:
     ttl_seconds: int = 604800
     max_fix_attempts: int = 3
     sft_epochs: int = 1
+    cpt: bool = False

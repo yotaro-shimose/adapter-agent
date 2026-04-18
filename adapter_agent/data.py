@@ -4,8 +4,8 @@ from typing import Self
 import polars as pl
 from datasets import Dataset
 from pydantic import BaseModel, Field
-from tinker_cookbook.renderers.base import Message as TinkerMessage
 from tinker_cookbook.renderers.base import (
+    Message,
     Role,
     TextPart,
     ThinkingPart,
@@ -15,6 +15,8 @@ from tinker_cookbook.renderers.base import (
 
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.savable import Savable
+
+TinkerMessage = Message
 
 
 class QA(BaseModel):

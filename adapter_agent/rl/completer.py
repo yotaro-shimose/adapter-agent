@@ -1,7 +1,9 @@
 from dataclasses import dataclass
-from typing import cast
+from typing import Self, cast
 
 import tinker
+from agents.extensions.models.litellm_model import LitellmModel
+from litellm import acompletion
 from tinker_cookbook import renderers
 from tinker_cookbook.completers import (
     MessageCompleter,
@@ -10,6 +12,7 @@ from tinker_cookbook.completers import (
     TokensWithLogprobs,
 )
 
+from adapter_agent.data import TinkerMessage
 from adapter_agent.util.exception import MaximumContextExceeded
 
 
@@ -107,6 +110,87 @@ class TinkerMessageCompleter(MessageCompleter):
         parsed_message_with_logprobs["tokens_with_logprobs"] = TokensWithLogprobs(
             tokens=response.sequences[0].tokens,
             maybe_logprobs=response.sequences[0].logprobs,
+        )
+
+        return parsed_message_with_logprobs
+
+
+class LiteLLMMessageCompleter(MessageCompleter):
+    """A custom completer that uses Litellm to generate responses, maintaining a similar interface."""
+
+    def __init__(
+        self,
+        model_name: str,
+        api_key: str | None,
+        max_tokens: int | None,
+        temperature: float = 1.0,
+        stop_condition: StopCondition | None = None,
+    ):
+        self.model_name = model_name
+        self.api_key = api_key
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.stop_condition = stop_condition
+
+    @classmethod
+    def from_litellm_model(
+        cls,
+        model: LitellmModel,
+        max_tokens: int | None = None,
+        temperature: float = 1.0,
+        stop_condition: StopCondition | None = None,
+    ) -> Self:
+        return cls(
+            model_name=model.model,
+            api_key=model.api_key,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stop_condition=stop_condition,
+        )
+
+    async def __call__(self, messages: list[TinkerMessage]) -> MessageWithLogprobs:
+        litellm_messages = []
+        for msg in messages:
+            content = msg["content"]
+            if isinstance(content, list):
+                content = "".join(
+                    [part["text"] for part in content if part["type"] == "text"]
+                )
+            litellm_messages.append(
+                {"role": msg.get("role", "user"), "content": content}
+            )
+
+        try:
+            response = await acompletion(  # type: ignore
+                model=self.model_name,
+                api_key=self.api_key,
+                messages=litellm_messages,
+                max_tokens=self.max_tokens,
+                temperature=self.temperature,
+                stop=list(self.stop_condition) if self.stop_condition else None,
+            )
+        except Exception as e:
+            err_msg = str(e).lower()
+            if (
+                "context length" in err_msg
+                or "context window" in err_msg
+                or (
+                    hasattr(e, "status_code")
+                    and getattr(e, "status_code") == 400
+                    and "exceed" in err_msg
+                )
+            ):
+                raise MaximumContextExceeded(str(e)) from e
+            raise
+
+        text_response = response.choices[0].message.content or ""
+
+        parsed_message_with_logprobs = cast(
+            MessageWithLogprobs, {"role": "assistant", "content": text_response}
+        )
+        parsed_message_with_logprobs["tokens_with_logprobs"] = TokensWithLogprobs(
+            tokens=[],
+            maybe_logprobs=None,
         )
 
         return parsed_message_with_logprobs

@@ -30,18 +30,17 @@ class LLMAsAJudgeMetrics(TypedDict):
 
 @dataclass
 class LLMAsAJudge:
-    rust_env: Runtime
     verifier: Verifier
     tree_structure: str
     task: Task
 
     async def __call__(
-        self, history: list[TinkerMessage]
+        self, history: list[TinkerMessage], runtime: Runtime
     ) -> tuple[float, dict[str, float]]:
         if len(history) == 0:
             raise ValueError("History for LLMAsAJudge cannot be empty")
         try:
-            execution_output, success = await self.rust_env.run_cargo()
+            execution_output, success = await runtime.run_cargo()
         except CoderMCPRuntimeError as e:
             raise CodingEnvironmentError(
                 f"Environment error during run_cargo: {e}"
@@ -93,7 +92,7 @@ class LLMAsAJudge:
                 verifier_error=0.0,
             )
         try:
-            content = await self.rust_env.view_file("src/main.rs")
+            content = await runtime.view_file("src/main.rs")
         except CoderMCPRuntimeError as e:
             raise CodingEnvironmentError(
                 f"Environment error during view_file: {e}"
@@ -140,18 +139,17 @@ class LLMAsAJudge:
 
 @dataclass
 class LLMAsAJudgeSingleTurn:
-    rust_env: Runtime
     verifier: Verifier
     tree_structure: str
     task: Task
 
     async def __call__(
-        self, history: list[TinkerMessage]
+        self, history: list[TinkerMessage], runtime: Runtime
     ) -> tuple[float, SSConclusion, str]:
         if len(history) == 0:
             raise ValueError("History for LLMAsAJudge cannot be empty")
         try:
-            execution_output, success = await self.rust_env.run_cargo()
+            execution_output, success = await runtime.run_cargo()
         except CoderMCPRuntimeError as e:
             raise CodingEnvironmentError(
                 f"Environment error during run_cargo: {e}"
@@ -159,7 +157,7 @@ class LLMAsAJudgeSingleTurn:
         if not success:
             return 0.0, "code_did_not_compile", execution_output
         try:
-            content = await self.rust_env.view_file("src/main.rs")
+            content = await runtime.view_file("src/main.rs")
         except CoderMCPRuntimeError as e:
             raise CodingEnvironmentError(
                 f"Environment error during view_file: {e}"
@@ -174,8 +172,7 @@ class LLMAsAJudgeSingleTurn:
             answer = "\n".join(
                 part["text"]
                 for part in last_assistant_message["content"]
-                if part["type"] == "text"
-                and "text" in part
+                if part["type"] == "text" and "text" in part
             )
         try:
             verification_result = await self.verifier.verify(

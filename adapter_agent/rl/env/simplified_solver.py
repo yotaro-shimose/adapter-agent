@@ -1,22 +1,15 @@
 import asyncio
 import re
-from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Self
 
-import tinker
-from coder_mcp.runtime import (
-    CoderMCPRuntimeError,
-    Runtime,
-)
-from tinker_cookbook.completers import StopCondition
+from coder_mcp.runtime import CoderMCPRuntimeError
 from tinker_cookbook.renderers import Renderer
 from tinker_cookbook.renderers.base import Message as TinkerMessage
-from tinker_cookbook.renderers.base import TextPart, ToolCall, ToolSpec
+from tinker_cookbook.renderers.base import ToolCall, ToolSpec
 from tinker_cookbook.rl import types
 from tinker_cookbook.rl.message_env import MessageEnv, MessageStepResult
 from tinker_cookbook.tool_use.tools import handle_tool_call
-from typing_extensions import AsyncGenerator
 
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.types import Task
@@ -25,6 +18,7 @@ from adapter_agent.library.wiki_manager import WikiManager
 from adapter_agent.rl.env.conclusion import SSConclusion
 from adapter_agent.rl.env.injection import _inject_tools_into_prompt
 from adapter_agent.rl.env.reward import LLMAsAJudgeSingleTurn
+from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.rl.env.search_tool import SearchTool, SimplifiedSolverMutableState
 from adapter_agent.util.exception import CodingEnvironmentError
 
@@ -89,7 +83,7 @@ class SSTokenEnvResult(types.StepResult):
 @dataclass
 class SimplifiedSolverEnv(MessageEnv):
     initial_state: SimplifiedSolverEnvState
-    rust_env: Runtime
+    runtime_settings: RuntimeSettings
     search_model: Any
     wiki_manager: WikiManager
     rust_doc_analyzer: AsyncRustDocAnalyzer
@@ -157,10 +151,18 @@ class SimplifiedSolverEnv(MessageEnv):
                     re.DOTALL,
                 )
                 unique_tags = set(all_tags)
-                is_valid_multi_read = len(unique_tags) == 1 and "wiki_read" in unique_tags and len(all_tags) <= 5
-                
+                is_valid_multi_read = (
+                    len(unique_tags) == 1
+                    and "wiki_read" in unique_tags
+                    and len(all_tags) <= 5
+                )
+
                 if len(all_tags) > 1 and not is_valid_multi_read:
-                    if len(unique_tags) == 1 and "wiki_read" in unique_tags and len(all_tags) > 5:
+                    if (
+                        len(unique_tags) == 1
+                        and "wiki_read" in unique_tags
+                        and len(all_tags) > 5
+                    ):
                         error_content = (
                             f"[SYSTEM ERROR] TOO_MANY_WIKI_READ_TAGS\n"
                             f"You attempted to use {len(all_tags)} <wiki_read> tags in a single response.\n"
@@ -199,13 +201,15 @@ class SimplifiedSolverEnv(MessageEnv):
                 )
                 if write_match:
                     code_to_test = write_match.group(1).strip()
-                    await self.rust_env.set_content("src/main.rs", code_to_test)
+                    async with self.runtime_settings.build_runtime() as runtime:
+                        await runtime.set_content("src/main.rs", code_to_test)
+                        run_ret, run_success = await runtime.run_cargo()
 
-                    run_ret, run_success = await self.rust_env.run_cargo()
-                    
                     search_limit = self.mutable_state.total_turns // 2
-                    remaining_search_quota = max(0, search_limit - self.mutable_state.search_count)
-                    
+                    remaining_search_quota = max(
+                        0, search_limit - self.mutable_state.search_count
+                    )
+
                     content = (
                         f"<FileWritten>\nsrc/main.rs has been updated.\n</FileWritten>\n"
                         f"<CargoRunResult>\n{run_ret}\n</CargoRunResult>\n\n"
@@ -235,7 +239,11 @@ class SimplifiedSolverEnv(MessageEnv):
                 ls_match = re.search(r"<wiki_ls\s*/>", text_content)
                 if ls_match:
                     titles = await self.wiki_manager.ls()
-                    title_list = "\n".join([f"- [[{t}]]" for t in titles]) if titles else "No articles found."
+                    title_list = (
+                        "\n".join([f"- [[{t}]]" for t in titles])
+                        if titles
+                        else "No articles found."
+                    )
                     content = (
                         f"## Wiki Article List (Version: {self.wiki_manager.version})\n"
                         f"{title_list}\n\n"
@@ -244,9 +252,16 @@ class SimplifiedSolverEnv(MessageEnv):
                     )
                     new_message = TinkerMessage(role="user", content=content)
                     self.history.append(new_message)
-                    return SSStepResult(reward=0.0, episode_done=False, next_messages=self.history, conclusion="not_finished")
+                    return SSStepResult(
+                        reward=0.0,
+                        episode_done=False,
+                        next_messages=self.history,
+                        conclusion="not_finished",
+                    )
 
-                read_matches = re.findall(r"<wiki_read>(.*?)</wiki_read>", text_content, re.DOTALL)
+                read_matches = re.findall(
+                    r"<wiki_read>(.*?)</wiki_read>", text_content, re.DOTALL
+                )
                 if read_matches:
                     search_limit = self.mutable_state.total_turns // 2
                     if self.mutable_state.search_count >= search_limit:
@@ -258,10 +273,15 @@ class SimplifiedSolverEnv(MessageEnv):
                         )
                         new_message = TinkerMessage(role="user", content=content)
                         self.history.append(new_message)
-                        return SSStepResult(reward=0.0, episode_done=False, next_messages=self.history, conclusion="quota_exceeded")
+                        return SSStepResult(
+                            reward=0.0,
+                            episode_done=False,
+                            next_messages=self.history,
+                            conclusion="quota_exceeded",
+                        )
 
                     self.mutable_state.search_count += 1
-                    
+
                     titles = [m.strip() for m in read_matches]
                     fetch_tasks = [self.wiki_manager.read(t) for t in titles]
                     results = await asyncio.gather(*fetch_tasks)
@@ -269,15 +289,19 @@ class SimplifiedSolverEnv(MessageEnv):
                     res_parts = []
                     for title, article_content in zip(titles, results):
                         if article_content:
-                            res_parts.append(f"## Wiki Article: {title}\n\n{article_content}")
+                            res_parts.append(
+                                f"## Wiki Article: {title}\n\n{article_content}"
+                            )
                         else:
                             res_parts.append(f"Error: Article '{title}' not found.")
-                    
+
                     combined_res = "\n\n---\n\n".join(res_parts)
-                    
+
                     search_limit = self.mutable_state.total_turns // 2
-                    remaining_search_quota = max(0, search_limit - self.mutable_state.search_count)
-                    
+                    remaining_search_quota = max(
+                        0, search_limit - self.mutable_state.search_count
+                    )
+
                     content = (
                         f"{combined_res}\n\n"
                         f"[STATUS]\n"
@@ -286,7 +310,12 @@ class SimplifiedSolverEnv(MessageEnv):
                     )
                     new_message = TinkerMessage(role="user", content=content)
                     self.history.append(new_message)
-                    return SSStepResult(reward=0.0, episode_done=False, next_messages=self.history, conclusion="not_finished")
+                    return SSStepResult(
+                        reward=0.0,
+                        episode_done=False,
+                        next_messages=self.history,
+                        conclusion="not_finished",
+                    )
 
                 # Check for XML search tool
                 search_match = re.search(
@@ -353,9 +382,11 @@ class SimplifiedSolverEnv(MessageEnv):
                     )
 
                 code = submit_match.group(1).strip()
-                await self.rust_env.set_content("src/main.rs", code)
-
-                reward, conclusion, final_obs = await self.reward_fn(self.history)
+                async with self.runtime_settings.build_runtime() as runtime:
+                    await runtime.set_content("src/main.rs", code)
+                    reward, conclusion, final_obs = await self.reward_fn(
+                        self.history, runtime=runtime
+                    )
                 new_message = TinkerMessage(role="user", content=final_obs)
                 self.history.append(new_message)
 
@@ -376,7 +407,7 @@ def get_simplified_solver_initial_messages(
     env_state: SimplifiedSolverEnvState,
     tree_structure: str,
     tools: list[ToolSpec],
-    renderer: Renderer,
+    renderer: Renderer | None,
 ) -> list[TinkerMessage]:
     PROMPT = f"""<Role>
 You are a Rust engineer.
@@ -455,115 +486,29 @@ Error Reflection: If `<write_and_run>` test fails, analyze the compiler error ca
     if env_state.qwen_no_think:
         initial_message = "/no_think " + initial_message
 
-    system_prompt_with_tools = _inject_tools_into_prompt(renderer, tools, PROMPT)
+    if renderer is not None:
+        system_prompt_with_tools = _inject_tools_into_prompt(renderer, tools, PROMPT)
+    else:
+        system_prompt_with_tools = [TinkerMessage(role="system", content=PROMPT)]
+
     return system_prompt_with_tools + [
         TinkerMessage(role="user", content=initial_message),
     ]
 
 
-class SimplifiedSolverTokenEnv(types.Env):
-    def __init__(
-        self,
-        renderer: Renderer,
-        message_env: SimplifiedSolverEnv,
-        internalized_knowledge: str | None = None,
-        failed_parse_reward: float = -1.0,
-        terminate_on_parse_error: bool = True,
-        max_trajectory_tokens: int | None = None,
-    ):
-        self.renderer = renderer
-        self.message_env = message_env
-        self.failed_parse_reward = failed_parse_reward
-        self.terminate_on_parse_error = terminate_on_parse_error
-        self.max_trajectory_tokens = max_trajectory_tokens
-        self.internalized_knowledge = internalized_knowledge
-        self._base_stop_condition = renderer.get_stop_sequences()
-
-    async def get_state(self) -> SimplifiedSolverEnvState:
-        return await self.message_env.get_state()  # type: ignore
-
-    async def initial_observation(self) -> tuple[tinker.ModelInput, StopCondition]:
-        messages = await self.message_env.initial_observation()
-        # No tags, just raw technical fact statement to start the response
-        prefill = self.internalized_knowledge
-        return self.renderer.build_generation_prompt(
-            messages, prefill=prefill
-        ), self._base_stop_condition
-
-    async def step(
-        self, action: types.Action, *, extra: types.ActionExtra | None = None
-    ) -> SSTokenEnvResult:
-        assistant_message, parse_success = self.renderer.parse_response(action)
-
-        if not parse_success:
-            return SSTokenEnvResult(
-                reward=self.failed_parse_reward,
-                episode_done=self.terminate_on_parse_error,
-                next_observation=tinker.ModelInput.empty(),
-                next_stop_condition=self._base_stop_condition,
-                metrics={"parse_error": 1.0},
-                conclusion="parse_failed",
-            )
-
-        if self.internalized_knowledge:
-            if isinstance(assistant_message["content"], str):
-                assistant_message["content"] = [
-                    TextPart(type="text", text=assistant_message["content"])
-                ]
-
-            # Prepend the internalized knowledge (plain text context) to the first TextPart
-            # Or add it as the very first part if preferred.
-            assistant_content = [
-                TextPart(
-                    type="text",
-                    text=self.internalized_knowledge,
-                ),
-                *assistant_message["content"],
-            ]
-            assistant_message["content"] = assistant_content
-            self.internalized_knowledge = None
-
-        msg_step = await self.message_env.step(assistant_message)
-        next_observation = self.renderer.build_generation_prompt(msg_step.next_messages)
-        next_stop_condition = msg_step.next_stop_condition or self._base_stop_condition
-
-        if (
-            self.max_trajectory_tokens is not None
-            and next_observation.length > self.max_trajectory_tokens
-        ):
-            return SSTokenEnvResult(
-                reward=0.0,
-                episode_done=True,
-                next_observation=tinker.ModelInput.empty(),
-                next_stop_condition=self._base_stop_condition,
-                metrics={**msg_step.metrics, "context_overflow": 1.0},
-                conclusion="context_length_exceeded",
-            )
-
-        return SSTokenEnvResult(
-            reward=msg_step.reward,
-            episode_done=msg_step.episode_done,
-            next_observation=next_observation,
-            next_stop_condition=next_stop_condition,
-            metrics=msg_step.metrics,
-            conclusion=msg_step.conclusion,
-        )
-
-
-@asynccontextmanager
-async def build_simplified_solver_env(
+async def build_simplified_solver_msg_env(
     env_state: SimplifiedSolverEnvState,
-    renderer: Renderer,
     verifier: Verifier,
     rust_doc_analyzer: AsyncRustDocAnalyzer,
-    runtime: Runtime,
+    runtime_settings: RuntimeSettings,
     search_model: Any,
     wiki_manager: WikiManager,
-    max_trajectory_tokens: int = 32 * 1024,
     max_turns: int = 10,
-) -> AsyncGenerator[SimplifiedSolverTokenEnv, None]:
+    renderer: Renderer | None = None,
+) -> SimplifiedSolverEnv:
     exclude = ["target", ".git"]
-    tree_structure = await runtime.tree(".", exclude=exclude, truncate=20)
+    async with runtime_settings.build_runtime() as runtime:
+        tree_structure = await runtime.tree(".", exclude=exclude, truncate=20)
 
     # Fetch root MOC.md from Wiki
     moc_content = await wiki_manager.read("MOC.md")
@@ -575,7 +520,7 @@ async def build_simplified_solver_env(
 
     msg_env = SimplifiedSolverEnv(
         initial_state=env_state,
-        rust_env=runtime,
+        runtime_settings=runtime_settings,
         search_model=search_model,
         wiki_manager=wiki_manager,
         rust_doc_analyzer=rust_doc_analyzer,
@@ -587,17 +532,9 @@ async def build_simplified_solver_env(
         ),
         reward_fn=LLMAsAJudgeSingleTurn(
             task=env_state.task,
-            rust_env=runtime,
             verifier=verifier,
             tree_structure=tree_structure,
         ),
         mutable_state=mutable_state,
     )
-
-    yield SimplifiedSolverTokenEnv(
-        renderer=renderer,
-        message_env=msg_env,
-        internalized_knowledge=env_state.internalized_knowledge,
-        failed_parse_reward=-1.0,
-        max_trajectory_tokens=max_trajectory_tokens,
-    )
+    return msg_env

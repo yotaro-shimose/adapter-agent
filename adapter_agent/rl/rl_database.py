@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 class RLDatabase:
     """
     Unified database access layer for RL experiments.
-    Handles experiments, trajectories, knowledge, and citations.
+    Handles experiments, trajectories, and knowledge.
     Includes internal locking to ensure sequential access.
     """
     def __init__(self, experiment_name: Optional[str] = None):
@@ -111,7 +111,6 @@ class RLDatabase:
         knowledge_ids: List[str] | None = None,
         final_knowledge: str | None = None,
         final_knowledge_title: str | None = None,
-        citations: List[Dict[str, Any]] | None = None,
     ) -> int:
         if self.experiment_name is None:
             raise ValueError("experiment_name must be set before adding trajectory")
@@ -140,23 +139,6 @@ class RLDatabase:
                     "is_sft_candidate": (reward is not None and reward > 0),
                 }
             )
-
-            # 2. Create associated Citations if present
-            if citations:
-                for c in citations:
-                    k_id = c.get("knowledge_id")
-                    if not k_id:
-                        continue
-
-                    await client.citation.create(
-                        data={
-                            "trajectory_id": new_traj.id,
-                            "knowledge_id": k_id,
-                            "content": c.get("content"),
-                            "title": c.get("title"),
-                            "turn_index": c.get("turn_index", 0),
-                        }
-                    )
 
             return new_traj.id
 

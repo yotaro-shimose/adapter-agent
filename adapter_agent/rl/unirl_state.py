@@ -282,17 +282,6 @@ class UniRLState:
                     if k.id == knowledge.id:
                         k.knowledge_id = k_id
 
-            # 2. Extract citations
-            citations_data = [
-                {
-                    "knowledge_id": c.knowledge_id,
-                    "turn_index": c.turn_index,
-                    "content": c.content,
-                    "title": c.title,
-                }
-                for c in result.citations
-            ]
-
             # 3. Save trajectory with references to stable Knowledge IDs
             await self.db.add_trajectory(
                 task_id=result.task.id,
@@ -305,7 +294,6 @@ class UniRLState:
                 final_knowledge_title=result.knowledges[0].title
                 if result.knowledges
                 else None,
-                citations=citations_data,
             )
 
         await self.handle_study_result(result)
@@ -357,8 +345,8 @@ class UniRLState:
         logger.info(msg)
 
     @ray.method
-    async def update_sampling_client(self, new_client: Any):
-        await self.sampling_client_manager.update_client(new_client)
+    def update_sampling_client(self, new_client: Any):
+        self.sampling_client_manager.update_client(new_client)
 
     def _get_latest_model(self) -> TinkerModel:
         return TinkerModel(

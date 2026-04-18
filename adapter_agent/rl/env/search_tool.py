@@ -21,6 +21,7 @@ class SimplifiedSolverMutableState:
     total_turns: int
     search_count: int = 0
     seen_knowledge_ids: set[str] = field(default_factory=set)
+    source_code: str = ""
 
 
 class SearchTool(Tool):

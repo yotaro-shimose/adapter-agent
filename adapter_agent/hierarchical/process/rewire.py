@@ -1,13 +1,13 @@
 import logging
-from typing import Any, cast
 
 import tinker
+from agents.extensions.models.litellm_model import LitellmModel
 from coder_mcp.runtime import CoderMCPRuntimeError
 from oai_utils.tinker import TinkerModel
 from tinker_cookbook.renderers.base import Message as TinkerMessage
+from tinker_cookbook.renderers.base import TextPart
 from tinker_cookbook.rl.types import TokensWithLogprobs, Trajectory, Transition
 
-from adapter_agent.hierarchical.agent.reflector import Reflector
 from adapter_agent.hierarchical.agent.knowledge_normalizer import (
     AgentsSDKModel,
 )
@@ -15,10 +15,10 @@ from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
 from adapter_agent.library.wiki_manager import WikiManager
+from adapter_agent.rl.completer import LiteLLMMessageCompleter
 from adapter_agent.rl.env.reward import LLMAsAJudge
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.rl.env.session_result import (
-    Citation,
     RewireSessionResult,
     RewireSessionResultError,
     RewireSessionResultFailure,
@@ -26,7 +26,7 @@ from adapter_agent.rl.env.session_result import (
 )
 from adapter_agent.rl.env.simplified_solver import (
     SimplifiedSolverEnvState,
-    build_simplified_solver_env,
+    build_simplified_solver_msg_env,
 )
 from adapter_agent.util.exception import CodingEnvironmentError, MaximumContextExceeded
 
@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 async def ss_solve_verify(
-    solver_model: TinkerModel,
+    solver_model: TinkerModel | LitellmModel,
     verifier_model: AgentsSDKModel,
     rust_doc_analyzer: AsyncRustDocAnalyzer,
     task: Task,
@@ -57,49 +57,59 @@ async def ss_solve_verify(
         blocked_knowledge_ids=blocked_knowledge_ids,
     )
     try:
-        async with runtime_settings.build_runtime() as runtime:
-            async with build_simplified_solver_env(
-                env_state=ss_state,
-                renderer=solver_model.renderer,
-                verifier=verifier,
-                rust_doc_analyzer=verifier.rust_doc_analyzer,
-                search_model=verifier_model,
-                wiki_manager=wiki_manager,
-                max_turns=max_turns,
-                runtime=runtime,
-            ) as env:
-                # Use TokenEnv directly to handle prefilling
-                ob, stop = await env.initial_observation()
-                transitions = []
-                while True:
-                    try:
-                        # Sample from the model
-                        # We use sampling_client directly because ob is ModelInput (which supports prefill)
-                        sample_result = await solver_model.sampling_client.sample_async(
-                            prompt=ob,
-                            num_samples=1,
-                            sampling_params=tinker.SamplingParams(
-                                stop=stop,
-                                temperature=1.0,
-                            ),
-                        )
-                        sampled_tokens = sample_result.sequences[0].tokens
-                        ac_with_logprobs = TokensWithLogprobs(
-                            tokens=sampled_tokens,
-                            maybe_logprobs=sample_result.sequences[0].logprobs,
-                        )
-                    except MaximumContextExceeded:
+        renderer = (
+            solver_model.renderer if isinstance(solver_model, TinkerModel) else None
+        )
+
+        msg_env = await build_simplified_solver_msg_env(
+            env_state=ss_state,
+            verifier=verifier,
+            rust_doc_analyzer=verifier.rust_doc_analyzer,
+            search_model=verifier_model,
+            wiki_manager=wiki_manager,
+            max_turns=max_turns,
+            runtime_settings=runtime_settings,
+            renderer=renderer,
+        )
+
+        ob_messages = await msg_env.initial_observation()
+        internalized_knowledge = ss_state.internalized_knowledge
+
+        if isinstance(solver_model, TinkerModel):
+            assert renderer is not None, "TinkerModel must have a renderer"
+            transitions = []
+            stop_condition = renderer.get_stop_sequences()
+            while True:
+                prefill = internalized_knowledge
+                internalized_knowledge = None
+
+                model_input = renderer.build_generation_prompt(
+                    ob_messages, prefill=prefill
+                )
+                try:
+                    sample_result = await solver_model.sampling_client.sample_async(
+                        prompt=model_input,
+                        num_samples=1,
+                        sampling_params=tinker.SamplingParams(
+                            stop=stop_condition,
+                            temperature=1.0,
+                        ),
+                    )
+                    sampled_tokens = sample_result.sequences[0].tokens
+                    maybe_logprobs = sample_result.sequences[0].logprobs
+                except tinker.APIStatusError as e:
+                    if (
+                        e.status_code == 400
+                        and "Prompt length plus max_tokens exceeds the model's context window"
+                        in e.message
+                    ):
                         logger.debug(
                             "Maximum context length exceeded during the rewiring loop"
                         )
-                        # Fallback to message env for recording the failure
-                        msg_env = env.message_env
                         msg_env.history.append(CONTEXT_EXCEEDED_MESSAGE)
                         trajectory = Trajectory(
                             transitions=transitions,
-                            final_ob=solver_model.renderer.build_generation_prompt(
-                                msg_env.history
-                            ),
+                            final_ob=renderer.build_generation_prompt(msg_env.history),
                         )
                         return RewireSessionResultFailure(
                             task=task,
@@ -107,41 +117,112 @@ async def ss_solve_verify(
                             conclusion="context_length_exceeded",
                             trajectory=trajectory,
                         )
+                    else:
+                        raise
 
-                    model_input_before = ob
-                    step_result = await env.step(sampled_tokens)
+                assistant_message, parse_success = renderer.parse_response(
+                    sampled_tokens
+                )
+
+                if not parse_success:
+                    reward = -1.0
+                    episode_done = True
+                    metrics = {"parse_error": 1.0}
                     transition = Transition(
-                        ob=model_input_before,
-                        ac=ac_with_logprobs,
-                        reward=step_result.reward,
-                        episode_done=step_result.episode_done,
-                        metrics=getattr(step_result, "metrics", {}),
-                        logs=getattr(step_result, "logs", {}),
+                        ob=model_input,
+                        ac=TokensWithLogprobs(
+                            tokens=sampled_tokens, maybe_logprobs=maybe_logprobs
+                        ),
+                        reward=reward,
+                        episode_done=episode_done,
+                        metrics=metrics,
+                        logs={},
                     )
                     transitions.append(transition)
-                    ob = step_result.next_observation
-                    stop = step_result.next_stop_condition
+                    # Create a mock step result to pass to _process_solve_result
+                    from adapter_agent.rl.env.simplified_solver import SSStepResult
 
-                    if step_result.episode_done:
-                        break
+                    step_result = SSStepResult(
+                        reward=reward,
+                        episode_done=episode_done,
+                        next_messages=msg_env.history,
+                        conclusion="parse_failed",
+                    )
+                    break
 
-                msg_env = env.message_env
-                trajectory = Trajectory(
-                    transitions=transitions,
-                    final_ob=solver_model.renderer.build_generation_prompt(
-                        msg_env.history
+                if prefill:
+                    if isinstance(assistant_message["content"], str):
+                        assistant_message["content"] = [
+                            TextPart(type="text", text=assistant_message["content"])
+                        ]
+                    assistant_message["content"] = [
+                        TextPart(type="text", text=prefill),
+                        *assistant_message["content"],
+                    ]
+
+                step_result = await msg_env.step(assistant_message)
+                ob_messages = step_result.next_messages
+
+                transition = Transition(
+                    ob=model_input,
+                    ac=TokensWithLogprobs(
+                        tokens=sampled_tokens, maybe_logprobs=maybe_logprobs
                     ),
+                    reward=step_result.reward,
+                    episode_done=step_result.episode_done,
+                    metrics=step_result.metrics,
+                    logs={},
                 )
+                transitions.append(transition)
 
-                return await _process_solve_result(
-                    task=task,
-                    history=msg_env.history,
-                    trajectory=trajectory,
-                    step_result=step_result,
-                    verifier_model=verifier_model,
-                    wiki_manager=wiki_manager,
-                    runtime=runtime,
-                )
+                if step_result.episode_done:
+                    break
+
+            trajectory = Trajectory(
+                transitions=transitions,
+                final_ob=renderer.build_generation_prompt(msg_env.history),
+            )
+            trials = msg_env.history
+
+        else:
+            litellm_completer = LiteLLMMessageCompleter.from_litellm_model(solver_model)
+            while True:
+                try:
+                    action = await litellm_completer(ob_messages)
+                except MaximumContextExceeded:
+                    logger.debug(
+                        "Maximum context length exceeded during the rewiring loop"
+                    )
+                    msg_env.history.append(CONTEXT_EXCEEDED_MESSAGE)
+                    return RewireSessionResultFailure(
+                        task=task,
+                        trials=msg_env.history,
+                        conclusion="context_length_exceeded",
+                        trajectory=None,
+                    )
+
+                step_result = await msg_env.step(action)
+                ob_messages = step_result.next_messages
+
+                if step_result.episode_done:
+                    break
+
+            trials = msg_env.history
+            trajectory = None
+
+        if not LLMAsAJudge.is_successful_reward(step_result.reward):
+            return RewireSessionResultFailure(
+                task=task,
+                trials=trials,
+                conclusion=step_result.conclusion,
+                trajectory=trajectory,
+            )
+
+        return RewireSessionResultSuccess(
+            task=task,
+            trials=trials,
+            trajectory=trajectory,
+        )
 
     except (CodingEnvironmentError, CoderMCPRuntimeError) as e:
         logger.error(f"Environment error: {e}")
@@ -151,67 +232,3 @@ async def ss_solve_verify(
         )
 
 
-async def _process_solve_result(
-    task: Task,
-    history: list[TinkerMessage],
-    trajectory: Trajectory,
-    step_result: Any, # SimplifiedSolverEnvStepResult
-    verifier_model: AgentsSDKModel,
-    wiki_manager: WikiManager,
-    runtime: Any, # CoderMCPRuntime
-) -> RewireSessionResult:
-    """
-    Handles the post-solve logic: citation extraction, knowledge normalization,
-    verification, and uniqueness checking.
-    """
-    # Extract citations from the trials
-    citations = []
-    for turn_idx, msg in enumerate(history):
-        msg_dict = cast(dict[str, Any], msg)
-        knowledge_id = msg_dict.get("knowledge_id")
-        if knowledge_id:
-            citations.append(
-                Citation(
-                    knowledge_id=cast(str, knowledge_id),
-                    turn_index=turn_idx,
-                    content=msg_dict.get("knowledge_content"),
-                    title=msg_dict.get("knowledge_title"),
-                )
-            )
-
-    if not LLMAsAJudge.is_successful_reward(step_result.reward):
-        return RewireSessionResultFailure(
-            task=task,
-            trials=history,
-            conclusion=step_result.conclusion,
-            trajectory=trajectory,
-            citations=citations,
-        )
-
-    # 1. Extract Reflections
-    logger.info("Extracting reflections from trajectory...")
-    reflector = Reflector(model=verifier_model)
-    reflections = await reflector.reflect(history)
-
-    if not reflections:
-        logger.warning("No reflections extracted.")
-        # We can still return success if the goal was reached, but knowledge extraction failed.
-        # However, for consistency with the previous logic:
-        return RewireSessionResultFailure(
-            task=task,
-            trials=history,
-            conclusion="knowledge_normalization_failed",
-            trajectory=trajectory,
-            citations=citations,
-        )
-
-    logger.info(f"Extracted {len(reflections)} reflections for async distillation.")
-    return RewireSessionResultSuccess(
-        task=task,
-        trials=history,
-        knowledges=[], # Knowledges will be populated by Studier
-        reflections=reflections,
-        trajectory=trajectory,
-        reasoning="Delegated to async KnowledgeStudier",
-        citations=citations,
-    )

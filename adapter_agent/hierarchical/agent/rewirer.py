@@ -109,24 +109,106 @@ def format_trajectory_transcript(
     return transcript
 
 
-def _log_trajectory_debug(transcript: str) -> None:
-    """Helper function to log the trajectory using rich if debugging is enabled."""
-    from rich.console import Console
+def _log_trajectory_rich(messages: list[TinkerMessage]) -> None:
+    """Helper function to log the trajectory using rich with structured panels."""
+    from rich.console import Console, Group
     from rich.markdown import Markdown
     from rich.panel import Panel
+    from rich.text import Text
 
     console = Console()
-    console.print(
-        Panel(
-            Markdown(transcript),
-            title="Acquired Trajectory",
-            border_style="blue",
+    entities = []
+
+    for msg in messages:
+        role = msg.get("role", "unknown")
+        content_raw = msg.get("content", "")
+
+        # Determine Title and Color based on role
+        if role == "system":
+            title, color = "System", "dim white"
+        elif role == "user":
+            title, color = "User", "cyan"
+        elif role == "assistant":
+            title, color = "Assistant", "green"
+        elif role == "tool":
+            title, color = "Tool Result", "magenta"
+        else:
+            title, color = role.capitalize(), "white"
+
+        parts = []
+
+        # Handle content parts
+        if isinstance(content_raw, str):
+            if content_raw.strip():
+                parts.append(Markdown(content_raw))
+        elif isinstance(content_raw, list):
+            for p in content_raw:
+                if p["type"] == "thinking":
+                    thinking_text = p["thinking"]
+                    if thinking_text:
+                        parts.append(
+                            Panel(
+                                Text(thinking_text, style="italic dim"),
+                                title="[dim]Thinking[/dim]",
+                                border_style="dim",
+                                padding=(0, 1),
+                            )
+                        )
+                elif p["type"] == "text":
+                    text = p.get("text", "").strip()
+                    if text:
+                        parts.append(Markdown(text))
+
+        # Handle tool calls in assistant messages
+        tool_calls = msg.get("tool_calls") or []
+        for call in tool_calls:
+            if isinstance(call, dict):
+                fn = call.get("function", {})
+                name = fn.get("name", "unknown")
+                args = fn.get("arguments", "{}")
+            else:
+                name = call.function.name
+                args = call.function.arguments
+            parts.append(
+                Panel(
+                    Text(f"Call: {name}\nArgs: {args}", style="yellow"),
+                    title="Tool Call",
+                    border_style="yellow",
+                )
+            )
+
+        if parts:
+            entities.append(
+                Panel(
+                    Group(*parts),
+                    title=f"[bold]{title}[/bold]",
+                    border_style=color,
+                    expand=False,
+                )
+            )
+
+    if entities:
+        console.print("\n")
+        console.print(
+            Panel(
+                Group(*entities),
+                title="[bold blue]Trajectory Visualizer[/bold blue]",
+                border_style="blue",
+                padding=(1, 2),
+            )
         )
-    )
+        console.print("\n")
 
 
 def log_trajectory(messages: list[TinkerMessage], flip_tag: bool = False) -> None:
-    transcript = format_trajectory_transcript(
-        messages, use_thinking=True, flip_tag=flip_tag
-    )
-    _log_trajectory_debug(transcript)
+    # We still keep the logic to log to standard logger as well if needed.
+    # But for the visual requirement, we use the rich version.
+    try:
+        _log_trajectory_rich(messages)
+    except Exception as e:
+        # Fallback to the old method if rich rendering fails
+        logger.warning(f"Rich trajectory logging failed: {e}. Falling back to text.")
+        transcript = format_trajectory_transcript(
+            messages, use_thinking=True, flip_tag=flip_tag
+        )
+        print(transcript)

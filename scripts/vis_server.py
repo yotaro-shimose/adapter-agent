@@ -114,7 +114,7 @@ async def get_trajectory(experiment_name: str, task_id: str):
             "task_id": task_id
         },
         order={"created_at": "asc"},
-        include={"citations": True}
+        include=None
     )
     
     print(f"DEBUG: Found {len(trajectories)} trajectories for task_id '{task_id}' in experiment '{experiment_name}'")
@@ -128,14 +128,6 @@ async def get_trajectory(experiment_name: str, task_id: str):
             "reward": t.reward if t.reward is not None else 0.0,
             "trials": t.trials_json,
             "knowledge_ids": t.knowledge_ids,
-            "citations": [
-                {
-                    "knowledge_id": str(c.knowledge_id) if c.knowledge_id is not None else None,
-                    "content": c.content,
-                    "title": c.title,
-                    "turn_index": c.turn_index
-                } for c in (t.citations or [])
-            ],
             "created_at": t.created_at.isoformat() if t.created_at else None
         }
         for t in trajectories
@@ -327,6 +319,57 @@ async def get_wiki_article_content(version: str, title: str):
         "content": article.content,
         "version": article.version,
         "updated_at": article.updated_at.isoformat()
+    }
+
+@app.get("/api/openbook/experiments")
+async def list_openbook_experiments():
+    try:
+        client = await _db_manager.get_client()
+        experiments = await client.openbookexperiment.find_many(
+            order={"created_at": "desc"}
+        )
+        return [e.experiment_name for e in experiments]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+@app.get("/api/openbook/{experiment_name}/data")
+async def get_openbook_data(experiment_name: str):
+    client = await _db_manager.get_client()
+    
+    qas = await client.openbookqa.find_many(
+        where={"experiment_name": experiment_name},
+        order={"knowledge_id": "asc"}
+    )
+    
+    trajectories = await client.openbooktrajectory.find_many(
+        where={"experiment_name": experiment_name},
+        order={"id": "asc"}
+    )
+    
+    return {
+        "qas": [
+            {
+                "id": q.id,
+                "knowledge_id": q.knowledge_id,
+                "title": q.title,
+                "question": q.question,
+                "answer": q.answer
+            } for q in qas
+        ],
+        "trajectories": [
+            {
+                "id": t.id,
+                "qa_id": t.qa_id,
+                "question": t.question,
+                "hint": t.hint,
+                "reasoning": t.reasoning,
+                "answer": t.answer,
+                "success": t.success,
+                "dataset": t.dataset,
+                "execution_output": t.execution_output,
+                "verification_output": t.verification_output
+            } for t in trajectories
+        ]
     }
 
 if __name__ == "__main__":

@@ -3,12 +3,13 @@ import itertools
 import logging
 import pickle
 from pathlib import Path
-from typing import Any, Optional, Self
+from typing import Any, Iterable, Optional, Self
 
 import tinker
 from oai_utils.tinker import TinkerModel, setup_tinkermodel
 from oai_utils.tinker.model_helper import get_tokenizer_renderer
 from prisma import Prisma
+from tinker import Datum
 from tinker_cookbook import checkpoint_utils
 from tinker_cookbook.renderers import Message, TextPart, ThinkingPart, TrainOnWhat
 from tinker_cookbook.rl import Trajectory
@@ -17,6 +18,7 @@ from tinker_cookbook.supervised.data import conversation_to_datum
 from tinker_cookbook.utils import ml_log
 from tinker_cookbook.utils.ml_log import Logger as MLLogger
 
+from adapter_agent.data import QRA
 from adapter_agent.hierarchical.agent.generator import GeneratorAgent
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.grpo import compute_grpo_loss
@@ -538,7 +540,7 @@ class SimplePipeline:
             self.shared_sampling_client.update_client(new_client)
             self.eval_trigger.set()
 
-    async def _run_sft_steps(self, batch_iter) -> None:
+    async def _run_sft_steps(self, batch_iter: Iterable[list[Datum]]) -> None:
         adam_params = self.config.adam_params
         for batch in batch_iter:
             fwd_future = await self.training_client.forward_backward_async(
@@ -621,28 +623,57 @@ class SimplePipeline:
         )
         return list(itertools.chain.from_iterable(results))
 
-    def _create_sft_batch_iterator(self, sft_qras: list[Any], num_epochs: int):
+    def _create_sft_batch_iterator(
+        self, sft_qras: list[QRA], num_epochs: int
+    ) -> Iterable[list[Datum]]:
         _, renderer = get_tokenizer_renderer(
             self.training_client, self.config.model_loading_settings.model_name
         )
-        datums = [
-            conversation_to_datum(
-                conversation=[
-                    Message(role="user", content=q.question),
-                    Message(
-                        role="assistant",
-                        content=[
-                            ThinkingPart(type="thinking", thinking=q.reasoning),
-                            TextPart(type="text", text=f"\n\n{q.answer}"),
-                        ],
-                    ),
-                ],
-                renderer=renderer,
-                train_on_what=TrainOnWhat.LAST_ASSISTANT_MESSAGE,
-                max_length=None,
-            )
-            for q in sft_qras
-        ]
+        if self.config.cpt:
+            datums = [
+                conversation_to_datum(
+                    conversation=[
+                        Message(
+                            role="system",
+                            content=f"これは{self.config.library_name}の教育資料から抜粋した練習問題です。",
+                            trainable=False,
+                        ),
+                        Message(
+                            role="example_question",
+                            content=q.question,
+                            trainable=False,
+                        ),
+                        Message(
+                            role="example_answer",
+                            content=q.answer,
+                            trainable=True,
+                        ),
+                    ],
+                    renderer=renderer,
+                    train_on_what=TrainOnWhat.CUSTOMIZED,
+                    max_length=None,
+                )
+                for q in sft_qras
+            ]
+        else:
+            datums = [
+                conversation_to_datum(
+                    conversation=[
+                        Message(role="user", content=q.question),
+                        Message(
+                            role="assistant",
+                            content=[
+                                ThinkingPart(type="thinking", thinking=q.reasoning),
+                                TextPart(type="text", text=f"\n\n{q.answer}"),
+                            ],
+                        ),
+                    ],
+                    renderer=renderer,
+                    train_on_what=TrainOnWhat.LAST_ASSISTANT_MESSAGE,
+                    max_length=None,
+                )
+                for q in sft_qras
+            ]
         if not datums:
             return iter([])
 

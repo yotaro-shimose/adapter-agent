@@ -17,7 +17,6 @@ from adapter_agent.data import QRA
 from adapter_agent.rl.env.session_result import (
     RewireSessionResult,
     RewireSessionResultNormal,
-    Citation,
 )
 from adapter_agent.hierarchical.types import Entity, Task, Knowledge
 from adapter_agent.util.exception import AllTasksCompleted
@@ -37,7 +36,6 @@ class TaskWithMeta:
     item: Task
     sft_conclusions: list[Attempt] = field(default_factory=list)
     knowledges: dict[str, NormalizedKnowledge] = field(default_factory=dict)
-    citations: list[Citation] = field(default_factory=list)
     knowledge_finalized_at: datetime | None = None
     PSEUDO_ROOT_ID: ClassVar[str] = "pseudo_root"
 
@@ -49,8 +47,6 @@ class TaskWithMeta:
                     timestamp=datetime.now(),
                 )
             )
-        if isinstance(result, RewireSessionResultNormal):
-            self.citations.extend(result.citations)
 
         if isinstance(result, RewireSessionResultNormal):
             # We no longer populate knowledges immediately to support async distillation.
@@ -157,7 +153,6 @@ class GraphNodeMetadata(BaseModel):
     is_executing: bool
     slice_count: int
     gen_count: int
-    citations: list[dict[str, Any]] = Field(default_factory=list)
     slices: list[dict[str, str]] = Field(default_factory=list)
     knowledge_content: str | None = None
     knowledge_title: str | None = None
@@ -664,15 +659,6 @@ class TaskNetwork:
                 is_executing=is_executing,
                 slice_count=slice_count,
                 gen_count=gen_count,
-                citations=[
-                    {
-                        "knowledge_id": c.knowledge_id,
-                        "turn_index": c.turn_index,
-                        "content": c.content,
-                        "title": c.title,
-                    }
-                    for c in node.citations
-                ],
                 slices=slices_data,
                 knowledge_content=knowledge_content,
                 knowledge_title=knowledge_title,
@@ -689,17 +675,6 @@ class TaskNetwork:
                 )
             )
 
-            # Export Citation edges
-            for c in node.citations:
-                if c.knowledge_id:
-                    edges_exported.append(
-                        GraphExportEdge(
-                            id=f"{node.item.id}-{c.knowledge_id}-citation",
-                            source=node.item.id,
-                            target=c.knowledge_id,
-                            type="citation"
-                        )
-                    )
 
         # 2. Export Decomposition Edges
         for parent_id, children in self.children_map.items():

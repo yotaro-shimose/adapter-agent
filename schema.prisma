@@ -34,7 +34,6 @@ model Trajectory {
   usage_count          Int        @default(0)
   last_used_at         DateTime   @default(now())
   created_at           DateTime   @default(now())
-  citations            Citation[]
 
   @@map("trajectories")
   @@index([task_id])
@@ -50,24 +49,9 @@ model Knowledge {
   title         String
   content       String
   created_at    DateTime     @default(now())
-  citations     Citation[]   @relation("KnowledgeToCitation")
 
   @@map("knowledge_base")
   @@index([experiment_name])
-}
-
-model Citation {
-  id             Int        @id @default(autoincrement())
-  trajectory     Trajectory @relation(fields: [trajectory_id], references: [id], onDelete: Cascade)
-  trajectory_id  Int
-  knowledge_id   String     // Changed from Int? to String and made it required
-  knowledge      Knowledge  @relation("KnowledgeToCitation", fields: [knowledge_id], references: [id])
-  content        String?
-  title          String?
-  turn_index     Int        @default(0)
-  created_at     DateTime   @default(now())
-
-  @@map("citations")
 }
 
 model SimpleTrainRun {
@@ -88,11 +72,9 @@ model GranularKnowledge {
   title           String
   content         String
   
+  
   created_at      DateTime @default(now())
   
-  sft_qnas        SimpleSftQna[]
-  trajectories    SimpleTrajectory[]
-
   @@map("granular_knowledges")
   @@index([simple_train_id])
 }
@@ -120,7 +102,6 @@ model SimpleTrajectory {
   @@index([simple_train_id])
   @@index([knowledge_id])
 
-  granular_knowledge GranularKnowledge? @relation(fields: [knowledge_id], references: [id])
 }
 
 model SimpleSftQna {
@@ -141,7 +122,6 @@ model SimpleSftQna {
   @@index([simple_train_id])
   @@index([knowledge_id])
 
-  granular_knowledge GranularKnowledge? @relation(fields: [knowledge_id], references: [id])
 }
 
 
@@ -154,4 +134,50 @@ model WikiArticle {
 
   @@id([version, title]) // Compound Primary Key
   @@map("wiki_articles")
+}
+
+model OpenBookExperiment {
+  experiment_name String   @id
+  created_at      DateTime @default(now())
+  qnas            OpenBookQA[]
+  trajectories    OpenBookTrajectory[]
+
+  @@map("openbook_experiments")
+}
+
+model OpenBookQA {
+  id              Int                @id @default(autoincrement())
+  experiment_name String
+  experiment      OpenBookExperiment @relation(fields: [experiment_name], references: [experiment_name], onDelete: Cascade)
+  
+  knowledge_id    String
+  title           String
+  question        String
+  answer          String
+  
+  @@map("openbook_qnas")
+  @@index([experiment_name])
+}
+
+model OpenBookTrajectory {
+  id              Int                @id @default(autoincrement())
+  experiment_name String
+  experiment      OpenBookExperiment @relation(fields: [experiment_name], references: [experiment_name], onDelete: Cascade)
+
+  qa_id           Int
+  
+  question        String
+  hint            String
+
+  reasoning       String
+  answer          String
+  success         Boolean
+  
+  execution_output    String?
+  verification_output String?
+  
+  dataset         String?  // "train" or "holdout"
+  
+  @@map("openbook_trajectories")
+  @@index([experiment_name])
 }

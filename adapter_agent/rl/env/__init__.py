@@ -12,7 +12,6 @@ from adapter_agent.rl.env.session_result import (
 from adapter_agent.rl.env.simplified_solver import (
     SimplifiedSolverEnv,
     SimplifiedSolverEnvState,
-    build_simplified_solver_env,
 )
 from adapter_agent.rl.env.single_turn import (
     SingleTurnEnv,
@@ -30,7 +29,6 @@ __all__ = [
     "RewireSessionResultSuccess",
     "SimplifiedSolverEnv",
     "SimplifiedSolverEnvState",
-    "build_simplified_solver_env",
     "SingleTurnEnv",
     "SingleTurnEnvState",
     "build_single_turn_env",

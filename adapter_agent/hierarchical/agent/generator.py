@@ -7,8 +7,8 @@ from pydantic import BaseModel
 
 from adapter_agent.data import QA, QRA
 from adapter_agent.hierarchical.agent.base import BaseAgent
+from adapter_agent.hierarchical.types import Knowledge
 from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
-from adapter_agent.rl.env.session_result import Knowledge
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +45,9 @@ class GeneratorAgent[T: AgentsSDKModel](BaseAgent[T]):
         prompt = self._build_system_prompt(is_sft=True)
         # Add emphasis on fixing the error
         prompt += "\n\n<Focus>You are now in refinement mode. A previous attempt failed with the following error. Fix the code while keeping the question and reasoning consistent.</Focus>"
-        
+
         agent = self._create_agent(prompt, output_type=QRA)
-        
+
         input_prompt = self._build_input_prompt(knowledge)
         input_prompt += f"\n\n<Previous Attempt>\nQuestion: {qra.question}\nAnswer: {qra.answer}\n</Previous Attempt>\n\n<Error Output>\n{error_message}\n</Error Output>\n\nPlease provide a corrected version of the QRA."
 
@@ -116,7 +116,9 @@ class GeneratorAgent[T: AgentsSDKModel](BaseAgent[T]):
             else "Question-Answer (QA) pair"
         )
         if not is_coding:
-            mode_desc = "Question-Reasoning-Answer (QRA) triplet (CONCEPTUAL / NON-CODING)"
+            mode_desc = (
+                "Question-Reasoning-Answer (QRA) triplet (CONCEPTUAL / NON-CODING)"
+            )
 
         prompt = f"""\
 <Role>
@@ -158,3 +160,51 @@ You must return the result in a structured JSON format.
 
 Please generate a new task based on the knowledge provided above.
 """
+
+    async def generate_qa(self, knowledge: Knowledge) -> Optional[QA]:
+        """
+        Generate a QA pair (no reasoning) based on a specific Knowledge item.
+        """
+        # Create a modified prompt specifically for QA generation without reasoning requirements.
+        prompt = """\
+<Role>
+You are an expert Rust software architect who has already mastered the library.
+Your task is to generate a high-quality Question-Answer (QA) pair.
+</Role>
+
+<Objective>
+- Create a realistic conceptual challenge (Question) that tests the understanding of the API or its requirements.
+- The Answer MUST include the explanation and the code enclosed in a ```rust ... ``` code block.
+- The code must be correct, idiomatic Rust.
+- IMPORTANT: Return ONLY the Question and Answer. Do NOT include any `<think>` or internal reasoning steps.
+</Objective>
+
+<Persona & Knowledge State>
+- **Internalized Expertise**: Speak and reason from the perspective of an expert who has already integrated the library's concepts. 
+- **No Meta-References**: Avoid any mention of "the provided documentation," "the overview," or "the text." Use direct first-person reasoning (e.g., "I will use...", "I need to...").
+</Persona & Knowledge State>
+
+<Guidelines>
+1. **Focus on the Library**. Design tasks that require meaningful application or understanding of the specific library's features.
+2. **Solvability**. Ensure all technical facts are accurate according to the provided overview.
+3. **Verifiability**. Ensure the generated code produces clear output during execution.
+4. **Reliability**. All code generated MUST be valid, compilable Rust.
+</Guidelines>
+
+<OutputFormat>
+You must return the result in a structured JSON format with `question` and `answer` fields.
+</OutputFormat>
+"""
+        agent = self._create_agent(prompt, output_type=QA)
+
+        input_prompt = self._build_input_prompt(knowledge)
+
+        try:
+            result = await agent.run(input_prompt, time_out_seconds=60.0)
+            output = result.final_output()
+            return output
+        except Exception as e:
+            logger.exception(
+                f"Problem generation (QA) failed for '{knowledge.title}': {e}"
+            )
+            return None

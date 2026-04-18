@@ -63,6 +63,11 @@ async def main():
         default="granular_prep_20260414_085004",
         help="SimpleTrainRun ID for granular knowledge",
     )
+    parser.add_argument(
+        "--cpt",
+        action="store_true",
+        help="Use Continual Pre-training mode (single trainable user message)",
+    )
     args = parser.parse_args()
 
     load_dotenv()
@@ -150,6 +155,7 @@ async def main():
         stop_grpo=False,
         kl_penalty_coef=0.0,
         kl_discount_factor=0.0,
+        cpt=args.cpt,
     )
 
     pipeline = await SimplePipeline.create(config=config, rust_doc_analyzer=analyzer)

@@ -115,3 +115,24 @@ export interface SimpleSftQna {
   created_at: string | null;
 }
 
+export interface OpenBookQA {
+  id: number;
+  knowledge_id: string;
+  title: string;
+  question: string;
+  answer: string;
+}
+
+export interface OpenBookTrajectory {
+  id: number;
+  qa_id: number;
+  question: string;
+  hint: string;
+  reasoning: string;
+  answer: string;
+  success: boolean;
+  dataset: 'train' | 'holdout' | null;
+  execution_output?: string | null;
+  verification_output?: string | null;
+}
+
