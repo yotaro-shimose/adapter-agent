@@ -6,21 +6,19 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from inspect import isawaitable
 from pathlib import Path
-from typing import Any, Awaitable, Callable, ClassVar, Self
+from typing import Any, Awaitable, Callable, ClassVar, Self, TypeGuard
 
 from pydantic import BaseModel
 from pydantic.fields import Field
 from pyvis.network import Network
-from typing_extensions import TypeIs
 
 from adapter_agent.data import QRA
+from adapter_agent.hierarchical.types import Entity, Knowledge, Task
 from adapter_agent.rl.env.session_result import (
     RewireSessionResult,
     RewireSessionResultNormal,
 )
-from adapter_agent.hierarchical.types import Entity, Task, Knowledge
 from adapter_agent.util.exception import AllTasksCompleted
-
 
 logger = logging.getLogger(__name__)
 
@@ -342,19 +340,23 @@ class TaskNetwork:
             else:
                 raise ValueError(f"Unknown task type: {type(completed)}")
 
-    async def mark_knowledge_ready(self, task_id: str, finalized_knowledges: list[Knowledge]):
+    async def mark_knowledge_ready(
+        self, task_id: str, finalized_knowledges: list[Knowledge]
+    ):
         """
         Called by the KnowledgeStudier when distillation is complete.
         Updates the task node with the finalized knowledge and marks it as ready for parents.
         """
         async with self._lock:
             if task_id not in self.nodes:
-                logger.warning(f"Task {task_id} not found in nodes during mark_knowledge_ready")
+                logger.warning(
+                    f"Task {task_id} not found in nodes during mark_knowledge_ready"
+                )
                 return
-            
+
             node = self.nodes[task_id]
             node.knowledge_finalized_at = datetime.now()
-            
+
             for k_item in finalized_knowledges:
                 knowledge = NormalizedKnowledge(
                     id=k_item.id,
@@ -363,8 +365,10 @@ class TaskNetwork:
                     title=k_item.title,
                 )
                 node.knowledges[knowledge.id] = knowledge
-            
-            logger.info(f"Task {task_id} knowledge marked as ready. {len(finalized_knowledges)} items added.")
+
+            logger.info(
+                f"Task {task_id} knowledge marked as ready. {len(finalized_knowledges)} items added."
+            )
 
     def slicing_task_setup(self, slicing_task: SlicingTask):
         self.executing_slicing[slicing_task.knowledge.id] = (
@@ -576,6 +580,7 @@ class TaskNetwork:
                 if node_ids is None or (parent_id in node_ids and child_id in node_ids):
                     net.add_edge(parent_id, child_id)
         return net
+
     def to_dict(self):
         nodes_exported = []
         edges_exported = []
@@ -611,11 +616,13 @@ class TaskNetwork:
                     knowledge_content = k.knowledge
                     knowledge_title = k.title
                     generated_knowledge_id = k.knowledge_id or k.id
-                generated_knowledges.append({
-                    "id": k.knowledge_id or k.id,
-                    "title": k.title,
-                    "content": k.knowledge
-                })
+                generated_knowledges.append(
+                    {
+                        "id": k.knowledge_id or k.id,
+                        "title": k.title,
+                        "content": k.knowledge,
+                    }
+                )
 
                 # Export Knowledge node if not already exported
                 k_export_id = k.knowledge_id or k.id
@@ -635,19 +642,18 @@ class TaskNetwork:
                                 gen_count=0,
                                 knowledge_content=k.knowledge,
                                 knowledge_title=k.title,
-                                generator_task_id=node.item.id
-                            )
+                            ),
                         )
                     )
                     exported_knowledge_ids.add(k_export_id)
-                
+
                 # Add generation edge
                 edges_exported.append(
                     GraphExportEdge(
                         id=f"{node.item.id}-{k_export_id}-gen",
                         source=node.item.id,
                         target=k_export_id,
-                        type="generation"
+                        type="generation",
                     )
                 )
 
@@ -675,7 +681,6 @@ class TaskNetwork:
                 )
             )
 
-
         # 2. Export Decomposition Edges
         for parent_id, children in self.children_map.items():
             for child_id in children:
@@ -684,11 +689,13 @@ class TaskNetwork:
                         id=f"{parent_id}-{child_id}",
                         source=parent_id,
                         target=child_id,
-                        type="decomposition"
+                        type="decomposition",
                     )
                 )
 
-        return GraphExportData(nodes=nodes_exported, edges=edges_exported).model_dump(mode='json')
+        return GraphExportData(nodes=nodes_exported, edges=edges_exported).model_dump(
+            mode="json"
+        )
 
     def save_json_sync(self, path: Path):
         import json
@@ -699,6 +706,7 @@ class TaskNetwork:
 
     async def save_json(self, path: Path):
         async with self._lock:
+
             def _write():
                 self.save_json_sync(path)
 
@@ -783,8 +791,10 @@ class TaskResultContext[T, R]:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if exc_type is None and self.completed is None:
-            raise ValueError("No result registered for task (and no exception occurred).")
-        
+            raise ValueError(
+                "No result registered for task (and no exception occurred)."
+            )
+
         if self.completed is not None:
             ret = self.register(self.completed)
             if isawaitable(ret):
@@ -801,14 +811,25 @@ class TaskContext(TaskResultContext[TaskNetworkTask, TaskNetworkCompleted]):
         task = task_network.get_and_setup_next_task()
         return cls(task=task, register=task_network.task_teardown)
 
+    @classmethod
+    async def anext_task_from_network(cls, task_source: Any):
+        """Async variant that allows `task_source.get_and_setup_next_task`
+        to be either sync (returning a task directly) or async (returning a
+        coroutine / awaitable). This is needed to support remote proxies
+        backed by Ray actors, where the call is inherently async.
+        """
+        result = task_source.get_and_setup_next_task()
+        task = await result if isawaitable(result) else result
+        return cls(task=task, register=task_source.task_teardown)
+
 
 def is_study(
     task: TaskResultContext,
-) -> TypeIs[TaskResultContext[StudyTask, StudyTaskCompleted]]:
+) -> TypeGuard[TaskResultContext[StudyTask, StudyTaskCompleted]]:
     return isinstance(task.task, StudyTask)
 
 
 def is_slice(
     task: TaskResultContext,
-) -> TypeIs[TaskResultContext[SlicingTask, SlicingTaskCompleted]]:
+) -> TypeGuard[TaskResultContext[SlicingTask, SlicingTaskCompleted]]:
     return isinstance(task.task, SlicingTask)

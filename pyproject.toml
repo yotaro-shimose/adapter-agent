@@ -9,13 +9,12 @@ dependencies = [
     "mcp>=1.25.0",
     "peft>=0.18.1",
     "polars>=1.37.1",
-    "python-dotenv>=1.0.0",
     "rich>=14.2.0",
     "transformers>=4.56.0",
     "trl>=0.26.2",
     "flash-attn",
     "vllm>=0.13.0",
-    "litellm==1.81",
+    "litellm==1.83.7",
     "openai>=2.14.0",
     "chz>=0.4.0",
     "tinker-cookbook",
@@ -41,9 +40,10 @@ dependencies = [
     "aiosqlite>=0.22.1",
     "asyncpg>=0.29.0",
     "prisma>=0.15.0",
-    "fastmcp>=3.2.3",
     "openai-agents>=0.14.1",
     "orjson>=3.11.8",
+    "fastmcp>=2.2.0",
+    "python-dotenv>=1.0.1",
 ]
 
 [build-system]

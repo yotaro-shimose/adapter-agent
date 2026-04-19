@@ -1,11 +1,26 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 import tinker
+from pydantic import BaseModel
 from tinker.types.loss_fn_type import LossFnType
-from adapter_agent.hierarchical.types import Knowledge
+from adapter_agent.hierarchical.types import Knowledge, Task
 from adapter_agent.data import QRA
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.rl.config import ModelLoadingSettings
+
+
+class SeedSuite(BaseModel):
+    name: str  # eval metric suite name & RL source tag for DB logging
+    tasks: list[Task]
+    for_rl: bool = True
+    for_eval: bool = True
+
+
+@dataclass
+class RLSource:
+    """Origin tag for an RL task, written to simpletrajectory for grouping."""
+    id: str
+    title: str
 
 @dataclass
 class RuntimeExecutionResult:
@@ -36,20 +51,22 @@ class PipelineConfig:
     eval_concurrency: int
     generation_concurrency: int
     simple_train_id: str
-    knowledge_list: list[Knowledge]
+    granular_id: str
+    study_experiment_id: str
     library_name: str
     runtime_settings: RuntimeSettings
     model_loading_settings: ModelLoadingSettings
     k_sft: int = 32
     k_eval: int = 1
     eval_rollout: int = 4
-    init_sft_steps: int = 5
     iter_sft_steps: int = 1
     sft_batch_size: int = 32
+    save_sft_checkpoint: bool = False
     adam_params: tinker.AdamParams = field(
         default_factory=lambda: tinker.AdamParams(learning_rate=1e-4)
     )
     max_iterations: int = 50
+    rl_checkpoint_interval: int = 10
     cache_dir: Path = Path(".cache/simple_internalizer")
     k_rl: int = 4
     rl_rollout: int = 8
@@ -58,10 +75,11 @@ class PipelineConfig:
     )
     rl_loss_fn: LossFnType = "importance_sampling"
     rl_batch_size: int = 48
+    rl_metrics_window: int = 50
     rl_worker_stagger_s: float = 2.0
     kl_penalty_coef: float = 0.05
     kl_discount_factor: float = 1.0
-    extra_eval_suites: dict[str, list[str]] = field(default_factory=dict)
+    extra_seed_suites: list[SeedSuite] = field(default_factory=list)
     stop_grpo: bool = False
     ttl_seconds: int = 604800
     max_fix_attempts: int = 3

@@ -2,6 +2,7 @@ import asyncio
 import itertools
 import logging
 import pickle
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional, Self
 
@@ -23,7 +24,7 @@ from adapter_agent.hierarchical.agent.generator import GeneratorAgent
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.grpo import compute_grpo_loss
 from adapter_agent.hierarchical.state import RLGroup
-from adapter_agent.hierarchical.types import Knowledge
+from adapter_agent.hierarchical.types import Knowledge, Task
 from adapter_agent.model_helper import get_gemini
 from adapter_agent.rl.config import OptimizerParams
 from adapter_agent.rl.env.runtime_pool import RuntimePool
@@ -32,13 +33,57 @@ from adapter_agent.rl.shared_sampling_client import SharedSamplingClient
 
 from .evaluate_worker import EvaluateWorker
 from .executor import InternalizeExecutor
-from .types import PipelineConfig, PreparedTasks
+from .types import PipelineConfig, PreparedTasks, RLSource, SeedSuite
 
 logger = logging.getLogger(__name__)
 
 # Suppress noisy logs
 logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 logging.getLogger("coder_mcp.runtime.runtime").setLevel(logging.WARNING)
+
+
+@dataclass
+class RLBatchState:
+    """Accumulates RL groups with decoupled cadences:
+    - `valid_buffer` feeds training (pops exactly `target_valid` when ready).
+    - `window_groups` feeds rollout metrics (flushes every `metrics_window`
+      groups over ALL produced groups, valid or not).
+    Surplus valid groups are retained across calls — none are discarded.
+    """
+
+    target_valid: int
+    metrics_window: int
+    valid_buffer: list[RLGroup] = field(default_factory=list)
+    window_groups: list[RLGroup] = field(default_factory=list)
+
+    def add(self, group: RLGroup) -> dict[str, float] | None:
+        self.window_groups.append(group)
+        if max(group.rewards) > min(group.rewards):
+            self.valid_buffer.append(group)
+        if len(self.window_groups) >= self.metrics_window:
+            return self._flush_window()
+        return None
+
+    def _flush_window(self) -> dict[str, float]:
+        all_rewards = [r for g in self.window_groups for r in g.rewards]
+        num_valid = sum(
+            1 for g in self.window_groups if max(g.rewards) > min(g.rewards)
+        )
+        metrics = {
+            "rollout/mean_reward": sum(all_rewards) / len(all_rewards),
+            "rollout/valid_group_ratio": num_valid / len(self.window_groups),
+            "rollout/window_size": float(len(self.window_groups)),
+        }
+        self.window_groups = []
+        return metrics
+
+    def ready(self) -> bool:
+        return len(self.valid_buffer) >= self.target_valid
+
+    def pop_batch(self) -> list[RLGroup]:
+        batch = self.valid_buffer[: self.target_valid]
+        self.valid_buffer = self.valid_buffer[self.target_valid :]
+        return batch
 
 
 class SimplePipeline:
@@ -54,6 +99,8 @@ class SimplePipeline:
         prisma_client: Prisma,
         reference_client: tinker.SamplingClient,
         log_dir: Path,
+        knowledge_list: list[Knowledge],
+        seed_suites: list[SeedSuite],
     ):
         self.config = config
         self.cache_dir = config.cache_dir
@@ -67,6 +114,8 @@ class SimplePipeline:
         self.ml_logger = ml_logger
         self.prisma_client = prisma_client
         self.reference_client = reference_client
+        self.knowledge_list = knowledge_list
+        self.seed_suites = seed_suites
 
         # New components for decoupled evaluation
         self.shared_sampling_client = SharedSamplingClient(
@@ -76,8 +125,12 @@ class SimplePipeline:
         self.eval_trigger = asyncio.Event()
         self.evaluate_worker: Optional[EvaluateWorker] = None
 
-        self.rl_tasks_queue: asyncio.Queue[tuple[Knowledge, Any]] = asyncio.Queue()
+        self.rl_tasks_queue: asyncio.Queue[tuple[Task, RLSource]] = asyncio.Queue()
         self.rl_results_queue: asyncio.Queue[RLGroup] = asyncio.Queue()
+        self._rl_batch_state = RLBatchState(
+            target_valid=config.rl_batch_size,
+            metrics_window=config.rl_metrics_window,
+        )
 
     @classmethod
     async def create(cls, config: PipelineConfig, rust_doc_analyzer: Any) -> Self:
@@ -131,6 +184,42 @@ class SimplePipeline:
             data={"create": {"id": config.simple_train_id}, "update": {}},
         )
 
+        logger.info(f"Loading granular knowledge from run ID: {config.granular_id}")
+        granulars = await client.granularknowledge.find_many(
+            where={"simple_train_id": config.granular_id}
+        )
+        if not granulars:
+            raise ValueError(
+                f"No granular knowledge found for granular-id={config.granular_id}."
+            )
+        knowledge_list = [
+            Knowledge(id=g.id, title=g.title, content=g.content) for g in granulars
+        ]
+        logger.info(
+            f"Loaded {len(knowledge_list)} granular knowledge items "
+            f"(granular-id={config.granular_id})."
+        )
+
+        study_solved_tasks = await cls._load_solved_seed_tasks(
+            client, config.study_experiment_id
+        )
+        logger.info(
+            f"Loaded {len(study_solved_tasks)} solved seed tasks from experiment "
+            f"'{config.study_experiment_id}'."
+        )
+        study_solved_suite = SeedSuite(
+            name="study_solved",
+            tasks=study_solved_tasks,
+            for_rl=True,
+            for_eval=True,
+        )
+        seed_suites = [study_solved_suite, *config.extra_seed_suites]
+        for s in config.extra_seed_suites:
+            logger.info(
+                f"Registered extra seed suite '{s.name}' with {len(s.tasks)} tasks "
+                f"(for_rl={s.for_rl}, for_eval={s.for_eval})."
+            )
+
         runtime_pool = RuntimePool(
             config.runtime_settings, max_size=config.runtime_pool_size
         )
@@ -153,6 +242,8 @@ class SimplePipeline:
             prisma_client=client,
             reference_client=reference_client,
             log_dir=log_dir,
+            knowledge_list=knowledge_list,
+            seed_suites=seed_suites,
         )
 
     async def _generate_and_cache(
@@ -267,7 +358,11 @@ class SimplePipeline:
             shared_sampling_client=self.shared_sampling_client,
             renderer=self.solver_model.renderer,
             eval_tasks=prepared.eval_tasks,
-            extra_eval_suites=self.config.extra_eval_suites,
+            extra_eval_suites={
+                s.name: [t.instruction for t in s.tasks]
+                for s in self.seed_suites
+                if s.for_eval
+            },
             trigger=self.eval_trigger,
         )
         eval_worker_task = asyncio.create_task(self.evaluate_worker.run_loop())
@@ -280,15 +375,11 @@ class SimplePipeline:
             logger.info(f"Running initial SFT for {self.config.sft_epochs} epochs...")
             await self._run_sft_steps(sft_batch_iter)
 
-            if self.config.init_sft_steps > 0:
+            if self.config.save_sft_checkpoint:
                 logger.info("Saving initial SFT checkpoint...")
-                await checkpoint_utils.save_checkpoint_async(
-                    training_client=self.training_client,
+                await self._save_checkpoint(
                     name="init_sft",
-                    log_path=str(self.log_dir),
                     loop_state={"epochs": self.config.sft_epochs},
-                    kind="both",
-                    ttl_seconds=self.config.ttl_seconds,
                 )
 
                 # Update reference client to the post-SFT state
@@ -311,23 +402,20 @@ class SimplePipeline:
                     await asyncio.sleep(10)  # Wait if purely evaluating
                     continue
 
-                batch_groups = await self._collect_rl_batch(self.config.rl_batch_size)
-
-                # Consume all currently available samples in the queue to minimize off-policy-ness
-                additional_count = 0
-                while not self.rl_results_queue.empty():
-                    batch_groups.append(self.rl_results_queue.get_nowait())
-                    additional_count += 1
-
-                if additional_count > 0:
-                    logger.info(
-                        f"Drained additional {additional_count} samples from queue."
-                    )
+                batch_groups = await self._collect_valid_rl_batch()
 
                 logger.info(
-                    f"Running RL (GRPO) update on collected batch of size {len(batch_groups)}..."
+                    f"Running RL (GRPO) update on valid batch of size {len(batch_groups)}..."
                 )
                 await self._run_grpo_update(batch_groups)
+
+                rl_step = iteration + 1
+                if rl_step % self.config.rl_checkpoint_interval == 0:
+                    logger.info(f"Saving RL checkpoint at step {rl_step}...")
+                    await self._save_checkpoint(
+                        name=f"rl_{rl_step:04d}",
+                        loop_state={"rl_step": rl_step},
+                    )
 
         finally:
             eval_worker_task.cancel()
@@ -344,8 +432,15 @@ class SimplePipeline:
 
     async def _start_rl_workers(self) -> tuple[asyncio.Task, list[asyncio.Task]]:
         rl_tasks = await self._prepare_rl_tasks()
-        for k, qra in rl_tasks:
-            await self.rl_tasks_queue.put((k, qra))
+        for task, source in rl_tasks:
+            await self.rl_tasks_queue.put((task, source))
+
+        for suite in self.seed_suites:
+            if not suite.for_rl:
+                continue
+            source = RLSource(id=suite.name, title=suite.name)
+            for task in suite.tasks:
+                await self.rl_tasks_queue.put((task, source))
 
         num_workers = self.config.rl_worker_count
         worker_tasks: list[asyncio.Task] = []
@@ -365,18 +460,18 @@ class SimplePipeline:
         system_prompt = self.evaluate_worker.system_prompt
         while True:
             try:
-                k, qra = await self.rl_tasks_queue.get()
+                task, source = await self.rl_tasks_queue.get()
                 # Get current shared client snapshot
                 indexed_client = self.shared_sampling_client.get_client()
 
                 group = await self._collect_rl_group(
-                    system_prompt, qra, k, indexed_client
+                    system_prompt, task, source, indexed_client
                 )
                 if group:
                     await self.rl_results_queue.put(group)
 
                 self.rl_tasks_queue.task_done()
-                await self.rl_tasks_queue.put((k, qra))
+                await self.rl_tasks_queue.put((task, source))
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -384,12 +479,12 @@ class SimplePipeline:
                 await asyncio.sleep(1)
 
     async def _collect_rl_group(
-        self, system_prompt: str, qra: Any, knowledge: Knowledge, indexed_client: Any
+        self, system_prompt: str, task: Task, source: RLSource, indexed_client: Any
     ) -> RLGroup | None:
         model_input = self.solver_model.renderer.build_generation_prompt(
             [
                 Message(role="system", content=system_prompt),
-                Message(role="user", content=qra.question),
+                Message(role="user", content=task.instruction),
             ]
         )
 
@@ -430,7 +525,7 @@ class SimplePipeline:
                     answer_text = str(content)
 
                 outcome = await self.executor.run_execution_and_verification(
-                    qra.question, reasoning, answer_text
+                    task.instruction, reasoning, answer_text
                 )
                 is_success, exec_out, verif_out = (
                     outcome.success,
@@ -444,10 +539,10 @@ class SimplePipeline:
                 await self.prisma_client.simpletrajectory.create(
                     data={
                         "simple_train_id": self.config.simple_train_id,
-                        "knowledge_id": knowledge.id,
-                        "knowledge_title": knowledge.title,
+                        "knowledge_id": source.id,
+                        "knowledge_title": source.title,
                         "step": indexed_client.version,
-                        "question": qra.question,
+                        "question": task.instruction,
                         "reasoning": reasoning,
                         "answer": answer_text,
                         "success": is_success,
@@ -470,31 +565,22 @@ class SimplePipeline:
 
         return RLGroup(trajectories=trajectories, rewards=rewards)
 
-    async def _collect_rl_batch(self, batch_size: int) -> list[RLGroup]:
-        logger.info(f"Waiting for a batch of {batch_size} RL groups...")
-        batch_groups = []
-        while len(batch_groups) < batch_size:
-            try:
-                group = await asyncio.wait_for(
-                    self.rl_results_queue.get(), timeout=10.0
-                )
-                batch_groups.append(group)
-            except asyncio.TimeoutError:
-                self.ml_logger.log_metrics(
-                    {"status/collected_rl_groups": len(batch_groups)}
-                )
-        return batch_groups
+    async def _collect_valid_rl_batch(self) -> list[RLGroup]:
+        state = self._rl_batch_state
+        logger.info(
+            f"Collecting until {state.target_valid} valid RL groups are ready "
+            f"(buffered={len(state.valid_buffer)}, window={len(state.window_groups)}/{state.metrics_window})..."
+        )
+        while not state.ready():
+            group = await self.rl_results_queue.get()
+            rollout_metrics = state.add(group)
+            if rollout_metrics is not None:
+                self.ml_logger.log_metrics(rollout_metrics)
+        return state.pop_batch()
 
-    async def _run_grpo_update(self, batch_groups: list[RLGroup]) -> None:
-        if not batch_groups:
+    async def _run_grpo_update(self, valid_groups: list[RLGroup]) -> None:
+        if not valid_groups:
             return
-
-        # Calculate mean reward across all trajectories in all groups
-        all_rewards = [r for g in batch_groups for r in g.rewards]
-        mean_reward = sum(all_rewards) / len(all_rewards) if all_rewards else 0.0
-
-        # Filter for valid groups (those with reward variance)
-        valid_groups = [g for g in batch_groups if max(g.rewards) > min(g.rewards)]
 
         optimizer_params = OptimizerParams(
             adam_params=self.config.rl_adam_params,
@@ -504,41 +590,41 @@ class SimplePipeline:
             kl_discount_factor=self.config.kl_discount_factor,
         )
 
-        res = None
-        if valid_groups:
-            res = await compute_grpo_loss(
-                valid_groups,
-                self.training_client,
-                optimizer_params,
-                kl_reference_client=self.reference_client,
-            )
-
-        if res:
-            opt_future = await self.training_client.optim_step_async(
-                self.config.rl_adam_params
-            )
-            await opt_future.result_async()
-
-            metrics = {f"rl/{k}": v for k, v in res.metrics.items()}
-        else:
-            metrics = {}
-
-        metrics.update(
-            {
-                "rl/mean_reward": mean_reward,
-                "rl/num_valid_groups": len(valid_groups),
-                "rl/num_total_groups": len(batch_groups),
-            }
+        res = await compute_grpo_loss(
+            valid_groups,
+            self.training_client,
+            optimizer_params,
+            kl_reference_client=self.reference_client,
         )
+
+        if not res:
+            return
+
+        opt_future = await self.training_client.optim_step_async(
+            self.config.rl_adam_params
+        )
+        await opt_future.result_async()
+
+        metrics = {f"rl/{k}": v for k, v in res.metrics.items()}
+        metrics["rl/train_batch_size"] = float(len(valid_groups))
         self.ml_logger.log_metrics(metrics)
 
-        if res:
-            logger.info("Synchronizing sampling weights and triggering evaluation...")
-            new_client = (
-                await self.training_client.save_weights_and_get_sampling_client_async()
-            )
-            self.shared_sampling_client.update_client(new_client)
-            self.eval_trigger.set()
+        logger.info("Synchronizing sampling weights and triggering evaluation...")
+        new_client = (
+            await self.training_client.save_weights_and_get_sampling_client_async()
+        )
+        self.shared_sampling_client.update_client(new_client)
+        self.eval_trigger.set()
+
+    async def _save_checkpoint(self, name: str, loop_state: dict[str, Any]) -> None:
+        await checkpoint_utils.save_checkpoint_async(
+            training_client=self.training_client,
+            name=name,
+            log_path=str(self.log_dir),
+            loop_state=loop_state,
+            kind="both",
+            ttl_seconds=self.config.ttl_seconds,
+        )
 
     async def _run_sft_steps(self, batch_iter: Iterable[list[Datum]]) -> None:
         adam_params = self.config.adam_params
@@ -576,13 +662,13 @@ class SimplePipeline:
             return s_qras, e_item
 
         results = await asyncio.gather(
-            *[_prep_single(k) for k in self.config.knowledge_list]
+            *[_prep_single(k) for k in self.knowledge_list]
         )
 
-        self._print_generation_summary(self.config.knowledge_list, results)
+        self._print_generation_summary(self.knowledge_list, results)
 
         # Save SFT QRAs to database for visualization
-        for k, (s_qras, _) in zip(self.config.knowledge_list, results):
+        for k, (s_qras, _) in zip(self.knowledge_list, results):
             for qra in s_qras:
                 try:
                     # Check if already exists to avoid duplication on re-runs
@@ -611,17 +697,47 @@ class SimplePipeline:
         eval_tasks = [r[1] for r in results if r[1] is not None]
         return PreparedTasks(sft_qras=sft_qras, eval_tasks=eval_tasks)
 
-    async def _prepare_rl_tasks(self) -> list[tuple[Knowledge, Any]]:
+    async def _prepare_rl_tasks(self) -> list[tuple[Task, RLSource]]:
         async def _prep_single(k: Knowledge):
-            tasks = await self._generate_and_cache(
+            qras = await self._generate_and_cache(
                 k, self.config.k_rl, "rl", verify=False, is_coding=True
             )
-            return [(k, t) for t in tasks]
+            source = RLSource(id=k.id, title=k.title)
+            return [(Task(instruction=q.question), source) for q in qras]
 
         results = await asyncio.gather(
-            *[_prep_single(k) for k in self.config.knowledge_list]
+            *[_prep_single(k) for k in self.knowledge_list]
         )
         return list(itertools.chain.from_iterable(results))
+
+    @staticmethod
+    async def _load_solved_seed_tasks(
+        client: Prisma, experiment_id: str
+    ) -> list[Task]:
+        """Fetch root tasks directly under pseudo_root that are marked solved
+        in the study experiment's graph."""
+        experiment = await client.experiment.find_unique(
+            where={"experiment_name": experiment_id}
+        )
+        if experiment is None or not experiment.graph_json:
+            raise ValueError(f"Experiment '{experiment_id}' has no graph_json.")
+
+        graph = experiment.graph_json
+        pseudo_root_id = "pseudo_root"
+        root_child_ids = {
+            e["target"]
+            for e in graph.get("edges", [])
+            if e.get("type") == "decomposition" and e.get("source") == pseudo_root_id
+        }
+        tasks: list[Task] = []
+        for node in graph.get("nodes", []):
+            if node.get("type") != "task" or node["id"] not in root_child_ids:
+                continue
+            if not node.get("metadata", {}).get("is_solved"):
+                continue
+            instruction = node["metadata"]["instruction"]
+            tasks.append(Task(id=node["id"], instruction=instruction))
+        return tasks
 
     def _create_sft_batch_iterator(
         self, sft_qras: list[QRA], num_epochs: int

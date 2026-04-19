@@ -17,9 +17,9 @@ logger = logging.getLogger(__name__)
 
 async def main():
     parser = argparse.ArgumentParser(description="Prepare granular knowledge from Wiki articles")
-    parser.add_argument("--version", type=str, default="lab_verification", help="Wiki version to load articles from")
-    parser.add_argument("--simple-train-id", type=str, default=None, help="SimpleTrainRun ID to associate with")
-    parser.add_argument("--concurrency", type=int, default=10, help="Concurrency for granular knowledge generation")
+    parser.add_argument("--version", type=str, default="study_20260418_233708", help="Wiki version to load articles from")
+    parser.add_argument("--granular-id", type=str, default=None, help="SimpleTrainRun ID to associate the granular knowledge with")
+    parser.add_argument("--concurrency", type=int, default=50, help="Concurrency for granular knowledge generation")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -32,18 +32,18 @@ async def main():
     db = Prisma()
     await db.connect()
 
-    # 1. Setup Train Run ID
-    train_id = args.simple_train_id or f"granular_prep_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    
-    # Ensure SimpleTrainRun exists
+    # 1. Setup Granular Run ID
+    granular_id = args.granular_id or f"granular_prep_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    # Ensure SimpleTrainRun exists (GranularKnowledge FKs into it)
     await db.simpletrainrun.upsert(
-        where={"id": train_id},
+        where={"id": granular_id},
         data={
-            "create": {"id": train_id},
+            "create": {"id": granular_id},
             "update": {}
         }
     )
-    logger.info(f"Using SimpleTrainRun ID: {train_id}")
+    logger.info(f"Using granular ID: {granular_id}")
 
     # 2. Fetch Articles
     wiki_manager = WikiManager(db, version=args.version)
@@ -84,7 +84,7 @@ async def main():
                 try:
                     await db.granularknowledge.create(
                         data={
-                            "simple_train_id": train_id,
+                            "simple_train_id": granular_id,
                             "title": knowledge.title,
                             "content": knowledge.content,
                         }
