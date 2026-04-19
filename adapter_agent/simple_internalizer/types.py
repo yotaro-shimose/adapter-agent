@@ -3,8 +3,7 @@ from pathlib import Path
 import tinker
 from pydantic import BaseModel
 from tinker.types.loss_fn_type import LossFnType
-from adapter_agent.hierarchical.types import Knowledge, Task
-from adapter_agent.data import QRA
+from adapter_agent.hierarchical.types import Task
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.rl.config import ModelLoadingSettings
 
@@ -40,9 +39,19 @@ class EvalResult:
     total_count: int
 
 @dataclass
-class PreparedTasks:
-    sft_qras: list[QRA]
-    eval_tasks: list[tuple[Knowledge, QRA]]
+class SFTConfig:
+    """SFT-stage settings. Presence of this config enables the SFT stage;
+    set `PipelineConfig.sft = None` to skip SFT entirely."""
+
+    k_sft: int = 32
+    epochs: int = 1
+    batch_size: int = 32
+    save_checkpoint: bool = False
+    adam_params: tinker.AdamParams = field(
+        default_factory=lambda: tinker.AdamParams(learning_rate=1e-4)
+    )
+    cpt: bool = False
+
 
 @dataclass
 class PipelineConfig:
@@ -51,24 +60,14 @@ class PipelineConfig:
     eval_concurrency: int
     generation_concurrency: int
     simple_train_id: str
-    granular_id: str
-    study_experiment_id: str
     library_name: str
     runtime_settings: RuntimeSettings
     model_loading_settings: ModelLoadingSettings
-    k_sft: int = 32
-    k_eval: int = 1
+    sft: SFTConfig | None = None
     eval_rollout: int = 4
-    iter_sft_steps: int = 1
-    sft_batch_size: int = 32
-    save_sft_checkpoint: bool = False
-    adam_params: tinker.AdamParams = field(
-        default_factory=lambda: tinker.AdamParams(learning_rate=1e-4)
-    )
     max_iterations: int = 50
     rl_checkpoint_interval: int = 10
     cache_dir: Path = Path(".cache/simple_internalizer")
-    k_rl: int = 4
     rl_rollout: int = 8
     rl_adam_params: tinker.AdamParams = field(
         default_factory=lambda: tinker.AdamParams(learning_rate=1e-5)
@@ -79,9 +78,5 @@ class PipelineConfig:
     rl_worker_stagger_s: float = 2.0
     kl_penalty_coef: float = 0.05
     kl_discount_factor: float = 1.0
-    extra_seed_suites: list[SeedSuite] = field(default_factory=list)
     stop_grpo: bool = False
     ttl_seconds: int = 604800
-    max_fix_attempts: int = 3
-    sft_epochs: int = 1
-    cpt: bool = False
