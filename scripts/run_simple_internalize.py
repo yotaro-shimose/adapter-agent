@@ -121,7 +121,6 @@ async def main() -> None:
         rl_checkpoint_interval=10,
         rl_adam_params=tinker.AdamParams(learning_rate=2e-4),
         rl_loss_fn="cispo",
-        stop_grpo=False,
         kl_penalty_coef=0.0,
         kl_discount_factor=0.0,
     )

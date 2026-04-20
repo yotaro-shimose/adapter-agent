@@ -10,9 +10,11 @@ import asyncio
 import logging
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import tinker
 from dotenv import load_dotenv
+from tinker_cookbook.utils.ml_log import Logger as MLLogger
 
 from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
 from adapter_agent.rl.config import ModelLoadingSettings
@@ -29,6 +31,26 @@ logging.getLogger("adapter_agent.internalize").setLevel(logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
+class ClockCycleFilteredLogger(MLLogger):
+    """MLLogger wrapper that drops metric keys containing 'clock_cycle'."""
+
+    def __init__(self, base: MLLogger) -> None:
+        self._base = base
+
+    def log_hparams(self, config: Any) -> None:
+        self._base.log_hparams(config)
+
+    def log_metrics(
+        self, metrics: dict[str, Any], step: int | None = None
+    ) -> None:
+        filtered = {k: v for k, v in metrics.items() if "clock_cycle" not in k}
+        self._base.log_metrics(filtered, step)
+
+    def log_long_text(self, key: str, text: str) -> None:
+        self._base.log_long_text(key, text)
+
+    def close(self) -> None:
+        self._base.close()
 
 
 async def main() -> None:
@@ -68,8 +90,8 @@ async def main() -> None:
     )
 
     config = PipelineConfig(
-        runtime_pool_size=100,
-        rl_worker_count=200,
+        runtime_pool_size=50,
+        rl_worker_count=50,
         eval_concurrency=48,
         generation_concurrency=400,
         simple_train_id=simple_train_id,
@@ -83,12 +105,14 @@ async def main() -> None:
         ),
         sft=None,
         eval_rollout=4,
-        rl_rollout=8,
-        max_iterations=50,
+        eval_interval=5,
+        rl_rollout=16,
+        max_iterations=200,
         rl_checkpoint_interval=10,
+        rl_batch_size=96,
+        rl_update_epochs=1,
         rl_adam_params=tinker.AdamParams(learning_rate=2e-4),
         rl_loss_fn="cispo",
-        stop_grpo=False,
         kl_penalty_coef=0.0,
         kl_discount_factor=0.0,
     )
@@ -99,6 +123,10 @@ async def main() -> None:
         knowledge_list=[],
         seed_suites=[study_rl_suite, additional_rl_suite, eval_suite],
     )
+
+    filtered_logger = ClockCycleFilteredLogger(pipeline.ml_logger)
+    pipeline.ml_logger = filtered_logger
+    pipeline.evaluate_worker.ml_logger = filtered_logger
 
     try:
         async with analyzer:

@@ -2,17 +2,19 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional, Self
+from typing import Any, Iterable, Self
 
 import tinker
 from oai_utils.tinker import TinkerModel, setup_tinkermodel
 from oai_utils.tinker.model_helper import get_tokenizer_renderer
 from prisma import Prisma
 from tinker import Datum
+from tinker.types.loss_fn_type import LossFnType
 from tinker_cookbook import checkpoint_utils
+from tinker_cookbook.completers import TokensWithLogprobs
 from tinker_cookbook.renderers import Message, TextPart, ThinkingPart, TrainOnWhat
 from tinker_cookbook.rl import Trajectory
-from tinker_cookbook.rl.types import TokensWithLogprobs, Transition
+from tinker_cookbook.rl.types import Transition, TrajectoryGroup
 from tinker_cookbook.supervised.data import conversation_to_datum
 from tinker_cookbook.utils import ml_log
 from tinker_cookbook.utils.ml_log import Logger as MLLogger
@@ -20,14 +22,17 @@ from tinker_cookbook.utils.ml_log import Logger as MLLogger
 from adapter_agent.data import QRA
 from adapter_agent.hierarchical.agent.generator import GeneratorAgent
 from adapter_agent.hierarchical.agent.verifier import Verifier
-from adapter_agent.hierarchical.grpo import compute_grpo_loss
+from adapter_agent.hierarchical.grpo import _remove_mask
 from adapter_agent.hierarchical.state import RLGroup
 from adapter_agent.hierarchical.types import Knowledge, Task
 from adapter_agent.model_helper import get_gemini
-from adapter_agent.rl.config import OptimizerParams
 from adapter_agent.rl.env.runtime_pool import RuntimePool
 from adapter_agent.rl.postgres_db import PostgresDB
-from adapter_agent.rl.shared_sampling_client import SharedSamplingClient
+from adapter_agent.rl.trajectory import prepare_minibatch_simplified
+from adapter_agent.rl.shared_sampling_client import (
+    IndexedSamplingClient,
+    SharedSamplingClient,
+)
 
 from .data_sources import generate_qras_cached
 from .evaluate_worker import EvaluateWorker
@@ -122,13 +127,23 @@ class SimplePipeline:
         )
         self.log_dir = log_dir
         self.eval_trigger = asyncio.Event()
-        self.evaluate_worker: Optional[EvaluateWorker] = None
 
         self.rl_tasks_queue: asyncio.Queue[tuple[Task, RLSource]] = asyncio.Queue()
         self.rl_results_queue: asyncio.Queue[RLGroup] = asyncio.Queue()
         self._rl_batch_state = RLBatchState(
             target_valid=config.rl_batch_size,
             metrics_window=config.rl_metrics_window,
+        )
+
+        self.evaluate_worker = EvaluateWorker(
+            config=config,
+            executor=executor,
+            ml_logger=ml_logger,
+            prisma_client=prisma_client,
+            shared_sampling_client=self.shared_sampling_client,
+            renderer=solver_model.renderer,
+            eval_suites=[s for s in seed_suites if s.for_eval],
+            trigger=self.eval_trigger,
         )
 
     @classmethod
@@ -248,17 +263,6 @@ class SimplePipeline:
         print("=" * 80 + "\n")
 
     async def run(self) -> None:
-        eval_suites = [s for s in self.seed_suites if s.for_eval]
-        self.evaluate_worker = EvaluateWorker(
-            config=self.config,
-            executor=self.executor,
-            ml_logger=self.ml_logger,
-            prisma_client=self.prisma_client,
-            shared_sampling_client=self.shared_sampling_client,
-            renderer=self.solver_model.renderer,
-            eval_suites=eval_suites,
-            trigger=self.eval_trigger,
-        )
         eval_worker_task = asyncio.create_task(self.evaluate_worker.run_loop())
 
         if self.config.sft is None:
@@ -289,27 +293,21 @@ class SimplePipeline:
         spawner_task = None
         worker_tasks = []
 
-        if not self.config.stop_grpo:
-            spawner_task, worker_tasks = await self._start_rl_workers()
+        spawner_task, worker_tasks = await self._start_rl_workers()
 
         try:
             for iteration in range(self.config.max_iterations):
-                logger.info(
-                    f"--- Iteration {iteration + 1} (RL{' STOPPED' if self.config.stop_grpo else ''}) ---"
-                )
-
-                if self.config.stop_grpo:
-                    await asyncio.sleep(10)  # Wait if purely evaluating
-                    continue
+                logger.info(f"--- Iteration {iteration + 1} (RL) ---")
 
                 batch_groups = await self._collect_valid_rl_batch()
 
                 logger.info(
                     f"Running RL (GRPO) update on valid batch of size {len(batch_groups)}..."
                 )
-                await self._run_grpo_update(batch_groups)
-
                 rl_step = iteration + 1
+                trigger_eval = rl_step % self.config.eval_interval == 0
+                await self._run_grpo_update(batch_groups, trigger_eval=trigger_eval)
+
                 if rl_step % self.config.rl_checkpoint_interval == 0:
                     logger.info(f"Saving RL checkpoint at step {rl_step}...")
                     await self._save_checkpoint(
@@ -351,8 +349,6 @@ class SimplePipeline:
         return spawner_task, worker_tasks
 
     async def _rl_worker(self) -> None:
-        if self.evaluate_worker is None:
-            raise RuntimeError("EvaluateWorker not initialized")
         system_prompt = self.evaluate_worker.system_prompt
         while True:
             try:
@@ -375,7 +371,11 @@ class SimplePipeline:
                 await asyncio.sleep(1)
 
     async def _collect_rl_group(
-        self, system_prompt: str, task: Task, source: RLSource, indexed_client: Any
+        self,
+        system_prompt: str,
+        task: Task,
+        source: RLSource,
+        indexed_client: IndexedSamplingClient,
     ) -> RLGroup | None:
         model_input = self.solver_model.renderer.build_generation_prompt(
             [
@@ -387,7 +387,7 @@ class SimplePipeline:
         sample_results = await indexed_client.client.sample_async(
             prompt=model_input,
             num_samples=self.config.rl_rollout,
-            sampling_params=tinker.SamplingParams(include_logprobs=True),
+            sampling_params=tinker.SamplingParams(),
         )
 
         async def _verify_single_rollout(seq) -> tuple[Trajectory, float]:
@@ -474,43 +474,54 @@ class SimplePipeline:
                 self.ml_logger.log_metrics(rollout_metrics)
         return state.pop_batch()
 
-    async def _run_grpo_update(self, valid_groups: list[RLGroup]) -> None:
+    async def _run_grpo_update(
+        self, valid_groups: list[RLGroup], trigger_eval: bool = True
+    ) -> None:
         if not valid_groups:
             return
 
-        optimizer_params = OptimizerParams(
-            adam_params=self.config.rl_adam_params,
-            loss_fn=self.config.rl_loss_fn,
-            num_steps=1,
+        traj_groups = [
+            TrajectoryGroup(
+                trajectories_G=g.trajectories,
+                final_rewards_G=g.rewards,
+                metrics_G=[{} for _ in g.rewards],
+            )
+            for g in valid_groups
+        ]
+        data_D, kl_metrics = await prepare_minibatch_simplified(
+            trajectory_groups=traj_groups,
+            regularization="group_std",
+            kl_reference_client=self.reference_client,
             kl_penalty_coef=self.config.kl_penalty_coef,
             kl_discount_factor=self.config.kl_discount_factor,
         )
-
-        res = await compute_grpo_loss(
-            valid_groups,
-            self.training_client,
-            optimizer_params,
-            kl_reference_client=self.reference_client,
-        )
-
-        if not res:
+        if not data_D:
+            logger.warning("No valid training data assembled for GRPO step.")
             return
 
-        opt_future = await self.training_client.optim_step_async(
-            self.config.rl_adam_params
+        clean_data_D = [_remove_mask(d) for d in data_D]
+        if kl_metrics:
+            self.ml_logger.log_metrics({f"rl/{k}": v for k, v in kl_metrics.items()})
+        self.ml_logger.log_metrics(
+            {"rl/train_batch_size": float(len(valid_groups))}
         )
-        await opt_future.result_async()
 
-        metrics = {f"rl/{k}": v for k, v in res.metrics.items()}
-        metrics["rl/train_batch_size"] = float(len(valid_groups))
-        self.ml_logger.log_metrics(metrics)
+        batch_iter = (clean_data_D for _ in range(self.config.rl_update_epochs))
+        await self._run_training_steps(
+            batch_iter=batch_iter,
+            prefix="rl",
+            loss_fn=self.config.rl_loss_fn,
+            adam_params=self.config.rl_adam_params,
+        )
 
-        logger.info("Synchronizing sampling weights and triggering evaluation...")
+        logger.info("Synchronizing sampling weights...")
         new_client = (
             await self.training_client.save_weights_and_get_sampling_client_async()
         )
         self.shared_sampling_client.update_client(new_client)
-        self.eval_trigger.set()
+        if trigger_eval:
+            logger.info("Triggering evaluation.")
+            self.eval_trigger.set()
 
     async def _save_checkpoint(self, name: str, loop_state: dict[str, Any]) -> None:
         await checkpoint_utils.save_checkpoint_async(
@@ -522,20 +533,59 @@ class SimplePipeline:
             ttl_seconds=self.config.ttl_seconds,
         )
 
-    async def _run_sft_steps(self, batch_iter: Iterable[list[Datum]]) -> None:
-        assert self.config.sft is not None, "_run_sft_steps requires config.sft to be set"
-        adam_params = self.config.sft.adam_params
-        for batch in batch_iter:
-            fwd_future = await self.training_client.forward_backward_async(
-                data=batch, loss_fn="cross_entropy"
+    async def _run_training_steps(
+        self,
+        batch_iter: Iterable[list[Datum]],
+        prefix: str,
+        loss_fn: LossFnType,
+        adam_params: tinker.AdamParams,
+    ) -> None:
+        """Forward/backward + optim_step over batches using look-ahead pipelining:
+        the next batch's update is enqueued before the current batch's results
+        are awaited, keeping the server busy during client-side logging.
+        """
+        iterator = iter(batch_iter)
+        try:
+            first_batch = next(iterator)
+        except StopIteration:
+            return
+
+        fwd_future = await self.training_client.forward_backward_async(
+            data=first_batch, loss_fn=loss_fn
+        )
+        opt_future = await self.training_client.optim_step_async(adam_params)
+
+        for next_batch in iterator:
+            next_fwd_future = await self.training_client.forward_backward_async(
+                data=next_batch, loss_fn=loss_fn
             )
-            opt_future = await self.training_client.optim_step_async(adam_params)
+            next_opt_future = await self.training_client.optim_step_async(adam_params)
+
             fwd_res = await fwd_future.result_async()
             await opt_future.result_async()
-
             self.ml_logger.log_metrics(
-                {f"sft/{k}": v for k, v in fwd_res.metrics.items()}
+                {f"{prefix}/{k}": v for k, v in fwd_res.metrics.items()}
             )
+
+            fwd_future = next_fwd_future
+            opt_future = next_opt_future
+
+        fwd_res = await fwd_future.result_async()
+        await opt_future.result_async()
+        self.ml_logger.log_metrics(
+            {f"{prefix}/{k}": v for k, v in fwd_res.metrics.items()}
+        )
+
+    async def _run_sft_steps(self, batch_iter: Iterable[list[Datum]]) -> None:
+        assert self.config.sft is not None, (
+            "_run_sft_steps requires config.sft to be set"
+        )
+        await self._run_training_steps(
+            batch_iter=batch_iter,
+            prefix="sft",
+            loss_fn="cross_entropy",
+            adam_params=self.config.sft.adam_params,
+        )
 
         logger.info(
             "Synchronizing sampling weights after SFT and triggering evaluation..."
@@ -547,7 +597,9 @@ class SimplePipeline:
         self.eval_trigger.set()
 
     async def _prepare_sft_qras(self) -> list[QRA]:
-        assert self.config.sft is not None, "_prepare_sft_qras requires config.sft to be set"
+        assert self.config.sft is not None, (
+            "_prepare_sft_qras requires config.sft to be set"
+        )
 
         per_knowledge_qras: list[list[QRA]] = await asyncio.gather(
             *[
@@ -594,7 +646,9 @@ class SimplePipeline:
     def _create_sft_batch_iterator(
         self, sft_qras: list[QRA], num_epochs: int
     ) -> Iterable[list[Datum]]:
-        assert self.config.sft is not None, "_create_sft_batch_iterator requires config.sft to be set"
+        assert self.config.sft is not None, (
+            "_create_sft_batch_iterator requires config.sft to be set"
+        )
         _, renderer = get_tokenizer_renderer(
             self.training_client, self.config.model_loading_settings.model_name
         )

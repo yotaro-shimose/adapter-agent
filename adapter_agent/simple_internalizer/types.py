@@ -65,6 +65,7 @@ class PipelineConfig:
     model_loading_settings: ModelLoadingSettings
     sft: SFTConfig | None = None
     eval_rollout: int = 4
+    eval_interval: int = 1
     max_iterations: int = 50
     rl_checkpoint_interval: int = 10
     cache_dir: Path = Path(".cache/simple_internalizer")
@@ -74,9 +75,9 @@ class PipelineConfig:
     )
     rl_loss_fn: LossFnType = "importance_sampling"
     rl_batch_size: int = 48
+    rl_update_epochs: int = 1
     rl_metrics_window: int = 50
     rl_worker_stagger_s: float = 2.0
     kl_penalty_coef: float = 0.05
     kl_discount_factor: float = 1.0
-    stop_grpo: bool = False
     ttl_seconds: int = 604800
