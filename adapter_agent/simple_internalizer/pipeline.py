@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Iterable, Self
 
 import tinker
+from oai_utils import AgentsSDKModel
 from oai_utils.tinker import TinkerModel, setup_tinkermodel
 from oai_utils.tinker.model_helper import get_tokenizer_renderer
 from prisma import Prisma
@@ -14,7 +15,7 @@ from tinker_cookbook import checkpoint_utils
 from tinker_cookbook.completers import TokensWithLogprobs
 from tinker_cookbook.renderers import Message, TextPart, ThinkingPart, TrainOnWhat
 from tinker_cookbook.rl import Trajectory
-from tinker_cookbook.rl.types import Transition, TrajectoryGroup
+from tinker_cookbook.rl.types import TrajectoryGroup, Transition
 from tinker_cookbook.supervised.data import conversation_to_datum
 from tinker_cookbook.utils import ml_log
 from tinker_cookbook.utils.ml_log import Logger as MLLogger
@@ -25,14 +26,14 @@ from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.grpo import _remove_mask
 from adapter_agent.hierarchical.state import RLGroup
 from adapter_agent.hierarchical.types import Knowledge, Task
-from adapter_agent.model_helper import get_gemini
+from adapter_agent.model_helper import get_gemini, get_gemini_lite
 from adapter_agent.rl.env.runtime_pool import RuntimePool
 from adapter_agent.rl.postgres_db import PostgresDB
-from adapter_agent.rl.trajectory import prepare_minibatch_simplified
 from adapter_agent.rl.shared_sampling_client import (
     IndexedSamplingClient,
     SharedSamplingClient,
 )
+from adapter_agent.rl.trajectory import prepare_minibatch_simplified
 
 from .data_sources import generate_qras_cached
 from .evaluate_worker import EvaluateWorker
@@ -97,7 +98,7 @@ class SimplePipeline:
         service_client: tinker.ServiceClient,
         training_client: tinker.TrainingClient,
         solver_model: TinkerModel,
-        generator: GeneratorAgent,
+        generator: GeneratorAgent | None,
         executor: InternalizeExecutor,
         ml_logger: MLLogger,
         prisma_client: Prisma,
@@ -154,9 +155,16 @@ class SimplePipeline:
         knowledge_list: list[Knowledge],
         seed_suites: list[SeedSuite],
     ) -> Self:
-        gemini = get_gemini()
-        generator = GeneratorAgent(model=gemini, rust_doc_analyzer=rust_doc_analyzer)
-        verifier = Verifier(model=gemini, rust_doc_analyzer=rust_doc_analyzer)
+        verifier_model: AgentsSDKModel = config.verifier_model or get_gemini_lite()
+        verifier = Verifier(model=verifier_model, rust_doc_analyzer=rust_doc_analyzer)
+        generator: GeneratorAgent | None = None
+        if config.sft is not None:
+            generator_model: AgentsSDKModel = (
+                config.sft.generator_model or get_gemini()
+            )
+            generator = GeneratorAgent(
+                model=generator_model, rust_doc_analyzer=rust_doc_analyzer
+            )
 
         service_client = tinker.ServiceClient()
         training_client = await service_client.create_lora_training_client_async(
@@ -502,9 +510,7 @@ class SimplePipeline:
         clean_data_D = [_remove_mask(d) for d in data_D]
         if kl_metrics:
             self.ml_logger.log_metrics({f"rl/{k}": v for k, v in kl_metrics.items()})
-        self.ml_logger.log_metrics(
-            {"rl/train_batch_size": float(len(valid_groups))}
-        )
+        self.ml_logger.log_metrics({"rl/train_batch_size": float(len(valid_groups))})
 
         batch_iter = (clean_data_D for _ in range(self.config.rl_update_epochs))
         await self._run_training_steps(
@@ -599,6 +605,9 @@ class SimplePipeline:
     async def _prepare_sft_qras(self) -> list[QRA]:
         assert self.config.sft is not None, (
             "_prepare_sft_qras requires config.sft to be set"
+        )
+        assert self.generator is not None, (
+            "_prepare_sft_qras requires a generator (set when config.sft is not None)"
         )
 
         per_knowledge_qras: list[list[QRA]] = await asyncio.gather(

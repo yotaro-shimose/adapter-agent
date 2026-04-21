@@ -104,3 +104,11 @@ def get_gemini() -> LitellmModel:
     if not api_key:
         raise ValueError("Error: GEMINI_API_KEY not set.")
     return LitellmModel(model=model_name, api_key=api_key)
+
+
+def get_gemini_lite() -> LitellmModel:
+    model_name = "gemini/gemini-flash-lite-latest"
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("Error: GEMINI_API_KEY not set.")
+    return LitellmModel(model=model_name, api_key=api_key)

@@ -1,11 +1,14 @@
 from dataclasses import dataclass, field
 from pathlib import Path
+
 import tinker
+from oai_utils import AgentsSDKModel
 from pydantic import BaseModel
 from tinker.types.loss_fn_type import LossFnType
+
 from adapter_agent.hierarchical.types import Task
-from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.rl.config import ModelLoadingSettings
+from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 
 
 class SeedSuite(BaseModel):
@@ -18,8 +21,10 @@ class SeedSuite(BaseModel):
 @dataclass
 class RLSource:
     """Origin tag for an RL task, written to simpletrajectory for grouping."""
+
     id: str
     title: str
+
 
 @dataclass
 class RuntimeExecutionResult:
@@ -27,16 +32,19 @@ class RuntimeExecutionResult:
     tree_output: str
     exit_success: bool
 
+
 @dataclass
 class VerificationOutcome:
     success: bool
     execution_output: str
     verification_output: str
 
+
 @dataclass
 class EvalResult:
     success_count: int
     total_count: int
+
 
 @dataclass
 class SFTConfig:
@@ -51,6 +59,7 @@ class SFTConfig:
         default_factory=lambda: tinker.AdamParams(learning_rate=1e-4)
     )
     cpt: bool = False
+    generator_model: AgentsSDKModel | None = None
 
 
 @dataclass
@@ -81,3 +90,4 @@ class PipelineConfig:
     kl_penalty_coef: float = 0.05
     kl_discount_factor: float = 1.0
     ttl_seconds: int = 604800
+    verifier_model: AgentsSDKModel | None = None
