@@ -17,6 +17,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
+import os
 
 import tinker
 from dotenv import load_dotenv
@@ -61,7 +62,7 @@ logging.basicConfig(
 logging.getLogger("adapter_agent.internalize").setLevel(logging.DEBUG)
 
 logger = logging.getLogger(__name__)
-
+os.environ["OPENAI_AGENTS_DISABLE_TRACING"] = "1"
 
 class ClockCycleFilteredLogger(MLLogger):
     def __init__(self, base: MLLogger) -> None:
