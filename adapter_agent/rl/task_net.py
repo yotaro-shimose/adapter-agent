@@ -102,7 +102,6 @@ class TaskWithMeta:
 @dataclass(kw_only=True)
 class StudyTask:
     task: Task
-    knowledges: list[str] = field(default_factory=list)
     is_generation: bool
 
     @property
@@ -114,7 +113,6 @@ class StudyTask:
     ) -> StudyTaskCompleted:
         return StudyTaskCompleted(
             task=self.task,
-            knowledges=self.knowledges,
             is_generation=self.is_generation,
             result=result,
             new_task=new_task,
@@ -273,13 +271,11 @@ class TaskNetwork:
                         raise AllTasksCompleted("No more tasks in the pool.")
                     study_task = StudyTask(
                         task=new_task,
-                        knowledges=[],
                         is_generation=False,
                     )
                 else:
                     study_task = StudyTask(
                         task=node.item,
-                        knowledges=self._get_solved_subtask_knowledges(curr_id),
                         is_generation=True,
                     )
                 break
@@ -287,7 +283,6 @@ class TaskNetwork:
             if self._should_prioritize_parent(curr_id):
                 study_task = StudyTask(
                     task=node.item,
-                    knowledges=self._get_solved_subtask_knowledges(curr_id),
                     is_generation=False,
                 )
                 break
@@ -304,13 +299,11 @@ class TaskNetwork:
                         raise AllTasksCompleted("No more tasks in the pool.")
                     study_task = StudyTask(
                         task=new_task,
-                        knowledges=[],
                         is_generation=False,
                     )
                 else:
                     study_task = StudyTask(
                         task=node.item,
-                        knowledges=self._get_solved_subtask_knowledges(curr_id),
                         is_generation=False,
                     )
                 break
@@ -480,15 +473,6 @@ class TaskNetwork:
             effective_children_count
             <= self.pd_params.k * (n_s**self.pd_params.alpha) - 1
         )
-
-    def _get_solved_subtask_knowledges(self, node_id: str) -> list[str]:
-        knowledges = []
-        for child_id in self.children_map.get(node_id, []):
-            child_node = self.nodes[child_id]
-            if child_node.knowledge_finalized_at:
-                for k in child_node.knowledges.values():
-                    knowledges.append(k.knowledge)
-        return knowledges
 
     def to_pyvis(
         self, node_ids: set[str] | None = None, recent_ids: set[str] | None = None

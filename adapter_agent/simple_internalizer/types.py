@@ -87,7 +87,7 @@ class PipelineConfig:
     rl_update_epochs: int = 1
     rl_metrics_window: int = 50
     rl_worker_stagger_s: float = 2.0
-    kl_penalty_coef: float = 0.05
-    kl_discount_factor: float = 1.0
+    kl_penalty_coef: float = 0.0
+    kl_discount_factor: float = 0.0
     ttl_seconds: int = 604800
     verifier_model: AgentsSDKModel | None = None

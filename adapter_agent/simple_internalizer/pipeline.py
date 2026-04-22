@@ -12,10 +12,8 @@ from prisma import Prisma
 from tinker import Datum
 from tinker.types.loss_fn_type import LossFnType
 from tinker_cookbook import checkpoint_utils
-from tinker_cookbook.completers import TokensWithLogprobs
 from tinker_cookbook.renderers import Message, TextPart, ThinkingPart, TrainOnWhat
-from tinker_cookbook.rl import Trajectory
-from tinker_cookbook.rl.types import TrajectoryGroup, Transition
+from tinker_cookbook.rl.types import TrajectoryGroup
 from tinker_cookbook.supervised.data import conversation_to_datum
 from tinker_cookbook.utils import ml_log
 from tinker_cookbook.utils.ml_log import Logger as MLLogger
@@ -25,20 +23,22 @@ from adapter_agent.hierarchical.agent.generator import GeneratorAgent
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.grpo import _remove_mask
 from adapter_agent.hierarchical.state import RLGroup
-from adapter_agent.hierarchical.types import Knowledge, Task
+from adapter_agent.hierarchical.types import Knowledge
+from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
 from adapter_agent.model_helper import get_gemini, get_gemini_lite
 from adapter_agent.rl.env.runtime_pool import RuntimePool
 from adapter_agent.rl.postgres_db import PostgresDB
-from adapter_agent.rl.shared_sampling_client import (
-    IndexedSamplingClient,
-    SharedSamplingClient,
-)
+from adapter_agent.rl.shared_sampling_client import SharedSamplingClient
+from adapter_agent.rl.task_net import StudyTask
 from adapter_agent.rl.trajectory import prepare_minibatch_simplified
 
-from .data_sources import generate_qras_cached
-from .evaluate_worker import EvaluateWorker
-from .executor import InternalizeExecutor
-from .types import PipelineConfig, RLSource, SeedSuite
+from adapter_agent.simple_internalizer.data_sources import generate_qras_cached
+from adapter_agent.simple_internalizer.distilled_qra_manager import DistilledQRAManager
+from adapter_agent.simple_internalizer.evaluate_worker import EvaluateWorker
+from adapter_agent.simple_internalizer.executor import InternalizeExecutor
+from adapter_agent.simple_internalizer.rl_worker_pool import RLWorkerPool
+from adapter_agent.simple_internalizer.rollout_engine import RolloutEngine, build_solver_system_prompt
+from adapter_agent.simple_internalizer.types import PipelineConfig, SeedSuite
 
 logger = logging.getLogger(__name__)
 
@@ -91,72 +91,89 @@ class RLBatchState:
         return batch
 
 
+@dataclass
 class SimplePipeline:
-    def __init__(
-        self,
-        config: PipelineConfig,
-        service_client: tinker.ServiceClient,
-        training_client: tinker.TrainingClient,
-        solver_model: TinkerModel,
-        generator: GeneratorAgent | None,
-        executor: InternalizeExecutor,
-        ml_logger: MLLogger,
-        prisma_client: Prisma,
-        reference_client: tinker.SamplingClient,
-        log_dir: Path,
-        knowledge_list: list[Knowledge],
-        seed_suites: list[SeedSuite],
-    ):
-        self.config = config
-        self.cache_dir = config.cache_dir
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+    """知識内在化 (SFT) と強化学習 (GRPO) を単一プロセスで回すパイプライン。
 
-        self.service_client = service_client
-        self.training_client = training_client
-        self.solver_model = solver_model
-        self.generator = generator
-        self.executor = executor
-        self.ml_logger = ml_logger
-        self.prisma_client = prisma_client
-        self.reference_client = reference_client
-        self.knowledge_list = knowledge_list
-        self.seed_suites = seed_suites
+    インスタンスは `__init__` を直接呼ばず、外部依存のセットアップをまとめる
+    `create` クラスメソッド経由で生成する想定。`__init__` は dataclass が
+    自動生成するフィールド代入のみを行い、派生値や副作用のあるセットアップは
+    すべて `create` 側に集約されている。
+    """
 
-        # New components for decoupled evaluation
-        self.shared_sampling_client = SharedSamplingClient(
-            self.solver_model.sampling_client
-        )
-        self.log_dir = log_dir
-        self.eval_trigger = asyncio.Event()
+    config: PipelineConfig
+    """パイプライン全体の設定 (モデル, SFT, RL, バッチサイズ, キャッシュ先等)。"""
 
-        self.rl_tasks_queue: asyncio.Queue[tuple[Task, RLSource]] = asyncio.Queue()
-        self.rl_results_queue: asyncio.Queue[RLGroup] = asyncio.Queue()
-        self._rl_batch_state = RLBatchState(
-            target_valid=config.rl_batch_size,
-            metrics_window=config.rl_metrics_window,
-        )
+    service_client: tinker.ServiceClient
+    """Tinker サービスへの接続クライアント。training/sampling client 生成に使う。"""
 
-        self.evaluate_worker = EvaluateWorker(
-            config=config,
-            executor=executor,
-            ml_logger=ml_logger,
-            prisma_client=prisma_client,
-            shared_sampling_client=self.shared_sampling_client,
-            renderer=solver_model.renderer,
-            eval_suites=[s for s in seed_suites if s.for_eval],
-            trigger=self.eval_trigger,
-        )
+    training_client: tinker.TrainingClient
+    """学習用クライアント。forward/backward/optim_step とチェックポイント保存を担う。"""
+
+    solver_model: TinkerModel
+    """RL/評価で推論する対象モデル。renderer, tokenizer, sampling_client をまとめた束。"""
+
+    generator: GeneratorAgent | None
+    """初期 SFT 用の QRA を生成するエージェント。`config.sft is None` の場合は None。"""
+
+    executor: InternalizeExecutor
+    """生成結果をランタイム上で実行し Verifier で正誤判定する実行器。RL 報酬の源。"""
+
+    ml_logger: MLLogger
+    """W&B とローカルログへメトリクスを出す ML ロガー。"""
+
+    prisma_client: Prisma
+    """学習過程 (SFT の QA, RL のトラジェクトリ) を DB に記録する Prisma クライアント。"""
+
+    log_dir: Path
+    """チェックポイントと ML ログの出力先ディレクトリ。"""
+
+    knowledge_list: list[Knowledge]
+    """内在化対象の知識一覧。初期 SFT の QRA 生成と RL のタスク割当てに使う。"""
+
+    shared_sampling_client: SharedSamplingClient
+    """複数 RL ワーカー間で共有する「最新重みの SamplingClient」のラッパー。
+    GRPO ステップ後に `update_client` で差し替えられ、同じ参照を持つワーカー全員が
+    新しい重みを使うようになる。"""
+
+    evaluate_worker: EvaluateWorker
+    """`eval_trigger` を購読して評価スイートを走らせるバックグラウンドワーカー。
+    `run()` 内で別タスクとして起動される。"""
+
+    _rl_batch_state: RLBatchState
+    """有効 RL グループを蓄積し、`config.rl_batch_size` に達したら pop して GRPO
+    ステップに回すバッファ。rollout メトリクスの窓平均も兼ねる。"""
+
+    distilled: DistilledQRAManager
+    """Study 由来の蒸留 QRA のバッファリング・払い出し、RL all-fail 時の
+    replay / study 依頼ルーティングを一括管理するマネージャ。"""
+
+    rollout_engine: RolloutEngine
+    """1 問の「サンプリング→parse→実行/検証→DB 記録」を一括で行うエンジン。
+    RL ワーカーと EvaluateWorker の両方が共有する。"""
+
+    rl_pool: RLWorkerPool
+    """RL rollout のワーカープール。`async with` でライフサイクル管理され、
+    `next_group()` で RLGroup を順次取り出せる。"""
+
+    eval_trigger: asyncio.Event = field(default_factory=asyncio.Event)
+    """重み更新後に EvaluateWorker を起動するためのイベント。`create` で生成して
+    evaluate_worker と共有する (両者が同一の Event インスタンスを握る必要がある)。"""
 
     @classmethod
     async def create(
         cls,
         config: PipelineConfig,
-        rust_doc_analyzer: Any,
+        rust_doc_analyzer: AsyncRustDocAnalyzer,
         knowledge_list: list[Knowledge],
         seed_suites: list[SeedSuite],
+        study_task_queue: asyncio.Queue[StudyTask] | None = None,
+        qra_in_queue: asyncio.Queue[tuple[str, QRA]] | None = None,
     ) -> Self:
+        config.cache_dir.mkdir(parents=True, exist_ok=True)
+
         verifier_model: AgentsSDKModel = config.verifier_model or get_gemini_lite()
-        verifier = Verifier(model=verifier_model, rust_doc_analyzer=rust_doc_analyzer)
+        verifier = Verifier(model=verifier_model)
         generator: GeneratorAgent | None = None
         if config.sft is not None:
             generator_model: AgentsSDKModel = (
@@ -167,18 +184,20 @@ class SimplePipeline:
             )
 
         service_client = tinker.ServiceClient()
-        training_client = await service_client.create_lora_training_client_async(
-            base_model=config.model_loading_settings.model_name,
-            rank=config.model_loading_settings.lora_rank,
-        )
+
 
         if config.model_loading_settings.resume_trainer_path:
             logger.info(
                 f"Loading trainer state from {config.model_loading_settings.resume_trainer_path}..."
             )
-            await training_client.load_state_async(
-                config.model_loading_settings.resume_trainer_path
-            )
+            training_client = await service_client.create_training_client_from_state_with_optimizer_async(config.model_loading_settings.resume_trainer_path)
+        else:
+            logger.info("Creating new Lora training client.")
+            training_client = await service_client.create_lora_training_client_async(
+            base_model=config.model_loading_settings.model_name,
+            rank=config.model_loading_settings.lora_rank,
+        )
+
 
         tinker_model, _, _ = setup_tinkermodel(
             model_name=config.model_loading_settings.model_name,
@@ -227,11 +246,44 @@ class SimplePipeline:
         )
         executor = InternalizeExecutor(runtime_pool=runtime_pool, verifier=verifier)
 
-        # Initialize reference_client from the training_client state (base or loaded checkpoint)
-        reference_client = (
-            await training_client.save_weights_and_get_sampling_client_async()
+        shared_sampling_client = SharedSamplingClient(tinker_model.sampling_client)
+        eval_trigger = asyncio.Event()
+
+        rollout_engine = RolloutEngine(
+            renderer=tinker_model.renderer,
+            executor=executor,
+            prisma_client=client,
+            system_prompt=build_solver_system_prompt(config.library_name),
+            simple_train_id=config.simple_train_id,
         )
-        logger.info("Initialized reference client from training state.")
+
+        evaluate_worker = EvaluateWorker(
+            config=config,
+            ml_logger=ml_logger,
+            shared_sampling_client=shared_sampling_client,
+            eval_suites=[s for s in seed_suites if s.for_eval],
+            trigger=eval_trigger,
+            rollout_engine=rollout_engine,
+        )
+        rl_batch_state = RLBatchState(
+            target_valid=config.rl_batch_size,
+            metrics_window=config.rl_metrics_window,
+        )
+        distilled = DistilledQRAManager(
+            qra_in_queue=qra_in_queue,
+            study_task_queue=study_task_queue,
+        )
+
+        rl_pool = RLWorkerPool(
+            rollout_engine=rollout_engine,
+            shared_sampling_client=shared_sampling_client,
+            seed_suites=seed_suites,
+            num_workers=config.rl_worker_count,
+            stagger_s=config.rl_worker_stagger_s,
+            num_samples=config.rl_rollout,
+            sampling_params=tinker.SamplingParams(),
+            distilled=distilled,
+        )
 
         return cls(
             config=config,
@@ -242,10 +294,15 @@ class SimplePipeline:
             executor=executor,
             ml_logger=ml_logger,
             prisma_client=client,
-            reference_client=reference_client,
             log_dir=log_dir,
             knowledge_list=knowledge_list,
-            seed_suites=seed_suites,
+            shared_sampling_client=shared_sampling_client,
+            evaluate_worker=evaluate_worker,
+            _rl_batch_state=rl_batch_state,
+            distilled=distilled,
+            rollout_engine=rollout_engine,
+            rl_pool=rl_pool,
+            eval_trigger=eval_trigger,
         )
 
     def _print_sft_generation_summary(
@@ -272,202 +329,56 @@ class SimplePipeline:
 
     async def run(self) -> None:
         eval_worker_task = asyncio.create_task(self.evaluate_worker.run_loop())
-
-        if self.config.sft is None:
-            logger.info("Skipping initial SFT (config.sft is None).")
-        elif self.config.model_loading_settings.resume_trainer_path:
-            logger.info(
-                f"Skipping initial SFT because resume_trainer_path is provided: {self.config.model_loading_settings.resume_trainer_path}"
-            )
-        else:
-            sft_qras = await self._prepare_sft_qras()
-            sft_batch_iter = self._create_sft_batch_iterator(
-                sft_qras, self.config.sft.epochs
-            )
-            logger.info(f"Running initial SFT for {self.config.sft.epochs} epochs...")
-            await self._run_sft_steps(sft_batch_iter)
-
-            if self.config.sft.save_checkpoint:
-                logger.info("Saving initial SFT checkpoint...")
-                await self._save_checkpoint(
-                    name="init_sft",
-                    loop_state={"epochs": self.config.sft.epochs},
-                )
-
-                # Update reference client to the post-SFT state
-                self.reference_client = await self.training_client.save_weights_and_get_sampling_client_async()
-                logger.info("Updated reference client to SFT state.")
-
-        spawner_task = None
-        worker_tasks = []
-
-        spawner_task, worker_tasks = await self._start_rl_workers()
-
         try:
-            for iteration in range(self.config.max_iterations):
-                logger.info(f"--- Iteration {iteration + 1} (RL) ---")
-
-                batch_groups = await self._collect_valid_rl_batch()
-
+            if self.config.sft is None:
+                logger.info("Skipping initial SFT (config.sft is None).")
+            elif self.config.model_loading_settings.resume_trainer_path:
                 logger.info(
-                    f"Running RL (GRPO) update on valid batch of size {len(batch_groups)}..."
-                )
-                rl_step = iteration + 1
-                trigger_eval = rl_step % self.config.eval_interval == 0
-                await self._run_grpo_update(batch_groups, trigger_eval=trigger_eval)
-
-                if rl_step % self.config.rl_checkpoint_interval == 0:
-                    logger.info(f"Saving RL checkpoint at step {rl_step}...")
-                    await self._save_checkpoint(
-                        name=f"rl_{rl_step:04d}",
-                        loop_state={"rl_step": rl_step},
-                    )
-
-        finally:
-            eval_worker_task.cancel()
-            if spawner_task:
-                spawner_task.cancel()
-            for t in worker_tasks:
-                t.cancel()
-
-            tasks_to_wait = [eval_worker_task]
-            if spawner_task:
-                tasks_to_wait.append(spawner_task)
-            tasks_to_wait.extend(worker_tasks)
-            await asyncio.gather(*tasks_to_wait, return_exceptions=True)
-
-    async def _start_rl_workers(self) -> tuple[asyncio.Task, list[asyncio.Task]]:
-        for suite in self.seed_suites:
-            if not suite.for_rl:
-                continue
-            source = RLSource(id=suite.name, title=suite.name)
-            for task in suite.tasks:
-                await self.rl_tasks_queue.put((task, source))
-
-        num_workers = self.config.rl_worker_count
-        worker_tasks: list[asyncio.Task] = []
-
-        async def _staggered_spawner():
-            for i in range(num_workers):
-                worker_tasks.append(asyncio.create_task(self._rl_worker()))
-                if i < num_workers - 1:
-                    await asyncio.sleep(self.config.rl_worker_stagger_s)
-
-        spawner_task = asyncio.create_task(_staggered_spawner())
-        return spawner_task, worker_tasks
-
-    async def _rl_worker(self) -> None:
-        system_prompt = self.evaluate_worker.system_prompt
-        while True:
-            try:
-                task, source = await self.rl_tasks_queue.get()
-                # Get current shared client snapshot
-                indexed_client = self.shared_sampling_client.get_client()
-
-                group = await self._collect_rl_group(
-                    system_prompt, task, source, indexed_client
-                )
-                if group:
-                    await self.rl_results_queue.put(group)
-
-                self.rl_tasks_queue.task_done()
-                await self.rl_tasks_queue.put((task, source))
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.exception(f"RL worker error: {e}")
-                await asyncio.sleep(1)
-
-    async def _collect_rl_group(
-        self,
-        system_prompt: str,
-        task: Task,
-        source: RLSource,
-        indexed_client: IndexedSamplingClient,
-    ) -> RLGroup | None:
-        model_input = self.solver_model.renderer.build_generation_prompt(
-            [
-                Message(role="system", content=system_prompt),
-                Message(role="user", content=task.instruction),
-            ]
-        )
-
-        sample_results = await indexed_client.client.sample_async(
-            prompt=model_input,
-            num_samples=self.config.rl_rollout,
-            sampling_params=tinker.SamplingParams(),
-        )
-
-        async def _verify_single_rollout(seq) -> tuple[Trajectory, float]:
-            tokens, logprobs = seq.tokens, seq.logprobs
-            ac = TokensWithLogprobs(tokens=tokens, maybe_logprobs=logprobs)
-            trajectory = Trajectory(
-                transitions=[
-                    Transition(ob=model_input, ac=ac, reward=0.0, episode_done=True)
-                ],
-                final_ob=model_input,
-            )
-
-            msg, ok = self.solver_model.renderer.parse_response(tokens)
-            content = msg.get("content") if ok else None
-            is_success, reasoning, answer_text, exec_out, verif_out = (
-                False,
-                "",
-                "",
-                "",
-                "",
-            )
-
-            if ok and content:
-                if isinstance(content, list):
-                    for part in content:
-                        if part["type"] == "thinking":
-                            reasoning += part["thinking"]
-                        elif part["type"] == "text":
-                            answer_text += part["text"]
-                else:
-                    answer_text = str(content)
-
-                outcome = await self.executor.run_execution_and_verification(
-                    task.instruction, reasoning, answer_text
-                )
-                is_success, exec_out, verif_out = (
-                    outcome.success,
-                    outcome.execution_output,
-                    outcome.verification_output,
+                    f"Skipping initial SFT because resume_trainer_path is provided: {self.config.model_loading_settings.resume_trainer_path}"
                 )
             else:
-                verif_out = "Parse failed."
-
-            try:
-                await self.prisma_client.simpletrajectory.create(
-                    data={
-                        "simple_train_id": self.config.simple_train_id,
-                        "knowledge_id": source.id,
-                        "knowledge_title": source.title,
-                        "step": indexed_client.version,
-                        "question": task.instruction,
-                        "reasoning": reasoning,
-                        "answer": answer_text,
-                        "success": is_success,
-                        "execution_output": exec_out,
-                        "verification_output": verif_out,
-                    }
+                sft_qras = await self._prepare_sft_qras()
+                sft_batch_iter = self._create_sft_batch_iterator(
+                    sft_qras, self.config.sft.epochs
                 )
-            except Exception as e:
-                logger.error(f"Failed to record RL trajectory: {e}")
+                logger.info(f"Running initial SFT for {self.config.sft.epochs} epochs...")
+                await self._run_sft_steps(
+                    sft_batch_iter, adam_params=self.config.sft.adam_params
+                )
 
-            return trajectory, (1.0 if is_success else 0.0)
+                if self.config.sft.save_checkpoint:
+                    logger.info("Saving initial SFT checkpoint...")
+                    await self._save_checkpoint(
+                        name="init_sft",
+                        loop_state={"epochs": self.config.sft.epochs},
+                    )
 
-        rollout_results = await asyncio.gather(
-            *[_verify_single_rollout(seq) for seq in sample_results.sequences]
-        )
-        trajectories, rewards = (
-            [r[0] for r in rollout_results],
-            [r[1] for r in rollout_results],
-        )
+                    logger.info("Updated reference client to SFT state.")
 
-        return RLGroup(trajectories=trajectories, rewards=rewards)
+            async with self.rl_pool:
+                for iteration in range(self.config.max_iterations):
+                    logger.info(f"--- Iteration {iteration + 1} (RL) ---")
+
+                    batch_groups = await self._collect_valid_rl_batch()
+
+                    logger.info(
+                        f"Running RL (GRPO) update on valid batch of size {len(batch_groups)}..."
+                    )
+                    rl_step = iteration + 1
+                    trigger_eval = rl_step % self.config.eval_interval == 0
+                    await self._run_grpo_update(batch_groups, trigger_eval=trigger_eval)
+
+                    await self._maybe_run_distilled_sft_step()
+
+                    if rl_step % self.config.rl_checkpoint_interval == 0:
+                        logger.info(f"Saving RL checkpoint at step {rl_step}...")
+                        await self._save_checkpoint(
+                            name=f"rl_{rl_step:04d}",
+                            loop_state={"rl_step": rl_step},
+                        )
+        finally:
+            eval_worker_task.cancel()
+            await asyncio.gather(eval_worker_task, return_exceptions=True)
 
     async def _collect_valid_rl_batch(self) -> list[RLGroup]:
         state = self._rl_batch_state
@@ -476,7 +387,7 @@ class SimplePipeline:
             f"(buffered={len(state.valid_buffer)}, window={len(state.window_groups)}/{state.metrics_window})..."
         )
         while not state.ready():
-            group = await self.rl_results_queue.get()
+            group = await self.rl_pool.next_group()
             rollout_metrics = state.add(group)
             if rollout_metrics is not None:
                 self.ml_logger.log_metrics(rollout_metrics)
@@ -499,9 +410,6 @@ class SimplePipeline:
         data_D, kl_metrics = await prepare_minibatch_simplified(
             trajectory_groups=traj_groups,
             regularization="group_std",
-            kl_reference_client=self.reference_client,
-            kl_penalty_coef=self.config.kl_penalty_coef,
-            kl_discount_factor=self.config.kl_discount_factor,
         )
         if not data_D:
             logger.warning("No valid training data assembled for GRPO step.")
@@ -582,25 +490,71 @@ class SimplePipeline:
             {f"{prefix}/{k}": v for k, v in fwd_res.metrics.items()}
         )
 
-    async def _run_sft_steps(self, batch_iter: Iterable[list[Datum]]) -> None:
-        assert self.config.sft is not None, (
-            "_run_sft_steps requires config.sft to be set"
-        )
+    async def _run_sft_steps(
+        self,
+        batch_iter: Iterable[list[Datum]],
+        adam_params: tinker.AdamParams,
+        prefix: str = "sft",
+    ) -> None:
         await self._run_training_steps(
             batch_iter=batch_iter,
-            prefix="sft",
+            prefix=prefix,
             loss_fn="cross_entropy",
-            adam_params=self.config.sft.adam_params,
+            adam_params=adam_params,
         )
 
         logger.info(
-            "Synchronizing sampling weights after SFT and triggering evaluation..."
+            f"Synchronizing sampling weights after {prefix} and triggering evaluation..."
         )
         new_client = (
             await self.training_client.save_weights_and_get_sampling_client_async()
         )
         self.shared_sampling_client.update_client(new_client)
         self.eval_trigger.set()
+
+    def _distilled_sft_batch_size(self) -> int:
+        return (
+            self.config.sft.batch_size
+            if self.config.sft is not None
+            else self.config.rl_batch_size
+        )
+
+    def _distilled_sft_adam_params(self) -> tinker.AdamParams:
+        return (
+            self.config.sft.adam_params
+            if self.config.sft is not None
+            else self.config.rl_adam_params
+        )
+
+    async def _maybe_run_distilled_sft_step(self) -> None:
+        """蒸留 QRA を回収し、1 バッチ分溜まっていれば SFT ステップを回す。
+
+        バッファ管理は `DistilledQRAManager` が担当。本メソッドは学習呼び出しの
+        オーケストレーションのみを行う。
+        """
+        drained = self.distilled.ingest()
+        batch_size = self._distilled_sft_batch_size()
+        qras = self.distilled.try_take_batch(batch_size)
+        if qras is None:
+            if drained:
+                logger.info(
+                    f"Distilled SFT buffer: {self.distilled.buffered}/{batch_size} "
+                    f"(drained {drained} this iteration)."
+                )
+            return
+
+        cpt = self.config.sft.cpt if self.config.sft is not None else False
+        datums = self._qras_to_datums(qras, cpt=cpt)
+        batch_iter = self._chunk_into_batches(datums, batch_size, num_epochs=1)
+        logger.info(
+            f"Running distilled SFT step on {batch_size} QRAs "
+            f"(buffer remaining: {self.distilled.buffered})."
+        )
+        await self._run_sft_steps(
+            batch_iter=batch_iter,
+            adam_params=self._distilled_sft_adam_params(),
+            prefix="distilled_sft",
+        )
 
     async def _prepare_sft_qras(self) -> list[QRA]:
         assert self.config.sft is not None, (
@@ -617,7 +571,7 @@ class SimplePipeline:
                     knowledge=k,
                     count=self.config.sft.k_sft,
                     prefix="sft",
-                    cache_dir=self.cache_dir,
+                    cache_dir=self.config.cache_dir,
                     generation_concurrency=self.config.generation_concurrency,
                 )
                 for k in self.knowledge_list
@@ -652,17 +606,19 @@ class SimplePipeline:
 
         return [q for qs in per_knowledge_qras for q in qs]
 
-    def _create_sft_batch_iterator(
-        self, sft_qras: list[QRA], num_epochs: int
-    ) -> Iterable[list[Datum]]:
-        assert self.config.sft is not None, (
-            "_create_sft_batch_iterator requires config.sft to be set"
-        )
+    def _qras_to_datums(self, qras: list[QRA], cpt: bool) -> list[Datum]:
+        """Convert QRA samples into Datums suitable for cross-entropy SFT.
+
+        Two conversation shapes are supported: `cpt=True` uses a custom example
+        format (system + question + answer) with training limited to the answer
+        turn; `cpt=False` uses the standard user/assistant shape with a thinking
+        part on the assistant side, and trains on the last assistant message.
+        """
         _, renderer = get_tokenizer_renderer(
             self.training_client, self.config.model_loading_settings.model_name
         )
-        if self.config.sft.cpt:
-            datums = [
+        if cpt:
+            return [
                 conversation_to_datum(
                     conversation=[
                         Message(
@@ -670,57 +626,57 @@ class SimplePipeline:
                             content=f"これは{self.config.library_name}の教育資料から抜粋した練習問題です。",
                             trainable=False,
                         ),
-                        Message(
-                            role="example_question",
-                            content=q.question,
-                            trainable=False,
-                        ),
-                        Message(
-                            role="example_answer",
-                            content=q.answer,
-                            trainable=True,
-                        ),
+                        Message(role="example_question", content=q.question, trainable=False),
+                        Message(role="example_answer", content=q.answer, trainable=True),
                     ],
                     renderer=renderer,
                     train_on_what=TrainOnWhat.CUSTOMIZED,
                     max_length=None,
                 )
-                for q in sft_qras
+                for q in qras
             ]
-        else:
-            datums = [
-                conversation_to_datum(
-                    conversation=[
-                        Message(role="user", content=q.question),
-                        Message(
-                            role="assistant",
-                            content=[
-                                ThinkingPart(type="thinking", thinking=q.reasoning),
-                                TextPart(type="text", text=f"\n\n{q.answer}"),
-                            ],
-                        ),
-                    ],
-                    renderer=renderer,
-                    train_on_what=TrainOnWhat.LAST_ASSISTANT_MESSAGE,
-                    max_length=None,
-                )
-                for q in sft_qras
-            ]
+        return [
+            conversation_to_datum(
+                conversation=[
+                    Message(role="user", content=q.question),
+                    Message(
+                        role="assistant",
+                        content=[
+                            ThinkingPart(type="thinking", thinking=q.reasoning),
+                            TextPart(type="text", text=f"\n\n{q.answer}"),
+                        ],
+                    ),
+                ],
+                renderer=renderer,
+                train_on_what=TrainOnWhat.LAST_ASSISTANT_MESSAGE,
+                max_length=None,
+            )
+            for q in qras
+        ]
+
+    @staticmethod
+    def _chunk_into_batches(
+        datums: list[Datum], batch_size: int, num_epochs: int
+    ) -> Iterable[list[Datum]]:
+        """Wrap-around chunking: replicate for epochs, then pad the tail."""
         if not datums:
             return iter([])
-
-        batch_size = self.config.sft.batch_size
         all_datums = datums * num_epochs
         num_batches = (len(all_datums) + batch_size - 1) // batch_size
-
-        batches = []
+        batches: list[list[Datum]] = []
         for i in range(num_batches):
             batch = all_datums[i * batch_size : (i + 1) * batch_size]
             if len(batch) < batch_size:
-                # Pad with wrap-around from the start of the FULL dataset
-                needed = batch_size - len(batch)
-                batch.extend(all_datums[:needed])
+                batch.extend(all_datums[: batch_size - len(batch)])
             batches.append(batch)
-
         logger.info(f"Created {len(batches)} batches for {num_epochs} epochs.")
         return iter(batches)
+
+    def _create_sft_batch_iterator(
+        self, sft_qras: list[QRA], num_epochs: int
+    ) -> Iterable[list[Datum]]:
+        assert self.config.sft is not None, (
+            "_create_sft_batch_iterator requires config.sft to be set"
+        )
+        datums = self._qras_to_datums(sft_qras, cpt=self.config.sft.cpt)
+        return self._chunk_into_batches(datums, self.config.sft.batch_size, num_epochs)

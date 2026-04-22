@@ -1,13 +1,12 @@
 import logging
 from dataclasses import dataclass
-
+from openai.types.shared import Reasoning
 from agents import ModelSettings, RunContextWrapper, StopAtTools, function_tool
 from oai_utils.agent import AgentRunFailure, AgentsSDKModel, AgentWrapper
 from pydantic import BaseModel
 
 from adapter_agent.data import QA
 from adapter_agent.hierarchical.agent.base import BaseAgent
-from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +54,6 @@ def report_failure(
 
 @dataclass(kw_only=True)
 class Verifier[T: AgentsSDKModel](BaseAgent[T]):
-    rust_doc_analyzer: AsyncRustDocAnalyzer
 
     async def verify(
         self,
@@ -103,7 +101,7 @@ You must:
                 report_failure,
             ],
             model_settings=ModelSettings(
-                tool_choice="required", parallel_tool_calls=True
+                tool_choice="required", parallel_tool_calls=True, reasoning=Reasoning(effort="none")
             ),
             tool_use_behavior=StopAtTools(
                 stop_at_tool_names=[report_success.name, report_failure.name]
@@ -112,7 +110,6 @@ You must:
         )
 
         context = VerifierContext()
-        crate_overview = self.rust_doc_analyzer.get_overview()
 
         input_prompt = f"""\
 <Task>
@@ -134,14 +131,10 @@ You must:
 <Execution Output>
 {execution_output}
 </Execution Output>
-
-<Crate Overview>
-{crate_overview}
-</Crate Overview>
 """
 
         try:
-            await agent.run(input_prompt, max_turns=5, context=context)
+            await agent.run(input_prompt, context=context)
             if context.result is None:
                 return VerificationResult(
                     success=False,
