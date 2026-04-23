@@ -20,7 +20,7 @@ class RuntimeSettings(BaseModel):
     def cloudrun_numrs2(cls) -> Self:
         return cls(
             type="cloudrun",
-            image_uri="europe-north1-docker.pkg.dev/dsat2-405406/shimose-repo/coder-mcp-numrs2",
+            image_uri="europe-north1-docker.pkg.dev/dsat2-405406/shimose-repo/coder-mcp-numrs2:latest",
         )
 
     @classmethod

@@ -44,6 +44,7 @@ class VerificationOutcome:
 class EvalResult:
     success_count: int
     total_count: int
+    response_lengths: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -91,3 +92,4 @@ class PipelineConfig:
     kl_discount_factor: float = 0.0
     ttl_seconds: int = 604800
     verifier_model: AgentsSDKModel | None = None
+    max_output_tokens: int = 6000

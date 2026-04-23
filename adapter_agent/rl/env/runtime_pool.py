@@ -22,6 +22,16 @@ class RuntimePool:
         self._current_size = 0
         self._lock = asyncio.Lock()
 
+    @property
+    def current_size(self) -> int:
+        """Total runtimes created (in-use + idle)."""
+        return self._current_size
+
+    @property
+    def idle_size(self) -> int:
+        """Runtimes currently waiting in the pool (not in use)."""
+        return self._pool.qsize()
+
     @asynccontextmanager
     async def acquire(self) -> AsyncGenerator[Runtime, None]:
         """Safely acquire a runtime from the pool or create a new one."""

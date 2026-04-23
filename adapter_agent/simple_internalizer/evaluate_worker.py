@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import Optional
+import statistics
 
 import tinker
 from oai_utils.async_utils import gather_with_semaphore
@@ -83,9 +83,11 @@ class EvaluateWorker:
         suite_stats: dict[str, dict[str, int]] = {
             s.name: {"success": 0, "rollouts": 0} for s in self.eval_suites
         }
+        suite_lengths: dict[str, list[int]] = {s.name: [] for s in self.eval_suites}
         for suite_name, res in results:
             suite_stats[suite_name]["success"] += res.success_count
             suite_stats[suite_name]["rollouts"] += res.total_count
+            suite_lengths[suite_name].extend(res.response_lengths)
 
         metrics_to_log: dict[str, float] = {}
         for suite_name, stats in suite_stats.items():
@@ -96,6 +98,22 @@ class EvaluateWorker:
             metrics_to_log[f"eval_{suite_name}/total_success"] = float(success)
             metrics_to_log[f"eval_{suite_name}/total_rollouts"] = float(rollouts)
 
+            lengths = suite_lengths[suite_name]
+            if lengths:
+                mean_len = sum(lengths) / len(lengths)
+                var_len = (
+                    statistics.pvariance(lengths) if len(lengths) > 1 else 0.0
+                )
+                metrics_to_log[f"eval_{suite_name}/response_length_mean"] = float(
+                    mean_len
+                )
+                metrics_to_log[f"eval_{suite_name}/response_length_variance"] = float(
+                    var_len
+                )
+                metrics_to_log[f"eval_{suite_name}/response_length_max"] = float(
+                    max(lengths)
+                )
+
         if metrics_to_log:
             self.ml_logger.log_metrics(metrics_to_log)
 
@@ -104,16 +122,23 @@ class EvaluateWorker:
         snapshot: IndexedSamplingClient,
         instruction: str,
         source: str,
-        rollouts: Optional[int] = None,
+        rollouts: int | None = None,
     ) -> EvalResult:
         num_samples = rollouts if rollouts is not None else self.config.eval_rollout
         batch = await self.engine.run(
             sampling_client=snapshot,
             instruction=instruction,
             num_samples=num_samples,
-            sampling_params=tinker.SamplingParams(include_logprobs=True),
+            sampling_params=tinker.SamplingParams(
+                include_logprobs=True,
+                max_tokens=self.config.max_output_tokens,
+            ),
             source_id=source,
             source_title=source,
         )
         success_count = sum(1 for o in batch.outcomes if o.success)
-        return EvalResult(success_count=success_count, total_count=num_samples)
+        return EvalResult(
+            success_count=success_count,
+            total_count=num_samples,
+            response_lengths=[len(o.tokens) for o in batch.outcomes],
+        )

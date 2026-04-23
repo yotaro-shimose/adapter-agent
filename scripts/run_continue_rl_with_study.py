@@ -14,10 +14,10 @@ Wiki is reused (no reset) — edit `STUDY_WIKI_VERSION` to point at an existing 
 
 import asyncio
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
-import os
 
 import tinker
 from dotenv import load_dotenv
@@ -63,6 +63,7 @@ logging.getLogger("adapter_agent.internalize").setLevel(logging.DEBUG)
 
 logger = logging.getLogger(__name__)
 os.environ["OPENAI_AGENTS_DISABLE_TRACING"] = "1"
+
 
 class ClockCycleFilteredLogger(MLLogger):
     def __init__(self, base: MLLogger) -> None:
@@ -127,7 +128,7 @@ async def main() -> None:
     verifier_model = get_gemini() if VERIFIER_MODEL == "gemini" else get_gemini_lite()
 
     config = PipelineConfig(
-        runtime_pool_size=50,
+        runtime_pool_size=200,
         rl_worker_count=50,
         eval_concurrency=48,
         generation_concurrency=400,
@@ -141,7 +142,7 @@ async def main() -> None:
         rl_rollout=16,
         max_iterations=200,
         rl_checkpoint_interval=10,
-        rl_batch_size=48,
+        rl_batch_size=96,
         rl_update_epochs=1,
         rl_adam_params=tinker.AdamParams(learning_rate=2e-4),
         rl_loss_fn="cispo",
@@ -151,7 +152,9 @@ async def main() -> None:
     study_task_queue: asyncio.Queue[StudyTask] | None = (
         asyncio.Queue() if STUDY_ENABLED else None
     )
-    qra_out_queue: asyncio.Queue[QRA] | None = asyncio.Queue() if STUDY_ENABLED else None
+    qra_out_queue: asyncio.Queue[tuple[str, QRA]] | None = (
+        asyncio.Queue() if STUDY_ENABLED else None
+    )
 
     pipeline = await SimplePipeline.create(
         config=config,

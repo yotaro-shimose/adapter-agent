@@ -7,6 +7,7 @@ from oai_utils.tinker import TinkerModel
 from tinker_cookbook.renderers.base import Message as TinkerMessage
 from tinker_cookbook.renderers.base import TextPart
 from tinker_cookbook.rl.types import TokensWithLogprobs, Trajectory, Transition
+from adapter_agent.rl.env.simplified_solver import SSStepResult
 
 from adapter_agent.hierarchical.agent.knowledge_normalizer import (
     AgentsSDKModel,
@@ -49,7 +50,7 @@ async def ss_solve_verify(
     internalized_knowledge: str | None = None,
     blocked_knowledge_ids: set[str] | None = None,
 ) -> RewireSessionResult:
-    verifier = Verifier(model=verifier_model, rust_doc_analyzer=rust_doc_analyzer)
+    verifier = Verifier(model=verifier_model)
     ss_state = SimplifiedSolverEnvState.numrs2(
         task=task,
         qwen_no_think=qwen_no_think,
@@ -64,7 +65,7 @@ async def ss_solve_verify(
         msg_env = await build_simplified_solver_msg_env(
             env_state=ss_state,
             verifier=verifier,
-            rust_doc_analyzer=verifier.rust_doc_analyzer,
+            rust_doc_analyzer=rust_doc_analyzer,
             search_model=verifier_model,
             wiki_manager=wiki_manager,
             max_turns=max_turns,
@@ -140,7 +141,6 @@ async def ss_solve_verify(
                     )
                     transitions.append(transition)
                     # Create a mock step result to pass to _process_solve_result
-                    from adapter_agent.rl.env.simplified_solver import SSStepResult
 
                     step_result = SSStepResult(
                         reward=reward,

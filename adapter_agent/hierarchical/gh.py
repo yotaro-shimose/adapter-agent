@@ -185,13 +185,33 @@ async def main():
 def load_gh_archive() -> list[Task]:
     import polars as pl
 
-    path = Path("data/easy_benchmark_verified.csv")
-    df = pl.read_csv(path)
-    tasks = [
-        Task.from_instruction(row["problem_statement"])
-        for row in df.iter_rows(named=True)
+    # Primary source first so existing slice semantics (e.g. slice(0, 40) for RL,
+    # slice(40, 60) for eval) keep pointing at the strictly verified tasks.
+    primary_path = Path("data/easy_benchmark_verified.csv")
+    secondary_paths = [
+        Path("data/easy_benchmark_enhanced.csv"),
+        Path("data/benchmark_dataset_enhanced.csv"),
     ]
-    return tasks
+
+    primary_df = pl.read_csv(primary_path)
+    statements: list[str] = primary_df["problem_statement"].to_list()
+    seen: set[str] = set(statements)
+
+    for path in secondary_paths:
+        if not path.exists():
+            continue
+        df = pl.read_csv(path)
+        if "appropriate" in df.columns:
+            df = df.filter(pl.col("appropriate"))
+        if "difficulty" in df.columns:
+            df = df.filter(pl.col("difficulty") == "Easy")
+        for statement in df["problem_statement"].to_list():
+            if statement in seen:
+                continue
+            seen.add(statement)
+            statements.append(statement)
+
+    return [Task.from_instruction(s) for s in statements]
 
 
 if __name__ == "__main__":

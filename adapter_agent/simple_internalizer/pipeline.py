@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Self
@@ -74,11 +75,26 @@ class RLBatchState:
         num_valid = sum(
             1 for g in self.window_groups if max(g.rewards) > min(g.rewards)
         )
+        response_lengths = [
+            sum(len(tr.ac.tokens) for tr in traj.transitions)
+            for g in self.window_groups
+            for traj in g.trajectories
+        ]
         metrics = {
             "rollout/mean_reward": sum(all_rewards) / len(all_rewards),
             "rollout/valid_group_ratio": num_valid / len(self.window_groups),
             "rollout/window_size": float(len(self.window_groups)),
         }
+        if response_lengths:
+            mean_len = sum(response_lengths) / len(response_lengths)
+            var_len = (
+                statistics.pvariance(response_lengths)
+                if len(response_lengths) > 1
+                else 0.0
+            )
+            metrics["rollout/response_length_mean"] = float(mean_len)
+            metrics["rollout/response_length_variance"] = float(var_len)
+            metrics["rollout/response_length_max"] = float(max(response_lengths))
         self.window_groups = []
         return metrics
 
@@ -281,7 +297,9 @@ class SimplePipeline:
             num_workers=config.rl_worker_count,
             stagger_s=config.rl_worker_stagger_s,
             num_samples=config.rl_rollout,
-            sampling_params=tinker.SamplingParams(),
+            sampling_params=tinker.SamplingParams(
+                max_tokens=config.max_output_tokens,
+            ),
             distilled=distilled,
         )
 
@@ -390,6 +408,9 @@ class SimplePipeline:
             group = await self.rl_pool.next_group()
             rollout_metrics = state.add(group)
             if rollout_metrics is not None:
+                pool = self.executor.runtime_pool
+                rollout_metrics["rollout/runtime_pool_size"] = float(pool.current_size)
+                rollout_metrics["rollout/runtime_pool_idle"] = float(pool.idle_size)
                 self.ml_logger.log_metrics(rollout_metrics)
         return state.pop_batch()
 
