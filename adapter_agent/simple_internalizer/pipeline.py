@@ -37,6 +37,7 @@ from adapter_agent.simple_internalizer.data_sources import generate_qras_cached
 from adapter_agent.simple_internalizer.distilled_qra_manager import DistilledQRAManager
 from adapter_agent.simple_internalizer.evaluate_worker import EvaluateWorker
 from adapter_agent.simple_internalizer.executor import InternalizeExecutor
+from adapter_agent.simple_internalizer.ray.ray_rl_worker_pool import RayRLWorkerPool
 from adapter_agent.simple_internalizer.rl_worker_pool import RLWorkerPool
 from adapter_agent.simple_internalizer.rollout_engine import RolloutEngine, build_solver_system_prompt
 from adapter_agent.simple_internalizer.types import PipelineConfig, SeedSuite
@@ -168,9 +169,10 @@ class SimplePipeline:
     """1 問の「サンプリング→parse→実行/検証→DB 記録」を一括で行うエンジン。
     RL ワーカーと EvaluateWorker の両方が共有する。"""
 
-    rl_pool: RLWorkerPool
+    rl_pool: RLWorkerPool | RayRLWorkerPool
     """RL rollout のワーカープール。`async with` でライフサイクル管理され、
-    `next_group()` で RLGroup を順次取り出せる。"""
+    `next_group()` で RLGroup を順次取り出せる。`config.rl_use_ray=True` のとき
+    `RayRLWorkerPool` (マルチプロセス Ray actor 版) に差し替わる。"""
 
     eval_trigger: asyncio.Event = field(default_factory=asyncio.Event)
     """重み更新後に EvaluateWorker を起動するためのイベント。`create` で生成して
@@ -290,18 +292,36 @@ class SimplePipeline:
             study_task_queue=study_task_queue,
         )
 
-        rl_pool = RLWorkerPool(
-            rollout_engine=rollout_engine,
-            shared_sampling_client=shared_sampling_client,
-            seed_suites=seed_suites,
-            num_workers=config.rl_worker_count,
-            stagger_s=config.rl_worker_stagger_s,
-            num_samples=config.rl_rollout,
-            sampling_params=tinker.SamplingParams(
-                max_tokens=config.max_output_tokens,
-            ),
-            distilled=distilled,
-        )
+        sampling_params = tinker.SamplingParams(max_tokens=config.max_output_tokens)
+        rl_pool: RLWorkerPool | RayRLWorkerPool
+        if config.rl_use_ray:
+            rl_pool = RayRLWorkerPool(
+                num_processes=config.rl_ray_num_processes,
+                workers_per_process=config.rl_ray_workers_per_process,
+                runtime_pool_size_per_process=config.rl_ray_runtime_pool_size_per_process,
+                actor_stagger_s=config.rl_ray_actor_stagger_s,
+                runtime_settings=config.runtime_settings,
+                verifier_model=verifier_model,
+                library_name=config.library_name,
+                simple_train_id=config.simple_train_id,
+                model_name=config.model_loading_settings.model_name,
+                sampling_client=tinker_model.sampling_client,
+                seed_suites=seed_suites,
+                worker_stagger_s=config.rl_worker_stagger_s,
+                num_samples=config.rl_rollout,
+                sampling_params=sampling_params,
+            )
+        else:
+            rl_pool = RLWorkerPool(
+                rollout_engine=rollout_engine,
+                shared_sampling_client=shared_sampling_client,
+                seed_suites=seed_suites,
+                num_workers=config.rl_worker_count,
+                stagger_s=config.rl_worker_stagger_s,
+                num_samples=config.rl_rollout,
+                sampling_params=sampling_params,
+                distilled=distilled,
+            )
 
         return cls(
             config=config,
@@ -408,9 +428,10 @@ class SimplePipeline:
             group = await self.rl_pool.next_group()
             rollout_metrics = state.add(group)
             if rollout_metrics is not None:
-                pool = self.executor.runtime_pool
-                rollout_metrics["rollout/runtime_pool_size"] = float(pool.current_size)
-                rollout_metrics["rollout/runtime_pool_idle"] = float(pool.idle_size)
+                if not self.config.rl_use_ray:
+                    pool = self.executor.runtime_pool
+                    rollout_metrics["rollout/runtime_pool_size"] = float(pool.current_size)
+                    rollout_metrics["rollout/runtime_pool_idle"] = float(pool.idle_size)
                 self.ml_logger.log_metrics(rollout_metrics)
         return state.pop_batch()
 
@@ -454,6 +475,8 @@ class SimplePipeline:
             await self.training_client.save_weights_and_get_sampling_client_async()
         )
         self.shared_sampling_client.update_client(new_client)
+        if isinstance(self.rl_pool, RayRLWorkerPool):
+            await self.rl_pool.broadcast_sampling_client(new_client)
         if trigger_eval:
             logger.info("Triggering evaluation.")
             self.eval_trigger.set()
@@ -531,6 +554,8 @@ class SimplePipeline:
             await self.training_client.save_weights_and_get_sampling_client_async()
         )
         self.shared_sampling_client.update_client(new_client)
+        if isinstance(self.rl_pool, RayRLWorkerPool):
+            await self.rl_pool.broadcast_sampling_client(new_client)
         self.eval_trigger.set()
 
     def _distilled_sft_batch_size(self) -> int:

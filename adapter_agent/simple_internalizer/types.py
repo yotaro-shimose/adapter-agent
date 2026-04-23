@@ -93,3 +93,14 @@ class PipelineConfig:
     ttl_seconds: int = 604800
     verifier_model: AgentsSDKModel | None = None
     max_output_tokens: int = 6000
+
+    # --- Ray-based multiprocess rollout (optional) ---
+    # 有効化時、RL rollout は Ray async actor を N プロセス立て、各 actor が
+    # workers_per_process 個の asyncio worker を回す。eval は in-process のまま。
+    # `runtime_pool_size` は Ray 有効時 driver の eval 用 RuntimePool サイズとして
+    # 使う (各 actor は独自に runtime_pool_size_per_process を持つ)。
+    rl_use_ray: bool = False
+    rl_ray_num_processes: int = 32
+    rl_ray_workers_per_process: int = 2
+    rl_ray_runtime_pool_size_per_process: int = 6
+    rl_ray_actor_stagger_s: float = 1.0

@@ -128,7 +128,7 @@ async def main() -> None:
     verifier_model = get_gemini() if VERIFIER_MODEL == "gemini" else get_gemini_lite()
 
     config = PipelineConfig(
-        runtime_pool_size=200,
+        runtime_pool_size=50,
         rl_worker_count=50,
         eval_concurrency=48,
         generation_concurrency=400,
@@ -147,6 +147,11 @@ async def main() -> None:
         rl_adam_params=tinker.AdamParams(learning_rate=2e-4),
         rl_loss_fn="cispo",
         verifier_model=verifier_model,
+        rl_use_ray=True,
+        rl_ray_num_processes=16,
+        rl_ray_workers_per_process=4,
+        rl_ray_runtime_pool_size_per_process=8,
+        rl_ray_actor_stagger_s=1.0,
     )
 
     study_task_queue: asyncio.Queue[StudyTask] | None = (
