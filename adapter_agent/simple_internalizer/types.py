@@ -154,6 +154,7 @@ class PipelineConfig:
     rl_metrics_window: int = 50
     kl_penalty_coef: float = 0.0
     kl_discount_factor: float = 0.0
+    rl_skip_update: bool = False
 
 
 @dataclass

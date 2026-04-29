@@ -45,15 +45,15 @@ async def main() -> None:
     runtime_settings = RuntimeSettings.cloudrun_numrs2()
     simple_train_id = f"continue_rl_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
-    study_rl_suite = load_gh_archive_suite(
-        name="gh_archive_study_suite",
-        task_slice=slice(0, 40),
-        for_rl=True,
-        for_eval=False,
-    )
+    # study_rl_suite = load_gh_archive_suite(
+    #     name="gh_archive_study_suite",
+    #     task_slice=slice(0, 40),
+    #     for_rl=True,
+    #     for_eval=False,
+    # )
     additional_rl_suite = load_gh_archive_suite(
         name="gh_archive_study_suite",
-        task_slice=slice(60, 300),
+        task_slice=slice(60, 360),
         for_rl=True,
         for_eval=False,
     )
@@ -64,7 +64,7 @@ async def main() -> None:
         for_eval=True,
     )
     logger.info(
-        f"RL suite: {len(study_rl_suite.tasks)} tasks, eval suite: {len(eval_suite.tasks)} tasks."
+        f"RL suite: {len(additional_rl_suite.tasks)} tasks, eval suite: {len(eval_suite.tasks)} tasks."
     )
 
     config = PipelineConfig(
@@ -95,16 +95,17 @@ async def main() -> None:
         generation_concurrency=400,
         rl_batch_size=48,
         rl_update_epochs=1,
-        rl_adam_params=tinker.AdamParams(learning_rate=2e-4),
-        rl_loss_fn="cispo",
+        rl_adam_params=tinker.AdamParams(learning_rate=7e-5),
+        rl_loss_fn="ppo",
         kl_penalty_coef=0.0,
         kl_discount_factor=0.0,
+        rl_skip_update=False,
     )
 
     pipeline = await SimplePipeline.create(
         config=config,
         knowledge_list=[],
-        seed_suites=[study_rl_suite, additional_rl_suite, eval_suite],
+        seed_suites=[ additional_rl_suite, eval_suite],
     )
 
     try:

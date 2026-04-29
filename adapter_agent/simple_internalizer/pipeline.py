@@ -36,6 +36,7 @@ from adapter_agent.simple_internalizer.rl_worker_pool import RLWorkerPool
 from adapter_agent.simple_internalizer.rollout_engine import RolloutEngine, build_solver_system_prompt
 from adapter_agent.simple_internalizer.training_runner import TrainingRunner
 from adapter_agent.simple_internalizer.types import PipelineConfig, SeedSuite
+from adapter_agent.util.config_util import flatten_config
 from adapter_agent.util.logger_util import ClockCycleFilteredLogger
 
 logger = logging.getLogger(__name__)
@@ -198,14 +199,7 @@ class SimplePipeline:
         ml_logger = ml_log.setup_logging(
             log_dir=str(log_dir),
             wandb_project="internalization",
-            config={
-                "model_name": config.model_loading_settings.model_name,
-                "library": config.library_name,
-                "sft_enabled": config.sft is not None,
-                "sft_epochs": config.sft.epochs if config.sft else None,
-                "sft_batch_size": config.sft.batch_size if config.sft else None,
-                "lora_rank": config.model_loading_settings.lora_rank,
-            },
+            config=flatten_config(config),
         )
         ml_logger = ClockCycleFilteredLogger(ml_logger)
 
@@ -380,15 +374,18 @@ class SimplePipeline:
 
             async with self.rl_pool:
                 for iteration in range(self.config.max_iterations):
-                    logger.info(f"--- Iteration {iteration + 1} (RL) ---")
+                    rl_step = iteration + 1
+                    logger.info(f"--- Iteration {rl_step} (RL) ---")
 
                     batch_groups = await self._collect_valid_rl_batch()
+
+                    trigger_eval = rl_step % self.config.eval.eval_interval == 0
+
+
 
                     logger.info(
                         f"Running RL (GRPO) update on valid batch of size {len(batch_groups)}..."
                     )
-                    rl_step = iteration + 1
-                    trigger_eval = rl_step % self.config.eval.eval_interval == 0
                     await self._run_grpo_update(batch_groups, trigger_eval=trigger_eval)
 
                     await self._maybe_run_distilled_sft_step()
@@ -424,6 +421,13 @@ class SimplePipeline:
     async def _run_grpo_update(
         self, valid_groups: list[RLGroup], trigger_eval: bool = True
     ) -> None:
+        if self.config.rl_skip_update:
+            logger.info(
+                f"rl_skip_update=True: skipping GRPO update on batch of size {len(valid_groups)} "
+                f"(rollouts and eval still run)."
+            )
+
+            return
         if not valid_groups:
             return
 
@@ -447,6 +451,15 @@ class SimplePipeline:
         step_metrics: dict[str, float] = {"rl/train_batch_size": float(len(valid_groups))}
         if kl_metrics:
             step_metrics.update({f"rl/{k}": v for k, v in kl_metrics.items()})
+
+        batch_versions = [g.sampling_client_version for g in valid_groups]
+        current_version = self.training_runner.shared_sampling_client.version
+        version_mean = sum(batch_versions) / len(batch_versions)
+        step_metrics["rl/sampler_version_mean"] = version_mean
+        step_metrics["rl/sampler_version_min"] = float(min(batch_versions))
+        step_metrics["rl/sampler_version_max"] = float(max(batch_versions))
+        step_metrics["rl/sampler_version_lag_mean"] = float(current_version) - version_mean
+        step_metrics["rl/sampler_version_lag_max"] = float(current_version - min(batch_versions))
 
         batch_iter = (clean_data_D for _ in range(self.config.rl_update_epochs))
         await self.training_runner.run_training_steps(
