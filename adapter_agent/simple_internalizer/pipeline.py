@@ -73,6 +73,9 @@ class RLBatchState:
         num_valid = sum(
             1 for g in self.window_groups if max(g.rewards) > min(g.rewards)
         )
+        num_any_correct = sum(
+            1 for g in self.window_groups if max(g.rewards) > 0
+        )
         response_lengths = [
             sum(len(tr.ac.tokens) for tr in traj.transitions)
             for g in self.window_groups
@@ -82,6 +85,7 @@ class RLBatchState:
         metrics = {
             "rollout/mean_reward": sum(all_rewards) / len(all_rewards),
             "rollout/valid_group_ratio": num_valid / len(self.window_groups),
+            "rollout/any_correct_ratio": num_any_correct / len(self.window_groups),
             "rollout/window_size": float(len(self.window_groups)),
             "rollout/sampling_client_version_mean": sum(versions) / len(versions),
             "rollout/sampling_client_version_min": float(min(versions)),
