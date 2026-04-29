@@ -98,6 +98,47 @@ async def get_graph(experiment_name: str):
                 
     return graph
 
+@app.get("/api/{experiment_name}/tasks")
+async def list_tasks(experiment_name: str):
+    """Return per-task aggregates for an experiment.
+
+    SQL-side GROUP BY so we never ship trials_json over the wire — must stay
+    cheap even with 100k+ trajectories so it doesn't compete with training
+    writes on Postgres.
+    """
+    client = await _db_manager.get_client()
+    exp = await client.experiment.find_unique(where={"experiment_name": experiment_name})
+    if not exp:
+        raise HTTPException(status_code=404, detail=f"Experiment '{experiment_name}' not found")
+
+    rows = await client.query_raw(
+        '''
+        SELECT
+            task_id,
+            MAX(instruction) AS instruction,
+            COUNT(*)::int AS total_count,
+            SUM(CASE WHEN reward IS NOT NULL AND reward > 0 THEN 1 ELSE 0 END)::int AS success_count,
+            MAX(reward) AS max_reward,
+            MAX(created_at) AS latest_created_at
+        FROM trajectories
+        WHERE experiment_name = $1
+        GROUP BY task_id
+        ORDER BY MAX(created_at) DESC
+        ''',
+        experiment_name,
+    )
+    return [
+        {
+            "task_id": r["task_id"],
+            "instruction": r.get("instruction") or r["task_id"],
+            "total_count": r["total_count"],
+            "success_count": r["success_count"],
+            "max_reward": r.get("max_reward"),
+            "latest_created_at": r.get("latest_created_at"),
+        }
+        for r in rows
+    ]
+
 @app.get("/api/{experiment_name}/trajectory/{task_id}")
 async def get_trajectory(experiment_name: str, task_id: str):
     client = await _db_manager.get_client()

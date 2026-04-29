@@ -85,6 +85,15 @@ export interface GraphExportData {
   edges: GraphExportEdge[];
 }
 
+export interface TaskSummary {
+  task_id: string;
+  instruction: string;
+  total_count: number;
+  success_count: number;
+  max_reward: number | null;
+  latest_created_at: string | null;
+}
+
 export interface OpenBookQA {
   id: number;
   knowledge_id: string;

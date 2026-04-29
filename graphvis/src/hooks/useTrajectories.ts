@@ -1,21 +1,21 @@
 import { useState, useEffect } from 'react';
 import { API_BASE } from '../constants';
-import type { TrajectoryData, CustomNode } from '../types';
+import type { TrajectoryData } from '../types';
 
-export function useTrajectories(selectedNode: CustomNode | null, selectedExperiment: string | null) {
+export function useTrajectories(taskId: string | null, selectedExperiment: string | null) {
   const [trajectories, setTrajectories] = useState<TrajectoryData[]>([]);
   const [selectedAttemptIndex, setSelectedAttemptIndex] = useState<number>(0);
   const [loadingTraj, setLoadingTraj] = useState<boolean>(false);
   const [trajError, setTrajError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (selectedNode && selectedNode.type === 'task' && selectedExperiment) {
+    if (taskId && selectedExperiment) {
       setLoadingTraj(true);
       setTrajError(null);
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 120000);
-      
-      fetch(`${API_BASE}/api/${encodeURIComponent(selectedExperiment)}/trajectory/${encodeURIComponent(selectedNode.id)}`, {
+
+      fetch(`${API_BASE}/api/${encodeURIComponent(selectedExperiment)}/trajectory/${encodeURIComponent(taskId)}`, {
         signal: controller.signal
       })
         .then(async res => {
@@ -44,7 +44,7 @@ export function useTrajectories(selectedNode: CustomNode | null, selectedExperim
     } else {
       setTrajectories([]);
     }
-  }, [selectedNode, selectedExperiment]);
+  }, [taskId, selectedExperiment]);
 
   return { trajectories, selectedAttemptIndex, setSelectedAttemptIndex, loadingTraj, trajError };
 }

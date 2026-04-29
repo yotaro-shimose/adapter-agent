@@ -28,7 +28,8 @@ export const GraphCanvasComponent: React.FC = () => {
   // Custom Hooks
   const { experiments, selectedExperiment, setSelectedExperiment, error: expError } = useExperiments();
   const { data, error: graphError, isInitializing, loadData: refreshGraph } = useGraphData(selectedExperiment);
-  const { trajectories, selectedAttemptIndex, setSelectedAttemptIndex, loadingTraj, trajError } = useTrajectories(selectedNode, selectedExperiment);
+  const taskId = selectedNode && selectedNode.type === 'task' ? selectedNode.id : null;
+  const { trajectories, selectedAttemptIndex, setSelectedAttemptIndex, loadingTraj, trajError } = useTrajectories(taskId, selectedExperiment);
   
   const displayData = useFilteredGraph({
     data,
