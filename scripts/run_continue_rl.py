@@ -10,18 +10,19 @@ import asyncio
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 import tinker
 from dotenv import load_dotenv
-from tinker_cookbook.utils.ml_log import Logger as MLLogger
 
-from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
 from adapter_agent.rl.config import ModelLoadingSettings
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.simple_internalizer import PipelineConfig, SimplePipeline
 from adapter_agent.simple_internalizer.data_sources import load_gh_archive_suite
-
+from adapter_agent.simple_internalizer.types import (
+    CheckpointSettings,
+    EvalSettings,
+    RolloutSettings,
+)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -29,28 +30,6 @@ logging.basicConfig(
 logging.getLogger("adapter_agent.internalize").setLevel(logging.DEBUG)
 
 logger = logging.getLogger(__name__)
-
-
-class ClockCycleFilteredLogger(MLLogger):
-    """MLLogger wrapper that drops metric keys containing 'clock_cycle'."""
-
-    def __init__(self, base: MLLogger) -> None:
-        self._base = base
-
-    def log_hparams(self, config: Any) -> None:
-        self._base.log_hparams(config)
-
-    def log_metrics(
-        self, metrics: dict[str, Any], step: int | None = None
-    ) -> None:
-        filtered = {k: v for k, v in metrics.items() if "clock_cycle" not in k}
-        self._base.log_metrics(filtered, step)
-
-    def log_long_text(self, key: str, text: str) -> None:
-        self._base.log_long_text(key, text)
-
-    def close(self) -> None:
-        self._base.close()
 
 
 async def main() -> None:
@@ -63,7 +42,6 @@ async def main() -> None:
 
     logger.info("Setting up continuation RL pipeline...")
 
-    analyzer = await AsyncRustDocAnalyzer.create_from_json(json_path)
     runtime_settings = RuntimeSettings.cloudrun_numrs2()
     simple_train_id = f"continue_rl_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
@@ -90,26 +68,32 @@ async def main() -> None:
     )
 
     config = PipelineConfig(
-        runtime_pool_size=50,
-        rl_worker_count=50,
-        eval_concurrency=48,
-        generation_concurrency=400,
         simple_train_id=simple_train_id,
         library_name="numrs2",
-        runtime_settings=runtime_settings,
         model_loading_settings=ModelLoadingSettings(
             model_name="Qwen/Qwen3-8B",
-            resume_trainer_path="tinker://e2a354f7-905b-5e4f-a2f5-c4cb4217c56c:train:0/weights/rl_0050",
-            resume_sampler_path="tinker://e2a354f7-905b-5e4f-a2f5-c4cb4217c56c:train:0/sampler_weights/rl_0050",
+            # resume_trainer_path="tinker://e2a354f7-905b-5e4f-a2f5-c4cb4217c56c:train:0/weights/rl_0050",
+            # resume_sampler_path="tinker://e2a354f7-905b-5e4f-a2f5-c4cb4217c56c:train:0/sampler_weights/rl_0050",
+            resume_trainer_path="tinker://976a7c11-7e95-596e-9230-38bff6526aa1:train:0/weights/rl_0020",
+            resume_sampler_path="tinker://976a7c11-7e95-596e-9230-38bff6526aa1:train:0/sampler_weights/rl_0020",
             lora_rank=32,
         ),
+        rollout=RolloutSettings(
+            runtime_settings=runtime_settings,
+            num_samples=8,
+            runtime_pool_size=50,
+            worker_count=50,
+        ),
+        eval=EvalSettings(
+            eval_rollout=4,
+            eval_interval=5,
+            eval_concurrency=48,
+        ),
+        checkpoint=CheckpointSettings(checkpoint_interval=10),
         sft=None,
-        eval_rollout=4,
-        eval_interval=5,
-        rl_rollout=16,
         max_iterations=200,
-        rl_checkpoint_interval=10,
-        rl_batch_size=96,
+        generation_concurrency=400,
+        rl_batch_size=48,
         rl_update_epochs=1,
         rl_adam_params=tinker.AdamParams(learning_rate=2e-4),
         rl_loss_fn="cispo",
@@ -119,20 +103,14 @@ async def main() -> None:
 
     pipeline = await SimplePipeline.create(
         config=config,
-        rust_doc_analyzer=analyzer,
         knowledge_list=[],
         seed_suites=[study_rl_suite, additional_rl_suite, eval_suite],
     )
 
-    filtered_logger = ClockCycleFilteredLogger(pipeline.ml_logger)
-    pipeline.ml_logger = filtered_logger
-    pipeline.evaluate_worker.ml_logger = filtered_logger
-
     try:
-        async with analyzer:
-            logger.info("Starting continuation RL pipeline execution.")
-            await pipeline.run()
-            logger.info("Pipeline executed successfully.")
+        logger.info("Starting continuation RL pipeline execution.")
+        await pipeline.run()
+        logger.info("Pipeline executed successfully.")
     except Exception as e:
         logger.exception(f"Pipeline encountered an error: {e}")
 

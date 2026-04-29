@@ -18,7 +18,12 @@ from adapter_agent.simple_internalizer.data_sources import (
     load_granular_knowledge,
     load_study_solved_suite,
 )
-from adapter_agent.simple_internalizer.types import SFTConfig
+from adapter_agent.simple_internalizer.types import (
+    CheckpointSettings,
+    EvalSettings,
+    RolloutSettings,
+    SFTConfig,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -94,19 +99,25 @@ async def main() -> None:
     ]
 
     config = PipelineConfig(
-        runtime_pool_size=100,
-        rl_worker_count=48,
-        eval_concurrency=48,
-        generation_concurrency=GENERATION_CONCURRENCY,
         simple_train_id=simple_train_id,
         library_name="numrs2",
-        runtime_settings=runtime_settings,
         model_loading_settings=ModelLoadingSettings(
             model_name="Qwen/Qwen3-8B",
             resume_trainer_path=None,
             resume_sampler_path=None,
             lora_rank=32,
         ),
+        rollout=RolloutSettings(
+            runtime_settings=runtime_settings,
+            num_samples=8,
+            runtime_pool_size=100,
+            worker_count=48,
+        ),
+        eval=EvalSettings(
+            eval_rollout=4,
+            eval_concurrency=48,
+        ),
+        checkpoint=CheckpointSettings(checkpoint_interval=10),
         sft=SFTConfig(
             k_sft=8,
             epochs=8,
@@ -114,11 +125,9 @@ async def main() -> None:
             adam_params=tinker.AdamParams(learning_rate=1e-3),
             cpt=False,
         ),
-        eval_rollout=4,
-        rl_rollout=8,
         cache_dir=CACHE_DIR,
         max_iterations=50,
-        rl_checkpoint_interval=10,
+        generation_concurrency=GENERATION_CONCURRENCY,
         rl_adam_params=tinker.AdamParams(learning_rate=2e-4),
         rl_loss_fn="cispo",
         kl_penalty_coef=0.0,

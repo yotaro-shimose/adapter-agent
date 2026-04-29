@@ -92,6 +92,7 @@ class ModelLoadingSettings(BaseModel):
     resume_trainer_path: str | None = None
     resume_sampler_path: str | None = None
     lora_rank: int = 32
+    resume_optimizer_state: bool = False
 
 
 class RLConfig(BaseModel):

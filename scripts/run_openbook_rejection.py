@@ -43,6 +43,7 @@ from adapter_agent.model_helper import get_gemini
 from adapter_agent.rl.env.runtime_pool import RuntimePool
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.simple_internalizer.executor import InternalizeExecutor
+from adapter_agent.util.logger_util import ClockCycleFilteredLogger
 
 warnings.filterwarnings("ignore", message=".*PydanticSerializationUnexpectedValue.*")
 warnings.filterwarnings("ignore", category=UserWarning, module="pydantic.*")
@@ -127,10 +128,12 @@ class OpenBookPipeline:
 
         log_dir = Path("logs") / "openbook_rejection" / config.experiment_name
         log_dir.mkdir(parents=True, exist_ok=True)
-        ml_logger = ml_log.setup_logging(
-            log_dir=str(log_dir),
-            wandb_project="internalization",
-            config=asdict(config),
+        ml_logger = ClockCycleFilteredLogger(
+            ml_log.setup_logging(
+                log_dir=str(log_dir),
+                wandb_project="internalization",
+                config=asdict(config),
+            )
         )
 
         await db.openbookexperiment.upsert(

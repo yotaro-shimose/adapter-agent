@@ -8,14 +8,12 @@ from pydantic import BaseModel
 from adapter_agent.data import QA, QRA
 from adapter_agent.hierarchical.agent.base import BaseAgent
 from adapter_agent.hierarchical.types import Knowledge
-from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass(kw_only=True)
 class GeneratorAgent[T: AgentsSDKModel](BaseAgent[T]):
-    rust_doc_analyzer: AsyncRustDocAnalyzer
 
     async def generate_sft(self, knowledge: Knowledge) -> Optional[QRA]:
         """

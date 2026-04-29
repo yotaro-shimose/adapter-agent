@@ -85,36 +85,6 @@ export interface GraphExportData {
   edges: GraphExportEdge[];
 }
 
-export interface SimpleKnowledgeAggr {
-  knowledge_id: string;
-  knowledge_title: string;
-  total_rollouts: number;
-  total_success: number;
-  steps: number[];
-  sft_count: number;
-  content?: string;
-}
-
-export interface SimpleTrajectory {
-  id: number;
-  step: number;
-  question: string;
-  reasoning: string;
-  answer: string;
-  success: boolean;
-  execution_output: string | null;
-  verification_output: string | null;
-  created_at: string | null;
-}
-
-export interface SimpleSftQna {
-  id: number;
-  question: string;
-  reasoning: string;
-  answer: string;
-  created_at: string | null;
-}
-
 export interface OpenBookQA {
   id: number;
   knowledge_id: string;

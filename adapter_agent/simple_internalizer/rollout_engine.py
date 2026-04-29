@@ -3,7 +3,6 @@ import logging
 from dataclasses import dataclass
 
 import tinker
-from prisma import Prisma
 from tinker_cookbook.renderers import Message, Renderer
 
 from adapter_agent.rl.shared_sampling_client import IndexedSamplingClient
@@ -52,7 +51,7 @@ class RolloutBatch:
 
 class RolloutEngine:
     """指示文 (instruction) を受けて N 回サンプリングし、
-    parse → executor 実行/検証 → Prisma への記録 までを一括実行する。
+    parse → executor 実行/検証 までを一括実行する。
 
     集計 (成功数カウント、Trajectory 組み立て等) は呼び出し側の責務。
     エンジンは 1 rollout につき 1 つの RolloutOutcome を素直に返す。
@@ -62,15 +61,11 @@ class RolloutEngine:
         self,
         renderer: Renderer,
         executor: InternalizeExecutor,
-        prisma_client: Prisma,
         system_prompt: str,
-        simple_train_id: str,
     ) -> None:
         self.renderer = renderer
         self.executor = executor
-        self.prisma_client = prisma_client
         self.system_prompt = system_prompt
-        self.simple_train_id = simple_train_id
 
     async def run(
         self,
@@ -79,8 +74,6 @@ class RolloutEngine:
         instruction: str,
         num_samples: int,
         sampling_params: tinker.SamplingParams,
-        source_id: str,
-        source_title: str,
     ) -> RolloutBatch:
         prompt = self.renderer.build_generation_prompt(
             [
@@ -97,13 +90,7 @@ class RolloutEngine:
 
         outcomes = await asyncio.gather(
             *[
-                self._process_sequence(
-                    seq,
-                    instruction=instruction,
-                    version=sampling_client.version,
-                    source_id=source_id,
-                    source_title=source_title,
-                )
+                self._process_sequence(seq, instruction=instruction)
                 for seq in sample_results.sequences
             ]
         )
@@ -115,9 +102,6 @@ class RolloutEngine:
         seq,
         *,
         instruction: str,
-        version: int,
-        source_id: str,
-        source_title: str,
     ) -> RolloutOutcome:
         tokens, logprobs = seq.tokens, seq.logprobs
         parsed = False
@@ -149,24 +133,6 @@ class RolloutEngine:
             verification_output = outcome.verification_output
         else:
             verification_output = "Parse failed."
-
-        try:
-            await self.prisma_client.simpletrajectory.create(
-                data={
-                    "simple_train_id": self.simple_train_id,
-                    "knowledge_id": source_id,
-                    "knowledge_title": source_title,
-                    "step": version,
-                    "question": instruction,
-                    "reasoning": reasoning,
-                    "answer": answer,
-                    "success": success,
-                    "execution_output": execution_output,
-                    "verification_output": verification_output,
-                }
-            )
-        except Exception as e:
-            logger.error(f"Failed to record rollout trajectory: {e}")
 
         return RolloutOutcome(
             tokens=tokens,

@@ -1,6 +1,9 @@
 import logging
 import os
 import warnings
+from typing import Any
+
+from tinker_cookbook.utils.ml_log import Logger as MLLogger
 
 
 class TruncatingLogFilter(logging.Filter):
@@ -90,3 +93,27 @@ class SuppressExtensionWarning(logging.Filter):
         logging.getLogger("tinker_cookbook.renderers.base").addFilter(
             SuppressExtensionWarning()
         )
+
+
+class ClockCycleFilteredLogger(MLLogger):
+    """W&B/ローカル MLLogger のラッパ。`clock_cycle` を含むメトリクスキーを落とす。
+
+    tinker の `forward_backward` / `optim_step` が返す `clock_cycle:unique` 等は
+    ノイズかつ単調増加で W&B パネルを埋めるだけなので記録しない。
+    """
+
+    def __init__(self, base: MLLogger) -> None:
+        self._base = base
+
+    def log_hparams(self, config: Any) -> None:
+        self._base.log_hparams(config)
+
+    def log_metrics(self, metrics: dict[str, Any], step: int | None = None) -> None:
+        filtered = {k: v for k, v in metrics.items() if "clock_cycle" not in k}
+        self._base.log_metrics(filtered, step)
+
+    def log_long_text(self, key: str, text: str) -> None:
+        self._base.log_long_text(key, text)
+
+    def close(self) -> None:
+        self._base.close()

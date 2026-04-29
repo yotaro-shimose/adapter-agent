@@ -464,25 +464,6 @@ class SimplePipeline:
             else:
                 verif_out_str = "Parse failed."
 
-            # Record to Prisma
-            try:
-                await self.prisma_client.simpletrajectory.create(
-                    data={
-                        "simple_train_id": self.config.simple_train_id,
-                        "knowledge_id": knowledge.id,
-                        "knowledge_title": knowledge.title,
-                        "step": self.current_step,
-                        "question": qra.question,
-                        "reasoning": reasoning,
-                        "answer": answer_text,
-                        "success": is_success,
-                        "execution_output": exec_out_str,
-                        "verification_output": verif_out_str,
-                    }
-                )
-            except Exception as e:
-                logger.error(f"Failed to record RL trajectory: {e}")
-
             return trajectory, (1.0 if is_success else 0.0)
 
         # Parallelize the 8 rollouts' verification
@@ -703,31 +684,8 @@ Your task is to solve the programming challenge using the `{library_name}` libra
             outcome = await self._run_execution_and_verification(
                 qra.question, reasoning, answer_text
             )
-            is_success, exec_out_str, verif_out_str = (
-                outcome.success,
-                outcome.execution_output,
-                outcome.verification_output,
-            )
-            if is_success:
+            if outcome.success:
                 success_count += 1
-
-            try:
-                await self.prisma_client.simpletrajectory.create(
-                    data={
-                        "simple_train_id": self.config.simple_train_id,
-                        "knowledge_id": knowledge_id,
-                        "knowledge_title": knowledge_title,
-                        "step": self.current_step,
-                        "question": qra.question,
-                        "reasoning": reasoning,
-                        "answer": answer_text,
-                        "success": is_success,
-                        "execution_output": exec_out_str,
-                        "verification_output": verif_out_str,
-                    }
-                )
-            except Exception as e:
-                logger.error(f"Failed to record trajectory: {e}")
 
         return EvalResult(success_count=success_count, total_count=num_samples)
 

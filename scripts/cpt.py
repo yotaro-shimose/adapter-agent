@@ -29,7 +29,10 @@ from adapter_agent.model_helper import get_gemini
 from adapter_agent.rl.env.runtime_pool import RuntimePool
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.simple_internalizer.executor import InternalizeExecutor
-from adapter_agent.util.logger_util import setup_base_loglevel
+from adapter_agent.util.logger_util import (
+    ClockCycleFilteredLogger,
+    setup_base_loglevel,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -132,10 +135,12 @@ class CPTPipeline:
             / f"{config.model_name.replace('/', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         )
         log_dir.mkdir(parents=True, exist_ok=True)
-        ml_logger = ml_log.setup_logging(
-            log_dir=str(log_dir),
-            wandb_project=config.wandb_project,
-            config=config.model_dump(),
+        ml_logger = ClockCycleFilteredLogger(
+            ml_log.setup_logging(
+                log_dir=str(log_dir),
+                wandb_project=config.wandb_project,
+                config=config.model_dump(),
+            )
         )
 
         return cls(

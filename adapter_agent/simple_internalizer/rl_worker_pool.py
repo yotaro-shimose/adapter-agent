@@ -118,8 +118,6 @@ class RLWorkerPool:
             instruction=task.instruction,
             num_samples=self._num_samples,
             sampling_params=self._sampling_params,
-            source_id=source.id,
-            source_title=source.title,
         )
 
         trajectories: list[Trajectory] = []
@@ -138,4 +136,8 @@ class RLWorkerPool:
             )
             rewards.append(1.0 if o.success else 0.0)
 
-        return RLGroup(trajectories=trajectories, rewards=rewards)
+        return RLGroup(
+            trajectories=trajectories,
+            rewards=rewards,
+            sampling_client_version=indexed_client.version,
+        )

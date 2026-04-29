@@ -106,9 +106,7 @@ class RolloutActor:
         rollout_engine = RolloutEngine(
             renderer=renderer,
             executor=executor,
-            prisma_client=prisma_client,
             system_prompt=build_solver_system_prompt(self._library_name),
-            simple_train_id=self._simple_train_id,
         )
 
         # Study scope外: queue=None で on_all_fail は no-op

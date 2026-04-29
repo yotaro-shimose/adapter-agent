@@ -24,7 +24,10 @@ from adapter_agent.rl.config import (
     SFTOptimizerParams,
     TrajectorySFTDataConfig,
 )
-from adapter_agent.util.logger_util import setup_base_loglevel
+from adapter_agent.util.logger_util import (
+    ClockCycleFilteredLogger,
+    setup_base_loglevel,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -164,7 +167,7 @@ def setup_logger(cfg: SFTConfig) -> MLLogger:
         log_dir=cfg.log_path, wandb_project=cfg.wandb_project, config=cfg
     )
     logging.basicConfig(level=logging.INFO)
-    return ml_logger
+    return ClockCycleFilteredLogger(ml_logger)
 
 
 # --- Main Logic ---

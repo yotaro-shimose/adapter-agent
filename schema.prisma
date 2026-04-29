@@ -57,8 +57,8 @@ model Knowledge {
 model SimpleTrainRun {
   id              String   @id // simple_train_id
   created_at      DateTime @default(now())
-  trajectories    SimpleTrajectory[]
   sft_qnas        SimpleSftQna[]
+  star_qnas       StarQna[]
 
   @@map("simple_train_runs")
   granular_knowledges GranularKnowledge[]
@@ -79,49 +79,44 @@ model GranularKnowledge {
   @@index([simple_train_id])
 }
 
-model SimpleTrajectory {
+model SimpleSftQna {
   id              Int      @id @default(autoincrement())
   simple_train_id String
   simple_train    SimpleTrainRun @relation(fields: [simple_train_id], references: [id], onDelete: Cascade)
-  
+
   knowledge_id    String
   knowledge_title String
-  
-  step            Int
+
   question        String
   reasoning       String
   answer          String
-  success         Boolean
-  
-  execution_output    String?
-  verification_output String?
-  
+
   created_at      DateTime @default(now())
-  
-  @@map("simple_trajectories")
+
+  @@map("simple_sft_qnas")
   @@index([simple_train_id])
   @@index([knowledge_id])
 
 }
 
-model SimpleSftQna {
+model StarQna {
   id              Int      @id @default(autoincrement())
   simple_train_id String
   simple_train    SimpleTrainRun @relation(fields: [simple_train_id], references: [id], onDelete: Cascade)
-  
-  knowledge_id    String
-  knowledge_title String
-  
+
+  star_step       Int
+  task_suite      String
+  task_id         String   // Task.id (run 内で安定). 同一 task からの成功サンプルをグルーピングしたり均等サンプリングするための key。
   question        String
   reasoning       String
   answer          String
-  
-  created_at      DateTime @default(now())
-  
-  @@map("simple_sft_qnas")
-  @@index([simple_train_id])
-  @@index([knowledge_id])
 
+  created_at      DateTime @default(now())
+
+  @@map("star_qnas")
+  @@index([simple_train_id])
+  @@index([simple_train_id, star_step])
+  @@index([simple_train_id, task_id])
 }
 
 

@@ -17,11 +17,10 @@ import logging
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
 import tinker
 from dotenv import load_dotenv
-from tinker_cookbook.utils.ml_log import Logger as MLLogger
 
 from adapter_agent.data import QRA
 from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
@@ -31,6 +30,11 @@ from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.rl.task_net import StudyTask
 from adapter_agent.simple_internalizer import PipelineConfig, SimplePipeline
 from adapter_agent.simple_internalizer.data_sources import load_gh_archive_suite
+from adapter_agent.simple_internalizer.types import (
+    CheckpointSettings,
+    EvalSettings,
+    RolloutSettings,
+)
 from adapter_agent.study.qra_budget import QRABudgetConfig
 from adapter_agent.study.runner import (
     StudyRunner,
@@ -63,24 +67,6 @@ logging.getLogger("adapter_agent.internalize").setLevel(logging.DEBUG)
 
 logger = logging.getLogger(__name__)
 os.environ["OPENAI_AGENTS_DISABLE_TRACING"] = "1"
-
-
-class ClockCycleFilteredLogger(MLLogger):
-    def __init__(self, base: MLLogger) -> None:
-        self._base = base
-
-    def log_hparams(self, config: Any) -> None:
-        self._base.log_hparams(config)
-
-    def log_metrics(self, metrics: dict[str, Any], step: int | None = None) -> None:
-        filtered = {k: v for k, v in metrics.items() if "clock_cycle" not in k}
-        self._base.log_metrics(filtered, step)
-
-    def log_long_text(self, key: str, text: str) -> None:
-        self._base.log_long_text(key, text)
-
-    def close(self) -> None:
-        self._base.close()
 
 
 async def main() -> None:
@@ -128,30 +114,34 @@ async def main() -> None:
     verifier_model = get_gemini() if VERIFIER_MODEL == "gemini" else get_gemini_lite()
 
     config = PipelineConfig(
-        runtime_pool_size=50,
-        rl_worker_count=50,
-        eval_concurrency=48,
-        generation_concurrency=400,
         simple_train_id=simple_train_id,
         library_name="numrs2",
-        runtime_settings=runtime_settings,
         model_loading_settings=continue_rl_checkpoint,
+        rollout=RolloutSettings(
+            runtime_settings=runtime_settings,
+            num_samples=16,
+            runtime_pool_size=50,
+            worker_count=50,
+            verifier_model=verifier_model,
+            use_ray=True,
+            ray_num_processes=16,
+            ray_workers_per_process=8,
+            ray_runtime_pool_size_per_process=8,
+            ray_actor_stagger_s=1.0,
+        ),
+        eval=EvalSettings(
+            eval_rollout=4,
+            eval_interval=5,
+            eval_concurrency=48,
+        ),
+        checkpoint=CheckpointSettings(checkpoint_interval=10),
         sft=None,
-        eval_rollout=4,
-        eval_interval=5,
-        rl_rollout=16,
         max_iterations=200,
-        rl_checkpoint_interval=10,
+        generation_concurrency=400,
         rl_batch_size=96,
         rl_update_epochs=1,
-        rl_adam_params=tinker.AdamParams(learning_rate=2e-4),
-        rl_loss_fn="cispo",
-        verifier_model=verifier_model,
-        rl_use_ray=True,
-        rl_ray_num_processes=16,
-        rl_ray_workers_per_process=4,
-        rl_ray_runtime_pool_size_per_process=8,
-        rl_ray_actor_stagger_s=1.0,
+        rl_adam_params=tinker.AdamParams(learning_rate=2e-5),
+        rl_loss_fn="ppo",
     )
 
     study_task_queue: asyncio.Queue[StudyTask] | None = (
@@ -169,10 +159,6 @@ async def main() -> None:
         study_task_queue=study_task_queue,
         qra_in_queue=qra_out_queue,
     )
-    filtered_logger = ClockCycleFilteredLogger(pipeline.ml_logger)
-    pipeline.ml_logger = filtered_logger
-    pipeline.evaluate_worker.ml_logger = filtered_logger
-
     async def _drain_study_until_idle(
         runner: StudyRunner,
         in_queue: asyncio.Queue[StudyTask],

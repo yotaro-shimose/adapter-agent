@@ -12,7 +12,7 @@ from adapter_agent.rl.shared_sampling_client import (
 )
 
 from .rollout_engine import RolloutEngine
-from .types import EvalResult, PipelineConfig, SeedSuite
+from .types import EvalResult, SeedSuite
 
 logger = logging.getLogger(__name__)
 
@@ -20,19 +20,23 @@ logger = logging.getLogger(__name__)
 class EvaluateWorker:
     def __init__(
         self,
-        config: PipelineConfig,
         ml_logger: MLLogger,
         shared_sampling_client: SharedSamplingClient,
         eval_suites: list[SeedSuite],
         trigger: asyncio.Event,
         rollout_engine: RolloutEngine,
+        eval_concurrency: int,
+        eval_rollout: int,
+        max_output_tokens: int,
     ):
-        self.config = config
         self.ml_logger = ml_logger
         self.shared_sampling_client = shared_sampling_client
         self.eval_suites = eval_suites
         self.trigger = trigger
         self.engine = rollout_engine
+        self.eval_concurrency = eval_concurrency
+        self.eval_rollout = eval_rollout
+        self.max_output_tokens = max_output_tokens
 
     async def run_loop(self):
         logger.info("EvaluateWorker loop started.")
@@ -77,7 +81,7 @@ class EvaluateWorker:
 
         results = await gather_with_semaphore(
             [_eval_one(sn, instr) for sn, instr in flattened],
-            max_concurrent=self.config.eval_concurrency,
+            max_concurrent=self.eval_concurrency,
         )
 
         suite_stats: dict[str, dict[str, int]] = {
@@ -124,17 +128,15 @@ class EvaluateWorker:
         source: str,
         rollouts: int | None = None,
     ) -> EvalResult:
-        num_samples = rollouts if rollouts is not None else self.config.eval_rollout
+        num_samples = rollouts if rollouts is not None else self.eval_rollout
         batch = await self.engine.run(
             sampling_client=snapshot,
             instruction=instruction,
             num_samples=num_samples,
             sampling_params=tinker.SamplingParams(
                 include_logprobs=True,
-                max_tokens=self.config.max_output_tokens,
+                max_tokens=self.max_output_tokens,
             ),
-            source_id=source,
-            source_title=source,
         )
         success_count = sum(1 for o in batch.outcomes if o.success)
         return EvalResult(
