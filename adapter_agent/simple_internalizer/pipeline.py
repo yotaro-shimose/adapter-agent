@@ -52,11 +52,14 @@ class RLBatchState:
     - `valid_buffer` feeds training (pops exactly `target_valid` when ready).
     - `window_groups` feeds rollout metrics (flushes every `metrics_window`
       groups over ALL produced groups, valid or not).
-    Surplus valid groups are retained across calls — none are discarded.
+    Surplus valid groups are retained across calls — none are discarded
+    except by `ready()`, which prunes groups whose `sampling_client_version`
+    lags the current version by more than `max_version_lag` (off-policy guard).
     """
 
     target_valid: int
     metrics_window: int
+    max_version_lag: int = 1
     valid_buffer: list[RLGroup] = field(default_factory=list)
     window_groups: list[RLGroup] = field(default_factory=list)
 
@@ -104,7 +107,19 @@ class RLBatchState:
         self.window_groups = []
         return metrics
 
-    def ready(self) -> bool:
+    def ready(self, current_version: int) -> bool:
+        before = len(self.valid_buffer)
+        self.valid_buffer = [
+            g
+            for g in self.valid_buffer
+            if current_version - g.sampling_client_version <= self.max_version_lag
+        ]
+        pruned = before - len(self.valid_buffer)
+        if pruned > 0:
+            logger.info(
+                f"Pruned {pruned} stale group(s) from valid_buffer "
+                f"(current_version={current_version}, max_lag={self.max_version_lag})."
+            )
         return len(self.valid_buffer) >= self.target_valid
 
     def pop_batch(self) -> list[RLGroup]:
@@ -251,6 +266,7 @@ class SimplePipeline:
         rl_batch_state = RLBatchState(
             target_valid=config.rl_batch_size,
             metrics_window=config.rl_metrics_window,
+            max_version_lag=config.rl_max_version_lag,
         )
         distilled = DistilledQRAManager(
             qra_in_queue=qra_in_queue,
@@ -411,7 +427,7 @@ class SimplePipeline:
             f"Collecting until {state.target_valid} valid RL groups are ready "
             f"(buffered={len(state.valid_buffer)}, window={len(state.window_groups)}/{state.metrics_window})..."
         )
-        while not state.ready():
+        while not state.ready(self.shared_sampling_client.version):
             group = await self.rl_pool.next_group()
             rollout_metrics = state.add(group)
             if rollout_metrics is not None:

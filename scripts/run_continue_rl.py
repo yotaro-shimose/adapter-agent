@@ -95,6 +95,7 @@ async def main() -> None:
         generation_concurrency=400,
         rl_batch_size=48,
         rl_update_epochs=1,
+        rl_max_version_lag=1,
         rl_adam_params=tinker.AdamParams(learning_rate=7e-5),
         rl_loss_fn="ppo",
         kl_penalty_coef=0.0,

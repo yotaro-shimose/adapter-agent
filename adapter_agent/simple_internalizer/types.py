@@ -152,6 +152,7 @@ class PipelineConfig:
     rl_batch_size: int = 48
     rl_update_epochs: int = 1
     rl_metrics_window: int = 50
+    rl_max_version_lag: int = 1
     kl_penalty_coef: float = 0.0
     kl_discount_factor: float = 0.0
     rl_skip_update: bool = False
