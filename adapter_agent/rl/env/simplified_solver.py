@@ -20,6 +20,7 @@ from adapter_agent.rl.env.injection import _inject_tools_into_prompt
 from adapter_agent.rl.env.reward import LLMAsAJudgeSingleTurn
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.rl.env.search_tool import SearchTool, SimplifiedSolverMutableState
+from adapter_agent.rl.solved_subtask import SolvedSubtask
 from adapter_agent.util.exception import CodingEnvironmentError
 
 CARGO_INIT_MAIN_RS = """\
@@ -38,6 +39,7 @@ class SimplifiedSolverEnvState:
     moc_content: str | None = None
     blocked_knowledge_ids: set[str] = field(default_factory=set)
     qwen_no_think: bool = False
+    solved_subtasks: list[SolvedSubtask] = field(default_factory=list)
 
     @classmethod
     def numrs2(
@@ -47,6 +49,7 @@ class SimplifiedSolverEnvState:
         blocked_knowledge_ids: set[str] | None = None,
         qwen_no_think: bool = False,
         moc_content: str | None = None,
+        solved_subtasks: list[SolvedSubtask] | None = None,
     ) -> Self:
         return cls(
             task=task,
@@ -56,6 +59,7 @@ class SimplifiedSolverEnvState:
             blocked_knowledge_ids=blocked_knowledge_ids or set(),
             qwen_no_think=qwen_no_think,
             moc_content=moc_content,
+            solved_subtasks=solved_subtasks or [],
         )
 
     def with_messages(self, messages: list[TinkerMessage]) -> Self:
@@ -67,6 +71,7 @@ class SimplifiedSolverEnvState:
             blocked_knowledge_ids=self.blocked_knowledge_ids,
             qwen_no_think=self.qwen_no_think,
             moc_content=self.moc_content,
+            solved_subtasks=self.solved_subtasks,
         )
 
 
@@ -458,6 +463,23 @@ At the end of every tool response, you will see a `[STATUS]` section:
     if env_state.moc_content:
         PROMPT += f"\n<MapOfContent>\n{env_state.moc_content}\n</MapOfContent>\n"
 
+    if env_state.solved_subtasks:
+        subtask_blocks = []
+        for idx, sub in enumerate(env_state.solved_subtasks, start=1):
+            subtask_blocks.append(
+                f'<SolvedSubtask index="{idx}">\n'
+                f"<Problem>\n{sub.instruction}\n</Problem>\n"
+                f"<Solution>\n{sub.submit_code}\n</Solution>\n"
+                f"</SolvedSubtask>"
+            )
+        PROMPT += (
+            "\n<SolvedSubtasks>\n"
+            "You previously solved the following related sub-problems. "
+            "Their final, verified solutions are shown so you can reuse the approach in your current task.\n\n"
+            + "\n\n".join(subtask_blocks)
+            + "\n</SolvedSubtasks>\n"
+        )
+
     guidelines = """\
 Verification: Once again, you MUST verify your answer. You should make your best efforts to avoid hallucination and make sure your answer is correct.
 Self-contained: Note your solution has been fully self-contained including both fully functioning source code and explanation.
@@ -467,6 +489,7 @@ Code block inclusion: Your final answer MUST include exactly one `<submit>\\n<yo
 Wiki Exploration: Always check the internal Wiki (`wiki_ls`, `wiki_read`) first for high-quality, project-specific knowledge. Use the provided `<MapOfContent>` as your primary index to find relevant articles. You are encouraged to read multiple related articles in a single turn (up to 5) to save turns and quota.
 Documentation Fallback: Use `search_library_doc` only if the Wiki does not contain the necessary information. Note that this tool provides raw technical details from the crate's official documentation.
 Error Reflection: If `<write_and_run>` test fails, analyze the compiler error carefully. Check the Wiki or documentation for specific causes of the error code (e.g., E0308).
+Solved Subtasks: If a `<SolvedSubtasks>` section is provided, study the included `<Problem>` and `<Solution>` pairs first as concrete reference implementations before writing new code.
 """
     PROMPT += f"\n<Guidelines>\n{guidelines}\n</Guidelines>"
 

@@ -29,6 +29,7 @@ from adapter_agent.rl.env.simplified_solver import (
     SimplifiedSolverEnvState,
     build_simplified_solver_msg_env,
 )
+from adapter_agent.rl.solved_subtask import SolvedSubtask
 from adapter_agent.util.exception import CodingEnvironmentError, MaximumContextExceeded
 
 CONTEXT_EXCEEDED_MESSAGE = TinkerMessage(
@@ -49,6 +50,7 @@ async def ss_solve_verify(
     qwen_no_think: bool = False,
     internalized_knowledge: str | None = None,
     blocked_knowledge_ids: set[str] | None = None,
+    solved_subtasks: list[SolvedSubtask] | None = None,
 ) -> RewireSessionResult:
     verifier = Verifier(model=verifier_model)
     ss_state = SimplifiedSolverEnvState.numrs2(
@@ -56,6 +58,7 @@ async def ss_solve_verify(
         qwen_no_think=qwen_no_think,
         internalized_knowledge=internalized_knowledge,
         blocked_knowledge_ids=blocked_knowledge_ids,
+        solved_subtasks=solved_subtasks,
     )
     try:
         renderer = (

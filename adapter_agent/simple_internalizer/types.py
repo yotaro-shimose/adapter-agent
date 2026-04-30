@@ -102,7 +102,6 @@ class STaRSettings:
     sft_adam_params: tinker.AdamParams = field(
         default_factory=lambda: tinker.AdamParams(learning_rate=5e-6)
     )
-    cpt: bool = False
 
 
 @dataclass
@@ -113,49 +112,56 @@ class SFTConfig:
     k_sft: int = 32
     epochs: int = 1
     batch_size: int = 32
+    sft_seed: int = 42
     save_checkpoint: bool = False
     adam_params: tinker.AdamParams = field(
         default_factory=lambda: tinker.AdamParams(learning_rate=1e-4)
     )
-    cpt: bool = False
     generator_model: AgentsSDKModel | None = None
 
 
 @dataclass
+class RLConfig:
+    """RL (GRPO) stage settings. Set `PipelineConfig.rl = None` to skip the
+    RL loop entirely (eval-only / SFT-only runs)."""
+
+    max_iterations: int = 50
+    adam_params: tinker.AdamParams = field(
+        default_factory=lambda: tinker.AdamParams(learning_rate=1e-5)
+    )
+    loss_fn: LossFnType = "importance_sampling"
+    batch_size: int = 48
+    update_epochs: int = 1
+    metrics_window: int = 50
+    max_version_lag: int = 1
+    kl_penalty_coef: float = 0.0
+    kl_discount_factor: float = 0.0
+    skip_update: bool = False
+    rl_seed: int = 42  # initial RL task ordering shuffle seed
+
+
+@dataclass
 class PipelineConfig:
-    """RL (SimplePipeline) 用設定。SubConfig を合成で保持し、RL/GRPO 固有の
-    フィールドだけ自前で持つ。"""
+    """SimplePipeline 用設定。SubConfig を合成で保持。`rl=None` で RL ループを
+    完全スキップ (SFT のみ / eval のみの実験で使う)。"""
 
     # Identity / checkpoint resume
     simple_train_id: str
     library_name: str
     model_loading_settings: ModelLoadingSettings
 
-    # Composed sub-configs
+    # Composed sub-configs (shared across phases)
     rollout: RolloutSettings
     eval: EvalSettings
     checkpoint: CheckpointSettings
 
     # Pipeline flow
-    max_iterations: int = 50
     cache_dir: Path = Path(".cache/simple_internalizer")
     generation_concurrency: int = 400
 
-    # SFT (initial stage)
+    # Stage configs (None disables that stage)
     sft: SFTConfig | None = None
-
-    # RL (GRPO) specific
-    rl_adam_params: tinker.AdamParams = field(
-        default_factory=lambda: tinker.AdamParams(learning_rate=1e-5)
-    )
-    rl_loss_fn: LossFnType = "importance_sampling"
-    rl_batch_size: int = 48
-    rl_update_epochs: int = 1
-    rl_metrics_window: int = 50
-    rl_max_version_lag: int = 1
-    kl_penalty_coef: float = 0.0
-    kl_discount_factor: float = 0.0
-    rl_skip_update: bool = False
+    rl: RLConfig | None = None
 
 
 @dataclass

@@ -21,8 +21,8 @@ EVAL_STRATEGY — how the model is invoked per task:
                            search + rustdoc lookup tools. Success is decided
                            by the session's own reward.
 
-Edit the constants at the top of `main()` to pick axes and point at a
-checkpoint or model.
+Edit the `CONFIG` instance near the top of this module to pick axes and
+point at a checkpoint or model.
 """
 
 import asyncio
@@ -31,17 +31,18 @@ import os
 import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Awaitable, Iterable, Literal
 
 import tinker
 from agents.extensions.models.litellm_model import LitellmModel
 from dotenv import load_dotenv
 from oai_utils import AgentsSDKModel
 from oai_utils.agent import AgentWrapper
-from oai_utils.async_utils import gather_with_semaphore
 from oai_utils.tinker import TinkerModel, setup_tinkermodel
 from prisma import Prisma
 from tinker_cookbook.renderers import Message
+from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.process.rewire import ss_solve_verify
@@ -56,37 +57,290 @@ from adapter_agent.simple_internalizer.executor import InternalizeExecutor
 from adapter_agent.simple_internalizer.rollout_engine import build_solver_system_prompt
 from adapter_agent.simple_internalizer.types import SeedSuite
 
-# --- Eval suite ---
-EVAL_SLICE = slice(40, 60)
-EVAL_ROLLOUT = 1
-EVAL_CONCURRENCY = 48
-RUNTIME_POOL_SIZE = 50
-LIBRARY_NAME = "numrs2"
-VERIFIER_MODEL: Literal["gemini", "gemini_lite"] = "gemini_lite"
+# --- Dataset splits (reference; pick one for `EvalConfig.task_slice`) ---
+STUDY_SLICE = slice(0, 50)
+TRAIN_SLICE = slice(50, 150)
+EVAL_SLICE = slice(150, 200)
 
-# --- Solver model (which model runs as the policy) ---
-MODEL_BACKEND: Literal["tinker", "agents"] = "tinker"
 
-# Tinker backend: path to the trained sampler checkpoint.
-TINKER_MODEL_NAME = "Qwen/Qwen3-8B"
-TINKER_SAMPLER_PATH: str | None = (
-    "tinker://976a7c11-7e95-596e-9230-38bff6526aa1:train:0/sampler_weights/rl_0020"
+@dataclass(frozen=True)
+class TinkerSolverConfig:
+    """Tinker sampler loaded from a checkpoint path (RL/SFT-trained model)."""
+
+    model_name: str
+    sampler_path: str | None
+
+
+@dataclass(frozen=True)
+class AgentsSolverConfig:
+    """AgentsSDKModel-backed solver (e.g. LitellmModel via gemini)."""
+
+    model: Literal["gemini", "gemini_lite"]
+
+
+SolverConfig = TinkerSolverConfig | AgentsSolverConfig
+
+
+@dataclass(frozen=True)
+class SsSolveVerifyConfig:
+    """Settings for `EVAL_STRATEGY == "ss_solve_verify"` (mirrors study.py)."""
+
+    rust_libdir: Path
+    wiki_version: str  # ignored when `use_wiki` is False.
+    max_turns: int
+    qwen_no_think: bool
+    runtime_mode: Literal["docker", "cloudrun"]
+    concurrency: int  # typically lower than EvalConfig.concurrency — each run spins its own runtime.
+    use_wiki: bool  # If False, the solver runs with an empty wiki (no Prisma needed).
+
+
+@dataclass(frozen=True)
+class EvalConfig:
+    task_slice: slice
+    rollout: int
+    concurrency: int
+    runtime_pool_size: int
+    library_name: str
+    verifier_model: Literal["gemini", "gemini_lite"]
+    strategy: Literal["single_turn", "ss_solve_verify"]
+    solver: SolverConfig
+    ss: SsSolveVerifyConfig
+
+
+# --- Shared sub-configs (re-used across named variants below) ---
+_TINKER_RL0020 = TinkerSolverConfig(
+    model_name="Qwen/Qwen3-8B",
+    sampler_path=(
+        "tinker://976a7c11-7e95-596e-9230-38bff6526aa1:train:0/sampler_weights/rl_0020"
+    ),
 )
 
-# Agents backend: which LiteLLM-backed model to use as the policy.
-AGENTS_MODEL: Literal["gemini", "gemini_lite"] = "gemini"
+# Newer training run (2026-04-30 batch).
+_TINKER_SIP2 = TinkerSolverConfig(
+    model_name="Qwen/Qwen3-8B",
+    sampler_path=(
+        "tinker://01c17add-b415-5839-9ea7-2fe09d5748c7:train:0/sampler_weights/rl_0010"
+    ),
+)
 
-# --- Eval strategy (how the solver is invoked per task) ---
-EVAL_STRATEGY: Literal["single_turn", "ss_solve_verify"] = "single_turn"
+# Latest training run (2026-04-30 batch, c263af3f).
+_TINKER_SIP3 = TinkerSolverConfig(
+    model_name="Qwen/Qwen3-32B",
+    sampler_path=(
+        "tinker://c263af3f-acfd-5d93-a297-2dc732548b74:train:0/sampler_weights/rl_0010"
+    ),
+)
 
-# Settings for EVAL_STRATEGY == "ss_solve_verify" (mirrors study.py defaults).
-SS_RUST_LIBDIR = Path("repositories/numrs")
-SS_WIKI_VERSION = "study_20260419_041136"
-SS_MAX_TURNS = 6
-SS_QWEN_NO_THINK = True
-SS_RUNTIME_MODE: Literal["docker", "cloudrun"] = "docker"
-SS_CONCURRENCY = 20  # lower than EVAL_CONCURRENCY — each run spins its own runtime.
-SS_USE_WIKI = True  # If False, the solver runs with an empty wiki (no Prisma needed).
+# Qwen3-8B base model — no fine-tuned sampler, used as the baseline.
+_TINKER_BASE = TinkerSolverConfig(
+    model_name="Qwen/Qwen3-8B",
+    sampler_path=None,
+)
+
+# Qwen3-32B base model — larger reference policy.
+_TINKER_QWEN32B = TinkerSolverConfig(
+    model_name="Qwen/Qwen3-32B",
+    sampler_path=None,
+)
+
+# Gemini via AgentsSDK / LitellmModel — used as a stronger reference solver.
+_AGENTS_GEMINI = AgentsSolverConfig(model="gemini")
+
+_SS_NUMRS_NOWIKI = SsSolveVerifyConfig(
+    rust_libdir=Path("repositories/numrs"),
+    wiki_version="study_20260430_024306",  # 新版Easy だけど多様なタスクリスト solved by gemini
+    # wiki_version="study_20260419_041136",  # Easy のやつ
+    max_turns=10,
+    qwen_no_think=True,
+    runtime_mode="docker",
+    concurrency=50,
+    use_wiki=False,
+)
+
+_SS_NUMRS_WITHWIKI = SsSolveVerifyConfig(
+    rust_libdir=Path("repositories/numrs"),
+    wiki_version="study_20260430_024306",  # 新版Easy だけど多様なタスクリスト solved by gemini
+    max_turns=10,
+    qwen_no_think=True,
+    runtime_mode="docker",
+    concurrency=50,
+    use_wiki=True,
+)
+
+
+# --- Named eval variants. Pick one and assign to CONFIG below. ---
+
+# Tinker rl_0020 × ss_solve_verify (rustdoc tools, no wiki).
+SIP_RAG = EvalConfig(
+    task_slice=EVAL_SLICE,
+    rollout=1,
+    concurrency=50,
+    runtime_pool_size=50,
+    library_name="numrs2",
+    verifier_model="gemini_lite",
+    strategy="ss_solve_verify",
+    solver=_TINKER_RL0020,
+    ss=_SS_NUMRS_NOWIKI,
+)
+
+# Tinker rl_0020 × single_turn (no RAG, no tools — one-shot prompt).
+SIP_SINGLE = EvalConfig(
+    task_slice=EVAL_SLICE,
+    rollout=1,
+    concurrency=50,
+    runtime_pool_size=50,
+    library_name="numrs2",
+    verifier_model="gemini_lite",
+    strategy="single_turn",
+    solver=_TINKER_RL0020,
+    ss=_SS_NUMRS_NOWIKI,  # unused for single_turn
+)
+
+# Qwen3-8B base (no checkpoint) × ss_solve_verify — RAG baseline.
+BASE_RAG = EvalConfig(
+    task_slice=EVAL_SLICE,
+    rollout=1,
+    concurrency=50,
+    runtime_pool_size=50,
+    library_name="numrs2",
+    verifier_model="gemini_lite",
+    strategy="ss_solve_verify",
+    solver=_TINKER_BASE,
+    ss=_SS_NUMRS_NOWIKI,
+)
+
+# Qwen3-8B base × single_turn — bare baseline (no checkpoint, no RAG).
+BASE_SINGLE = EvalConfig(
+    task_slice=EVAL_SLICE,
+    rollout=1,
+    concurrency=50,
+    runtime_pool_size=50,
+    library_name="numrs2",
+    verifier_model="gemini_lite",
+    strategy="single_turn",
+    solver=_TINKER_BASE,
+    ss=_SS_NUMRS_NOWIKI,  # unused for single_turn
+)
+
+# Qwen3-8B base × ss_solve_verify with wiki — full RAG baseline.
+BASE_WIKI = EvalConfig(
+    task_slice=EVAL_SLICE,
+    rollout=1,
+    concurrency=50,
+    runtime_pool_size=50,
+    library_name="numrs2",
+    verifier_model="gemini_lite",
+    strategy="ss_solve_verify",
+    solver=_TINKER_BASE,
+    ss=_SS_NUMRS_WITHWIKI,
+)
+
+# Gemini × single_turn — one-shot prompt, no tools.
+GEMINI_SINGLE = EvalConfig(
+    task_slice=EVAL_SLICE,
+    rollout=1,
+    concurrency=50,
+    runtime_pool_size=50,
+    library_name="numrs2",
+    verifier_model="gemini_lite",
+    strategy="single_turn",
+    solver=_AGENTS_GEMINI,
+    ss=_SS_NUMRS_NOWIKI,  # unused for single_turn
+)
+
+# Gemini × ss_solve_verify (rustdoc tools, no wiki).
+GEMINI_RAG = EvalConfig(
+    task_slice=EVAL_SLICE,
+    rollout=1,
+    concurrency=50,
+    runtime_pool_size=50,
+    library_name="numrs2",
+    verifier_model="gemini_lite",
+    strategy="ss_solve_verify",
+    solver=_AGENTS_GEMINI,
+    ss=_SS_NUMRS_NOWIKI,
+)
+
+# Gemini × ss_solve_verify with wiki — full RAG with Gemini policy.
+GEMINI_WIKI = EvalConfig(
+    task_slice=EVAL_SLICE,
+    rollout=1,
+    concurrency=50,
+    runtime_pool_size=50,
+    library_name="numrs2",
+    verifier_model="gemini_lite",
+    strategy="ss_solve_verify",
+    solver=_AGENTS_GEMINI,
+    ss=_SS_NUMRS_WITHWIKI,
+)
+
+# Tinker SIP2 (rl_0010, newer run) × single_turn.
+SIP2_SINGLE = EvalConfig(
+    task_slice=EVAL_SLICE,
+    rollout=1,
+    concurrency=50,
+    runtime_pool_size=50,
+    library_name="numrs2",
+    verifier_model="gemini_lite",
+    strategy="single_turn",
+    solver=_TINKER_SIP2,
+    ss=_SS_NUMRS_NOWIKI,  # unused for single_turn
+)
+
+# Tinker SIP2 × ss_solve_verify (rustdoc tools, no wiki).
+SIP2_RAG = EvalConfig(
+    task_slice=EVAL_SLICE,
+    rollout=1,
+    concurrency=50,
+    runtime_pool_size=50,
+    library_name="numrs2",
+    verifier_model="gemini_lite",
+    strategy="ss_solve_verify",
+    solver=_TINKER_SIP2,
+    ss=_SS_NUMRS_NOWIKI,
+)
+
+# Tinker SIP3 (rl_0010, latest run c263af3f) × single_turn.
+SIP3_SINGLE = EvalConfig(
+    task_slice=EVAL_SLICE,
+    rollout=1,
+    concurrency=50,
+    runtime_pool_size=50,
+    library_name="numrs2",
+    verifier_model="gemini_lite",
+    strategy="single_turn",
+    solver=_TINKER_SIP3,
+    ss=_SS_NUMRS_NOWIKI,  # unused for single_turn
+)
+
+# Qwen3-32B base × ss_solve_verify (rustdoc tools, no wiki) — larger-model reference.
+QWEN32B_RAG = EvalConfig(
+    task_slice=EVAL_SLICE,
+    rollout=1,
+    concurrency=50,
+    runtime_pool_size=50,
+    library_name="numrs2",
+    verifier_model="gemini_lite",
+    strategy="ss_solve_verify",
+    solver=_TINKER_QWEN32B,
+    ss=_SS_NUMRS_NOWIKI,
+)
+
+# Qwen3-32B base × ss_solve_verify with wiki — larger-model + full RAG.
+QWEN32B_WIKI = EvalConfig(
+    task_slice=EVAL_SLICE,
+    rollout=1,
+    concurrency=50,
+    runtime_pool_size=50,
+    library_name="numrs2",
+    verifier_model="gemini_lite",
+    strategy="ss_solve_verify",
+    solver=_TINKER_QWEN32B,
+    ss=_SS_NUMRS_WITHWIKI,
+)
+
+
+CONFIG = SIP3_SINGLE
 
 
 logging.basicConfig(
@@ -134,6 +388,49 @@ def _length_stats(values: Iterable[int]) -> tuple[float, float, int] | None:
     mean = sum(vs) / len(vs)
     var = statistics.pvariance(vs) if len(vs) > 1 else 0.0
     return mean, var, max(vs)
+
+
+async def _gather_eval_with_progress(
+    coros: list[Awaitable["TaskEvalResult"]],
+    *,
+    desc: str,
+    max_concurrent: int,
+) -> list["TaskEvalResult"]:
+    """Run eval coroutines with a semaphore + live progress bar.
+
+    The bar shows running ok/total rollouts and ratio so the wait isn't blind.
+    """
+    sem = asyncio.Semaphore(max_concurrent)
+    success = 0
+    rollouts = 0
+    completed_tasks = 0
+
+    with logging_redirect_tqdm():
+        with tqdm(total=len(coros), desc=desc, dynamic_ncols=True) as pbar:
+
+            async def _worker(coro: Awaitable[TaskEvalResult]) -> TaskEvalResult:
+                nonlocal success, rollouts, completed_tasks
+                async with sem:
+                    r = await coro
+                success += r.success_count
+                rollouts += r.total_count
+                completed_tasks += 1
+                ratio = (success / rollouts) if rollouts else 0.0
+                head = (
+                    (r.instruction[:50] + "..")
+                    if len(r.instruction) > 50
+                    else r.instruction
+                ).replace("\n", " ")
+                mark = "✓" if r.success_count > 0 else "✗"
+                tqdm.write(
+                    f"  [{completed_tasks}/{len(coros)}] {mark} "
+                    f"({r.success_count}/{r.total_count}) {head}"
+                )
+                pbar.set_postfix_str(f"ok={success}/{rollouts} ({ratio:.1%})")
+                pbar.update(1)
+                return r
+
+            return await asyncio.gather(*[_worker(c) for c in coros])
 
 
 async def _sample_with_tinker(
@@ -292,32 +589,37 @@ async def _evaluate_task_ss_solve_verify(
 async def _run_single_turn(
     flattened: list[tuple[str, Task]],
     *,
+    cfg: EvalConfig,
     tinker_model: TinkerModel | None,
     agents_model: AgentsSDKModel | None,
     verifier_model: AgentsSDKModel,
 ) -> list[TaskEvalResult]:
     runtime_settings = RuntimeSettings.cloudrun_numrs2()
     verifier = Verifier(model=verifier_model)
-    runtime_pool = RuntimePool(runtime_settings, max_size=RUNTIME_POOL_SIZE)
+    runtime_pool = RuntimePool(runtime_settings, max_size=cfg.runtime_pool_size)
     executor = InternalizeExecutor(runtime_pool=runtime_pool, verifier=verifier)
-    system_prompt = build_solver_system_prompt(LIBRARY_NAME)
+    system_prompt = build_solver_system_prompt(cfg.library_name)
+    backend: Literal["tinker", "agents"] = (
+        "tinker" if isinstance(cfg.solver, TinkerSolverConfig) else "agents"
+    )
 
     try:
         async def _one(suite_name: str, task: Task) -> TaskEvalResult:
             return await _evaluate_task_single_turn(
                 task,
                 suite_name,
-                backend=MODEL_BACKEND,
+                backend=backend,
                 tinker_model=tinker_model,
                 agents_model=agents_model,
                 system_prompt=system_prompt,
                 executor=executor,
-                num_samples=EVAL_ROLLOUT,
+                num_samples=cfg.rollout,
             )
 
-        return await gather_with_semaphore(
+        return await _gather_eval_with_progress(
             [_one(sn, t) for sn, t in flattened],
-            max_concurrent=EVAL_CONCURRENCY,
+            desc="single_turn eval",
+            max_concurrent=cfg.concurrency,
         )
     finally:
         await runtime_pool.close_all()
@@ -345,27 +647,29 @@ class _NullWikiManager:
 async def _run_ss_solve_verify(
     flattened: list[tuple[str, Task]],
     *,
+    cfg: EvalConfig,
     solver_model: TinkerModel | LitellmModel,
     verifier_model: AgentsSDKModel,
 ) -> list[TaskEvalResult]:
+    ss = cfg.ss
     runtime_settings = (
         RuntimeSettings.docker_numrs2()
-        if SS_RUNTIME_MODE == "docker"
+        if ss.runtime_mode == "docker"
         else RuntimeSettings.cloudrun_numrs2()
     )
-    wiki_label = SS_WIKI_VERSION if SS_USE_WIKI else "<disabled>"
+    wiki_label = ss.wiki_version if ss.use_wiki else "<disabled>"
     logger.info(
         f"Building ss_solve_verify resources "
-        f"(libdir={SS_RUST_LIBDIR}, wiki={wiki_label}, runtime={SS_RUNTIME_MODE})..."
+        f"(libdir={ss.rust_libdir}, wiki={wiki_label}, runtime={ss.runtime_mode})..."
     )
-    rust_doc_analyzer = await AsyncRustDocAnalyzer.create_from_libdir(SS_RUST_LIBDIR)
+    rust_doc_analyzer = await AsyncRustDocAnalyzer.create_from_libdir(ss.rust_libdir)
 
     prisma: Prisma | None = None
     wiki_manager: WikiManager | _NullWikiManager
-    if SS_USE_WIKI:
+    if ss.use_wiki:
         prisma = Prisma()
         await prisma.connect()
-        wiki_manager = WikiManager(prisma, version=SS_WIKI_VERSION)
+        wiki_manager = WikiManager(prisma, version=ss.wiki_version)
     else:
         wiki_manager = _NullWikiManager()
 
@@ -380,14 +684,15 @@ async def _run_ss_solve_verify(
                     rust_doc_analyzer=rust_doc_analyzer,
                     wiki_manager=wiki_manager,
                     runtime_settings=runtime_settings,
-                    max_turns=SS_MAX_TURNS,
-                    qwen_no_think=SS_QWEN_NO_THINK,
-                    num_samples=EVAL_ROLLOUT,
+                    max_turns=ss.max_turns,
+                    qwen_no_think=ss.qwen_no_think,
+                    num_samples=cfg.rollout,
                 )
 
-            return await gather_with_semaphore(
+            return await _gather_eval_with_progress(
                 [_one(sn, t) for sn, t in flattened],
-                max_concurrent=SS_CONCURRENCY,
+                desc="ss_solve_verify eval",
+                max_concurrent=ss.concurrency,
             )
     finally:
         if prisma is not None:
@@ -396,51 +701,62 @@ async def _run_ss_solve_verify(
 
 async def main() -> None:
     load_dotenv()
+    cfg = CONFIG
 
     eval_suite = load_gh_archive_suite(
         name="gh_archive_eval",
-        task_slice=EVAL_SLICE,
+        task_slice=cfg.task_slice,
         for_rl=False,
         for_eval=True,
     )
     suites: list[SeedSuite] = [eval_suite]
 
-    verifier_model = get_gemini() if VERIFIER_MODEL == "gemini" else get_gemini_lite()
+    verifier_model = (
+        get_gemini() if cfg.verifier_model == "gemini" else get_gemini_lite()
+    )
 
     tinker_model: TinkerModel | None = None
     agents_model: AgentsSDKModel | None = None
-    if MODEL_BACKEND == "tinker":
+    if isinstance(cfg.solver, TinkerSolverConfig):
         logger.info(
-            f"Loading Tinker sampler (base={TINKER_MODEL_NAME}) from {TINKER_SAMPLER_PATH}..."
+            f"Loading Tinker sampler (base={cfg.solver.model_name}) "
+            f"from {cfg.solver.sampler_path}..."
         )
         tinker_model, _, _ = setup_tinkermodel(
-            model_name=TINKER_MODEL_NAME,
-            path=TINKER_SAMPLER_PATH,
+            model_name=cfg.solver.model_name,
+            path=cfg.solver.sampler_path,
         )
-    elif MODEL_BACKEND == "agents":
-        logger.info(f"Using AgentsSDKModel policy: {AGENTS_MODEL}")
-        agents_model = get_gemini() if AGENTS_MODEL == "gemini" else get_gemini_lite()
+        backend: Literal["tinker", "agents"] = "tinker"
     else:
-        raise ValueError(f"Unknown MODEL_BACKEND: {MODEL_BACKEND}")
+        logger.info(f"Using AgentsSDKModel policy: {cfg.solver.model}")
+        agents_model = (
+            get_gemini() if cfg.solver.model == "gemini" else get_gemini_lite()
+        )
+        backend = "agents"
 
     flattened: list[tuple[str, Task]] = [
         (s.name, t) for s in suites for t in s.tasks
     ]
+    slice_step = (
+        f":{cfg.task_slice.step}" if cfg.task_slice.step is not None else ""
+    )
+    slice_repr = f"[{cfg.task_slice.start}:{cfg.task_slice.stop}{slice_step}]"
     logger.info(
-        f"Evaluating {len(flattened)} tasks × {EVAL_ROLLOUT} rollouts "
-        f"(backend={MODEL_BACKEND}, strategy={EVAL_STRATEGY})..."
+        f"Evaluating {len(flattened)} tasks × {cfg.rollout} rollouts "
+        f"(backend={backend}, strategy={cfg.strategy}, slice={slice_repr})..."
     )
 
-    if EVAL_STRATEGY == "single_turn":
+    if cfg.strategy == "single_turn":
         results = await _run_single_turn(
             flattened=flattened,
+            cfg=cfg,
             tinker_model=tinker_model,
             agents_model=agents_model,
             verifier_model=verifier_model,
         )
-    elif EVAL_STRATEGY == "ss_solve_verify":
+    elif cfg.strategy == "ss_solve_verify":
         solver_model: TinkerModel | LitellmModel
-        if MODEL_BACKEND == "tinker":
+        if isinstance(cfg.solver, TinkerSolverConfig):
             assert tinker_model is not None
             solver_model = tinker_model
         else:
@@ -453,11 +769,12 @@ async def main() -> None:
             solver_model = agents_model
         results = await _run_ss_solve_verify(
             flattened=flattened,
+            cfg=cfg,
             solver_model=solver_model,
             verifier_model=verifier_model,
         )
     else:
-        raise ValueError(f"Unknown EVAL_STRATEGY: {EVAL_STRATEGY}")
+        raise ValueError(f"Unknown strategy: {cfg.strategy}")
 
     suite_stats: dict[str, dict[str, int]] = {s.name: {"success": 0, "rollouts": 0} for s in suites}
     suite_lengths: dict[str, list[int]] = {s.name: [] for s in suites}

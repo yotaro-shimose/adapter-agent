@@ -3,7 +3,7 @@
 責務:
   - forward/backward + optim_step のルックアヘッド・パイプライニング
   - cross_entropy SFT ステップのラッパ (任意で trigger_eval)
-  - QRA → Datum 変換 (CPT / 標準の 2 書式)
+  - QRA → Datum 変換 (user/assistant + thinking part 形式)
   - Datum → epoch-chunked batch iterator
   - 重み同期 (training_client → sampling_client; 任意で broadcast hook)
   - チェックポイント保存
@@ -156,46 +156,22 @@ class TrainingRunner:
     def qras_to_datums(
         self,
         qras: list[QRA],
-        cpt: bool,
-        library_name: str,
         system_prompt: str | None = None,
     ) -> list[Datum]:
-        """Convert QRA samples into Datums suitable for cross-entropy SFT.
+        """Convert QRA samples into Datums for cross-entropy SFT.
 
-        `cpt=True` uses a custom example format (system + question + answer) with
-        training limited to the answer turn; `cpt=False` uses the standard
-        user/assistant shape with a thinking part on the assistant side, and
-        trains on the last assistant message.
+        Standard user/assistant shape: user holds the question, assistant
+        emits a thinking part (reasoning) followed by the text answer.
+        Training is restricted to the last assistant message.
 
-        If `system_prompt` is given (cpt=False のみ有効)、user メッセージの前に
-        同じ system prompt を `trainable=False` で注入する。STaR のように
-        「学習データが推論時と同じ system prompt で生成された」ケースで format を
-        一致させるために使う。
+        If `system_prompt` is given, inject it before the user turn so the
+        format matches inference-time prompting (used e.g. by STaR where
+        training data was generated under the same system prompt). The
+        injected system message is left non-trainable; under
+        LAST_ASSISTANT_MESSAGE that's automatic, so we don't set the flag
+        explicitly (which would trip an internal assert).
         """
         _, renderer = get_tokenizer_renderer(self.training_client, self.model_name)
-        if cpt:
-            return [
-                conversation_to_datum(
-                    conversation=[
-                        Message(
-                            role="system",
-                            content=f"これは{library_name}の教育資料から抜粋した練習問題です。",
-                            trainable=False,
-                        ),
-                        Message(
-                            role="example_question", content=q.question, trainable=False
-                        ),
-                        Message(
-                            role="example_answer", content=q.answer, trainable=True
-                        ),
-                    ],
-                    renderer=renderer,
-                    train_on_what=TrainOnWhat.CUSTOMIZED,
-                    max_length=None,
-                )
-                for q in qras
-            ]
-
         datums: list[Datum] = []
         for q in qras:
             conversation: list[Message] = []

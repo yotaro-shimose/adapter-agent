@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 
 import tinker
 from tinker_cookbook.completers import TokensWithLogprobs
@@ -41,6 +42,7 @@ class RLWorkerPool:
         num_samples: int,
         sampling_params: tinker.SamplingParams,
         distilled: DistilledQRAManager,
+        rl_seed: int = 42,
     ) -> None:
         self._engine = rollout_engine
         self._shared_sampling_client = shared_sampling_client
@@ -50,6 +52,7 @@ class RLWorkerPool:
         self._num_samples = num_samples
         self._sampling_params = sampling_params
         self._distilled = distilled
+        self._rl_seed = rl_seed
 
         self._tasks_queue: asyncio.Queue[tuple[Task, RLSource]] = asyncio.Queue()
         self._results_queue: asyncio.Queue[RLGroup] = asyncio.Queue()
@@ -57,12 +60,19 @@ class RLWorkerPool:
         self._spawner_task: asyncio.Task | None = None
 
     async def __aenter__(self) -> "RLWorkerPool":
+        all_pairs: list[tuple[Task, RLSource]] = []
         for suite in self._seed_suites:
             if not suite.for_rl:
                 continue
             source = RLSource(id=suite.name, title=suite.name)
             for task in suite.tasks:
-                await self._tasks_queue.put((task, source))
+                all_pairs.append((task, source))
+        random.Random(self._rl_seed).shuffle(all_pairs)
+        logger.info(
+            f"Seeded {len(all_pairs)} RL tasks into queue (shuffled with seed={self._rl_seed})."
+        )
+        for pair in all_pairs:
+            await self._tasks_queue.put(pair)
 
         async def _staggered_spawner() -> None:
             for i in range(self._num_workers):

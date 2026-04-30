@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -148,12 +149,14 @@ class SimplePipeline:
     prisma_client: Prisma
     log_dir: Path
     knowledge_list: list[Knowledge]
+    extra_sft_qras: list[QRA]
+    has_rl_suites: bool
     shared_sampling_client: SharedSamplingClient
     evaluate_worker: EvaluateWorker
-    _rl_batch_state: RLBatchState
+    _rl_batch_state: RLBatchState | None
     distilled: DistilledQRAManager
     rollout_engine: RolloutEngine
-    rl_pool: RLWorkerPool | RayRLWorkerPool
+    rl_pool: RLWorkerPool | RayRLWorkerPool | None
     training_runner: TrainingRunner
     eval_trigger: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -165,6 +168,7 @@ class SimplePipeline:
         seed_suites: list[SeedSuite],
         study_task_queue: asyncio.Queue[StudyTask] | None = None,
         qra_in_queue: asyncio.Queue[tuple[str, QRA]] | None = None,
+        extra_sft_qras: list[QRA] | None = None,
     ) -> Self:
         config.cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -263,11 +267,6 @@ class SimplePipeline:
             eval_rollout=config.eval.eval_rollout,
             max_output_tokens=config.rollout.max_output_tokens,
         )
-        rl_batch_state = RLBatchState(
-            target_valid=config.rl_batch_size,
-            metrics_window=config.rl_metrics_window,
-            max_version_lag=config.rl_max_version_lag,
-        )
         distilled = DistilledQRAManager(
             qra_in_queue=qra_in_queue,
             study_task_queue=study_task_queue,
@@ -276,35 +275,43 @@ class SimplePipeline:
         sampling_params = tinker.SamplingParams(
             max_tokens=config.rollout.max_output_tokens
         )
-        rl_pool: RLWorkerPool | RayRLWorkerPool
-        if config.rollout.use_ray:
-            rl_pool = RayRLWorkerPool(
-                num_processes=config.rollout.ray_num_processes,
-                workers_per_process=config.rollout.ray_workers_per_process,
-                runtime_pool_size_per_process=config.rollout.ray_runtime_pool_size_per_process,
-                actor_stagger_s=config.rollout.ray_actor_stagger_s,
-                runtime_settings=config.rollout.runtime_settings,
-                verifier_model=verifier_model,
-                library_name=config.library_name,
-                simple_train_id=config.simple_train_id,
-                model_name=config.model_loading_settings.model_name,
-                sampling_client=tinker_model.sampling_client,
-                seed_suites=seed_suites,
-                worker_stagger_s=config.rollout.worker_stagger_s,
-                num_samples=config.rollout.num_samples,
-                sampling_params=sampling_params,
+        rl_batch_state: RLBatchState | None = None
+        rl_pool: RLWorkerPool | RayRLWorkerPool | None = None
+        if config.rl is not None:
+            rl_batch_state = RLBatchState(
+                target_valid=config.rl.batch_size,
+                metrics_window=config.rl.metrics_window,
+                max_version_lag=config.rl.max_version_lag,
             )
-        else:
-            rl_pool = RLWorkerPool(
-                rollout_engine=rollout_engine,
-                shared_sampling_client=shared_sampling_client,
-                seed_suites=seed_suites,
-                num_workers=config.rollout.worker_count,
-                stagger_s=config.rollout.worker_stagger_s,
-                num_samples=config.rollout.num_samples,
-                sampling_params=sampling_params,
-                distilled=distilled,
-            )
+            if config.rollout.use_ray:
+                rl_pool = RayRLWorkerPool(
+                    num_processes=config.rollout.ray_num_processes,
+                    workers_per_process=config.rollout.ray_workers_per_process,
+                    runtime_pool_size_per_process=config.rollout.ray_runtime_pool_size_per_process,
+                    actor_stagger_s=config.rollout.ray_actor_stagger_s,
+                    runtime_settings=config.rollout.runtime_settings,
+                    verifier_model=verifier_model,
+                    library_name=config.library_name,
+                    simple_train_id=config.simple_train_id,
+                    model_name=config.model_loading_settings.model_name,
+                    sampling_client=tinker_model.sampling_client,
+                    seed_suites=seed_suites,
+                    worker_stagger_s=config.rollout.worker_stagger_s,
+                    num_samples=config.rollout.num_samples,
+                    sampling_params=sampling_params,
+                )
+            else:
+                rl_pool = RLWorkerPool(
+                    rollout_engine=rollout_engine,
+                    shared_sampling_client=shared_sampling_client,
+                    seed_suites=seed_suites,
+                    num_workers=config.rollout.worker_count,
+                    stagger_s=config.rollout.worker_stagger_s,
+                    num_samples=config.rollout.num_samples,
+                    sampling_params=sampling_params,
+                    distilled=distilled,
+                    rl_seed=config.rl.rl_seed,
+                )
 
         # Weight sync 時に RL pool (Ray 版) へブロードキャストするフック
         async def _broadcast_hook(new_client: tinker.SamplingClient) -> None:
@@ -332,6 +339,8 @@ class SimplePipeline:
             prisma_client=client,
             log_dir=log_dir,
             knowledge_list=knowledge_list,
+            extra_sft_qras=extra_sft_qras or [],
+            has_rl_suites=any(s.for_rl for s in seed_suites),
             shared_sampling_client=shared_sampling_client,
             evaluate_worker=evaluate_worker,
             _rl_batch_state=rl_batch_state,
@@ -365,7 +374,10 @@ class SimplePipeline:
         print("=" * 80 + "\n")
 
     async def run(self) -> None:
-        eval_worker_task = asyncio.create_task(self.evaluate_worker.run_loop())
+        rl_active = self.config.rl is not None and self.has_rl_suites
+        eval_worker_task: asyncio.Task | None = None
+        if rl_active:
+            eval_worker_task = asyncio.create_task(self.evaluate_worker.run_loop())
         try:
             if self.config.sft is None:
                 logger.info("Skipping initial SFT (config.sft is None).")
@@ -380,7 +392,9 @@ class SimplePipeline:
                 )
                 logger.info(f"Running initial SFT for {self.config.sft.epochs} epochs...")
                 await self.training_runner.run_sft_steps(
-                    sft_batch_iter, adam_params=self.config.sft.adam_params
+                    sft_batch_iter,
+                    adam_params=self.config.sft.adam_params,
+                    trigger_eval=rl_active,
                 )
 
                 if self.config.sft.save_checkpoint:
@@ -392,8 +406,25 @@ class SimplePipeline:
                     )
                     logger.info("Updated reference client to SFT state.")
 
+            if self.config.rl is None or not self.has_rl_suites:
+                reason = (
+                    "config.rl is None"
+                    if self.config.rl is None
+                    else "no RL seed suites"
+                )
+                logger.info(
+                    f"Skipping RL loop ({reason}); running a final evaluation and exiting."
+                )
+                if self.config.sft is None:
+                    # SFT didn't sync weights for us — sync once so eval sees the
+                    # current trainer state (may matter on resume_trainer_path).
+                    await self.training_runner.sync_sampling_weights()
+                await self.evaluate_worker.run_once()
+                return
+
+            assert self.rl_pool is not None  # ensured by config.rl is not None
             async with self.rl_pool:
-                for iteration in range(self.config.max_iterations):
+                for iteration in range(self.config.rl.max_iterations):
                     rl_step = iteration + 1
                     logger.info(f"--- Iteration {rl_step} (RL) ---")
 
@@ -418,10 +449,12 @@ class SimplePipeline:
                             ttl_seconds=self.config.checkpoint.ttl_seconds,
                         )
         finally:
-            eval_worker_task.cancel()
-            await asyncio.gather(eval_worker_task, return_exceptions=True)
+            if eval_worker_task is not None:
+                eval_worker_task.cancel()
+                await asyncio.gather(eval_worker_task, return_exceptions=True)
 
     async def _collect_valid_rl_batch(self) -> list[RLGroup]:
+        assert self._rl_batch_state is not None and self.rl_pool is not None
         state = self._rl_batch_state
         logger.info(
             f"Collecting until {state.target_valid} valid RL groups are ready "
@@ -441,9 +474,10 @@ class SimplePipeline:
     async def _run_grpo_update(
         self, valid_groups: list[RLGroup], trigger_eval: bool = True
     ) -> None:
-        if self.config.rl_skip_update:
+        assert self.config.rl is not None  # only called from RL loop
+        if self.config.rl.skip_update:
             logger.info(
-                f"rl_skip_update=True: skipping GRPO update on batch of size {len(valid_groups)} "
+                f"rl.skip_update=True: skipping GRPO update on batch of size {len(valid_groups)} "
                 f"(rollouts and eval still run)."
             )
 
@@ -481,12 +515,12 @@ class SimplePipeline:
         step_metrics["rl/sampler_version_lag_mean"] = float(current_version) - version_mean
         step_metrics["rl/sampler_version_lag_max"] = float(current_version - min(batch_versions))
 
-        batch_iter = (clean_data_D for _ in range(self.config.rl_update_epochs))
+        batch_iter = (clean_data_D for _ in range(self.config.rl.update_epochs))
         await self.training_runner.run_training_steps(
             batch_iter=batch_iter,
             prefix="rl",
-            loss_fn=self.config.rl_loss_fn,
-            adam_params=self.config.rl_adam_params,
+            loss_fn=self.config.rl.loss_fn,
+            adam_params=self.config.rl.adam_params,
             extra_metrics=step_metrics,
         )
 
@@ -497,18 +531,16 @@ class SimplePipeline:
             self.eval_trigger.set()
 
     def _distilled_sft_batch_size(self) -> int:
-        return (
-            self.config.sft.batch_size
-            if self.config.sft is not None
-            else self.config.rl_batch_size
-        )
+        if self.config.sft is not None:
+            return self.config.sft.batch_size
+        assert self.config.rl is not None  # only reachable from RL loop
+        return self.config.rl.batch_size
 
     def _distilled_sft_adam_params(self) -> tinker.AdamParams:
-        return (
-            self.config.sft.adam_params
-            if self.config.sft is not None
-            else self.config.rl_adam_params
-        )
+        if self.config.sft is not None:
+            return self.config.sft.adam_params
+        assert self.config.rl is not None  # only reachable from RL loop
+        return self.config.rl.adam_params
 
     async def _maybe_run_distilled_sft_step(self) -> None:
         """蒸留 QRA を回収し、1 バッチ分溜まっていれば SFT ステップを回す。"""
@@ -523,10 +555,7 @@ class SimplePipeline:
                 )
             return
 
-        cpt = self.config.sft.cpt if self.config.sft is not None else False
-        datums = self.training_runner.qras_to_datums(
-            qras, cpt=cpt, library_name=self.config.library_name
-        )
+        datums = self.training_runner.qras_to_datums(qras)
         batch_iter = TrainingRunner.chunk_into_batches(datums, batch_size, num_epochs=1)
         logger.info(
             f"Running distilled SFT step on {batch_size} QRAs "
@@ -586,7 +615,16 @@ class SimplePipeline:
                 except Exception as e:
                     logger.error(f"Failed to record SFT QRA to DB: {e}")
 
-        return [q for qs in per_knowledge_qras for q in qs]
+        knowledge_qras = [q for qs in per_knowledge_qras for q in qs]
+        all_qras = knowledge_qras + list(self.extra_sft_qras)
+        rng = random.Random(self.config.sft.sft_seed)
+        rng.shuffle(all_qras)
+        logger.info(
+            f"SFT pool: {len(knowledge_qras)} knowledge QRAs + "
+            f"{len(self.extra_sft_qras)} extra QRAs = {len(all_qras)} total "
+            f"(shuffled with seed={self.config.sft.sft_seed})."
+        )
+        return all_qras
 
     def _create_sft_batch_iterator(
         self, sft_qras: list[QRA], num_epochs: int
@@ -594,9 +632,7 @@ class SimplePipeline:
         assert self.config.sft is not None, (
             "_create_sft_batch_iterator requires config.sft to be set"
         )
-        datums = self.training_runner.qras_to_datums(
-            sft_qras, cpt=self.config.sft.cpt, library_name=self.config.library_name
-        )
+        datums = self.training_runner.qras_to_datums(sft_qras)
         return TrainingRunner.chunk_into_batches(
             datums, self.config.sft.batch_size, num_epochs
         )

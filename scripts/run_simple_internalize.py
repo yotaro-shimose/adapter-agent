@@ -21,6 +21,7 @@ from adapter_agent.simple_internalizer.data_sources import (
 from adapter_agent.simple_internalizer.types import (
     CheckpointSettings,
     EvalSettings,
+    RLConfig,
     RolloutSettings,
     SFTConfig,
 )
@@ -123,15 +124,16 @@ async def main() -> None:
             epochs=8,
             batch_size=256,
             adam_params=tinker.AdamParams(learning_rate=1e-3),
-            cpt=False,
+        ),
+        rl=RLConfig(
+            max_iterations=50,
+            adam_params=tinker.AdamParams(learning_rate=2e-4),
+            loss_fn="cispo",
+            kl_penalty_coef=0.0,
+            kl_discount_factor=0.0,
         ),
         cache_dir=CACHE_DIR,
-        max_iterations=50,
         generation_concurrency=GENERATION_CONCURRENCY,
-        rl_adam_params=tinker.AdamParams(learning_rate=2e-4),
-        rl_loss_fn="cispo",
-        kl_penalty_coef=0.0,
-        kl_discount_factor=0.0,
     )
 
     pipeline = await SimplePipeline.create(

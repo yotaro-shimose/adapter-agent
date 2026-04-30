@@ -33,6 +33,7 @@ from adapter_agent.simple_internalizer.data_sources import load_gh_archive_suite
 from adapter_agent.simple_internalizer.types import (
     CheckpointSettings,
     EvalSettings,
+    RLConfig,
     RolloutSettings,
 )
 from adapter_agent.study.qra_budget import QRABudgetConfig
@@ -136,12 +137,14 @@ async def main() -> None:
         ),
         checkpoint=CheckpointSettings(checkpoint_interval=10),
         sft=None,
-        max_iterations=200,
+        rl=RLConfig(
+            max_iterations=200,
+            batch_size=96,
+            update_epochs=1,
+            adam_params=tinker.AdamParams(learning_rate=2e-5),
+            loss_fn="ppo",
+        ),
         generation_concurrency=400,
-        rl_batch_size=96,
-        rl_update_epochs=1,
-        rl_adam_params=tinker.AdamParams(learning_rate=2e-5),
-        rl_loss_fn="ppo",
     )
 
     study_task_queue: asyncio.Queue[StudyTask] | None = (

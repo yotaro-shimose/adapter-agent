@@ -11,10 +11,11 @@ from pathlib import Path
 
 from prisma import Prisma
 
-from adapter_agent.data import QRA
+from adapter_agent.data import PydanticTinkerBaseMessage, QRA
 from adapter_agent.hierarchical.agent.generator import GeneratorAgent
 from adapter_agent.hierarchical.gh import load_gh_archive
 from adapter_agent.hierarchical.types import Knowledge, Task
+from adapter_agent.study.qra_distiller import QRADistiller
 
 from .types import SeedSuite
 
@@ -121,6 +122,108 @@ async def generate_qras_cached(
         pickle.dump(results, f)
 
     return results
+
+
+async def load_study_root_qras_cached(
+    prisma_client: Prisma,
+    experiment_name: str,
+    traj_qra_id: str,
+    distiller: QRADistiller,
+    cache_dir: Path,
+    distill_concurrency: int = 50,
+) -> list[QRA]:
+    """Distill 1 solved trajectory per root task into a QRA, cached on disk.
+
+    The cache is scoped under `cache_dir / traj_qra_id /` so independent
+    experiments (different distill prompts, model versions, etc.) don't
+    collide. Bump `traj_qra_id` whenever distillation logic changes.
+
+    Pulls the experiment's `graph_json`, finds root tasks via the
+    `pseudo_root` decomposition edges (matching `load_study_solved_suite`),
+    fetches the latest `is_sft_candidate=True` trajectory per root task,
+    and runs `distiller.distill(instruction, trajectory)` on each. No
+    verification is performed — failed distillations are silently skipped.
+    """
+    scoped_dir = cache_dir / traj_qra_id
+    cache_file = scoped_dir / f"study_root_qras_{experiment_name}.pkl"
+    if cache_file.exists():
+        with open(cache_file, "rb") as f:
+            cached: list[QRA] = pickle.load(f)
+        logger.info(
+            f"Loaded {len(cached)} study root QRAs for '{experiment_name}' "
+            f"(traj_qra_id={traj_qra_id}) from cache."
+        )
+        return cached
+
+    experiment = await prisma_client.experiment.find_unique(
+        where={"experiment_name": experiment_name}
+    )
+    if experiment is None or not experiment.graph_json:
+        raise ValueError(f"Experiment '{experiment_name}' has no graph_json.")
+
+    graph = experiment.graph_json
+    pseudo_root_id = "pseudo_root"
+    root_task_ids: set[str] = {
+        e["target"]
+        for e in graph.get("edges", [])
+        if e.get("type") == "decomposition" and e.get("source") == pseudo_root_id
+    }
+    if not root_task_ids:
+        raise ValueError(
+            f"Experiment '{experiment_name}' has no root tasks under pseudo_root."
+        )
+
+    trajectories = await prisma_client.trajectory.find_many(
+        where={
+            "experiment_name": experiment_name,
+            "is_sft_candidate": True,
+            "task_id": {"in": list(root_task_ids)},
+        },
+        order={"created_at": "desc"},
+    )
+    seen: set[str] = set()
+    picked: list = []
+    for t in trajectories:
+        if t.task_id in seen:
+            continue
+        seen.add(t.task_id)
+        picked.append(t)
+    logger.info(
+        f"Found {len(picked)} root-task trajectories to distill "
+        f"({len(trajectories)} solved rows across {len(root_task_ids)} root tasks)."
+    )
+
+    sem = asyncio.Semaphore(distill_concurrency)
+
+    async def _distill_one(t) -> QRA | None:
+        async with sem:
+            raw = t.trials_json
+            if not isinstance(raw, list) or not raw:
+                return None
+            try:
+                messages = [
+                    PydanticTinkerBaseMessage.model_validate(m).to_tinker_message()
+                    for m in raw
+                ]
+            except Exception:
+                logger.exception(
+                    f"Failed to deserialize trajectory for task {t.task_id}"
+                )
+                return None
+            instruction = t.instruction or ""
+            return await distiller.distill(instruction, messages)
+
+    results = await asyncio.gather(*[_distill_one(t) for t in picked])
+    qras: list[QRA] = [q for q in results if q is not None]
+    logger.info(
+        f"Distilled {len(qras)}/{len(picked)} study root QRAs for '{experiment_name}'."
+    )
+
+    scoped_dir.mkdir(parents=True, exist_ok=True)
+    with open(cache_file, "wb") as f:
+        pickle.dump(qras, f)
+
+    return qras
 
 
 async def build_knowledge_suites(

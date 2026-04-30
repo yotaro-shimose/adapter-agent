@@ -44,16 +44,7 @@ class EvaluateWorker:
             try:
                 await self.trigger.wait()
                 self.trigger.clear()
-
-                # Snapshot the current model version
-                snapshot: IndexedSamplingClient = (
-                    self.shared_sampling_client.get_client()
-                )
-                version = snapshot.version
-                logger.info(f"Starting evaluation cycle for model version {version}...")
-
-                await self._run_evaluation(snapshot)
-                logger.info(f"Evaluation cycle for version {version} completed.")
+                await self.run_once()
 
             except asyncio.CancelledError:
                 logger.info("EvaluateWorker loop cancelled.")
@@ -61,6 +52,17 @@ class EvaluateWorker:
             except Exception as e:
                 logger.exception(f"EvaluateWorker encountered error: {e}")
                 await asyncio.sleep(5)
+
+    async def run_once(
+        self, snapshot: IndexedSamplingClient | None = None
+    ) -> None:
+        """Run a single evaluation cycle synchronously (no trigger needed)."""
+        if snapshot is None:
+            snapshot = self.shared_sampling_client.get_client()
+        version = snapshot.version
+        logger.info(f"Starting evaluation cycle for model version {version}...")
+        await self._run_evaluation(snapshot)
+        logger.info(f"Evaluation cycle for version {version} completed.")
 
     async def _run_evaluation(self, snapshot: IndexedSamplingClient) -> None:
         if not self.eval_suites:
@@ -75,7 +77,7 @@ class EvaluateWorker:
 
         async def _eval_one(suite_name: str, instruction: str) -> tuple[str, EvalResult]:
             res = await self._evaluate_single_task(
-                snapshot, instruction, source=suite_name
+                snapshot, instruction
             )
             return suite_name, res
 
@@ -98,9 +100,9 @@ class EvaluateWorker:
             success = stats["success"]
             rollouts = stats["rollouts"]
             success_ratio = success / rollouts if rollouts > 0 else 0.0
-            metrics_to_log[f"eval_{suite_name}/success_ratio"] = success_ratio
-            metrics_to_log[f"eval_{suite_name}/total_success"] = float(success)
-            metrics_to_log[f"eval_{suite_name}/total_rollouts"] = float(rollouts)
+            metrics_to_log[f"eval/{suite_name}/success_ratio"] = success_ratio
+            metrics_to_log[f"eval/{suite_name}/total_success"] = float(success)
+            metrics_to_log[f"eval/{suite_name}/total_rollouts"] = float(rollouts)
 
             lengths = suite_lengths[suite_name]
             if lengths:
@@ -108,13 +110,13 @@ class EvaluateWorker:
                 var_len = (
                     statistics.pvariance(lengths) if len(lengths) > 1 else 0.0
                 )
-                metrics_to_log[f"eval_{suite_name}/response_length_mean"] = float(
+                metrics_to_log[f"eval/{suite_name}/response_length_mean"] = float(
                     mean_len
                 )
-                metrics_to_log[f"eval_{suite_name}/response_length_variance"] = float(
+                metrics_to_log[f"eval/{suite_name}/response_length_variance"] = float(
                     var_len
                 )
-                metrics_to_log[f"eval_{suite_name}/response_length_max"] = float(
+                metrics_to_log[f"eval/{suite_name}/response_length_max"] = float(
                     max(lengths)
                 )
 
@@ -125,7 +127,6 @@ class EvaluateWorker:
         self,
         snapshot: IndexedSamplingClient,
         instruction: str,
-        source: str,
         rollouts: int | None = None,
     ) -> EvalResult:
         num_samples = rollouts if rollouts is not None else self.eval_rollout

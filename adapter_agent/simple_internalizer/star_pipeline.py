@@ -435,8 +435,6 @@ class STaRPipeline:
         random.shuffle(all_qras)
         datums = self.training_runner.qras_to_datums(
             all_qras,
-            cpt=self.config.star.cpt,
-            library_name=self.config.library_name,
             system_prompt=self.system_prompt,
         )
         batch_iter = TrainingRunner.chunk_into_batches(

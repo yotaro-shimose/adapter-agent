@@ -133,83 +133,87 @@ async def process_row(
         return None
 
 
-async def main():
-    # model = get_qwen30b_a3b().as_litellm_model()
-    model = get_gemini()
-    limit = 1000
-    max_concurrent = 100
-    # Define target library
-    library = Library(name="numrs2", local_path=Path("repositories/numrs/SUMMARY.md"))
+async def generate_benchmark_dataset(
+    library: Library,
+    output_path: Path,
+    limit: int = 1000,
+    max_concurrent: int = 100,
+    model: AgentsSDKModel | None = None,
+    bigquery_project: str = "dsat2-405406",
+) -> int:
+    if model is None:
+        model = get_gemini()
 
-    # 1. Initialize the BigQuery client
-    client = bigquery.Client(project="dsat2-405406")
+    client = bigquery.Client(project=bigquery_project)
 
-    # 2. Define your SQL query
     sql_query = f"""
     SELECT content, binary
-    FROM `bigquery-public-data.github_repos.sample_contents` 
+    FROM `bigquery-public-data.github_repos.sample_contents`
     WHERE content LIKE '%import numpy as np%'
     LIMIT {limit}
     """
 
-    # 3. Run the query
     print(f"Running BigQuery for {library.name} benchmarks...")
     query_job = client.query(sql_query)
-
-    # 4. Wait for the job to complete and get results
     results = query_job.result()
 
-    output_file = "benchmark_dataset.csv"
-    print(f"Top {limit} contents. Saving to {output_file}...")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Top {limit} contents. Saving to {output_path}...")
     async with litellm_concurrent_limit(max_concurrent):
-        # Create tasks for all rows
         tasks = [
             process_row(row.content, model, library)
             for row in results
             if not row.binary
         ]
-        # Run tasks with concurrency limit
         results_data = await gather_with_semaphore(tasks, max_concurrent=max_concurrent)
 
-        # Filter out None results
         data_rows = [res for res in results_data if res is not None]
 
         if data_rows:
             df = pl.DataFrame([res.model_dump() for res in data_rows])
-            df.write_csv(output_file)
-            print(f"Saved {len(data_rows)} rows to {output_file}")
+            df.write_csv(output_path)
+            print(f"Saved {len(data_rows)} rows to {output_path}")
         else:
             print("No data rows generated.")
 
+    return len(data_rows)
 
-def load_gh_archive() -> list[Task]:
+
+async def main():
+    library = Library(name="numrs2", local_path=Path("repositories/numrs/SUMMARY.md"))
+    await generate_benchmark_dataset(
+        library=library,
+        output_path=Path("benchmark_dataset.csv"),
+        limit=1000,
+        max_concurrent=100,
+    )
+
+
+def load_gh_archive(difficulty: str | None = "Easy") -> list[Task]:
+    """Load benchmark tasks from the latest enhanced CSV.
+
+    Args:
+        difficulty: If set (default "Easy"), keep only rows whose
+            ``difficulty`` column equals this value. Pass ``None`` to keep
+            every difficulty.
+    """
     import polars as pl
 
-    # Primary source first so existing slice semantics (e.g. slice(0, 40) for RL,
-    # slice(40, 60) for eval) keep pointing at the strictly verified tasks.
-    primary_path = Path("data/easy_benchmark_verified.csv")
-    secondary_paths = [
-        Path("data/easy_benchmark_enhanced.csv"),
-        Path("data/benchmark_dataset_enhanced.csv"),
-    ]
+    # Latest source: API-diverse, non-Hard, appropriate-only set rewritten to
+    # mandate numrs2 (produced by scripts/filter_diverse_benchmark.py).
+    primary_path = Path("data/benchmarks/numrs2_2026-04-29/diverse_enhanced.csv")
+
+    # # Previous sources (kept for reference / fallback):
+    # primary_path = Path("data/easy_benchmark_verified.csv")
+    # secondary_paths = [
+    #     Path("data/easy_benchmark_enhanced.csv"),
+    #     Path("data/benchmark_dataset_enhanced.csv"),
+    # ]
 
     primary_df = pl.read_csv(primary_path)
+    if difficulty is not None and "difficulty" in primary_df.columns:
+        primary_df = primary_df.filter(pl.col("difficulty") == difficulty)
     statements: list[str] = primary_df["problem_statement"].to_list()
-    seen: set[str] = set(statements)
-
-    for path in secondary_paths:
-        if not path.exists():
-            continue
-        df = pl.read_csv(path)
-        if "appropriate" in df.columns:
-            df = df.filter(pl.col("appropriate"))
-        if "difficulty" in df.columns:
-            df = df.filter(pl.col("difficulty") == "Easy")
-        for statement in df["problem_statement"].to_list():
-            if statement in seen:
-                continue
-            seen.add(statement)
-            statements.append(statement)
 
     return [Task.from_instruction(s) for s in statements]
 

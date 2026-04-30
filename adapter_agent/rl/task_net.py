@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from dataclasses import dataclass, field
 from datetime import datetime
 from inspect import isawaitable
@@ -18,7 +19,10 @@ from adapter_agent.rl.env.session_result import (
     RewireSessionResult,
     RewireSessionResultNormal,
 )
+from adapter_agent.rl.solved_subtask import SolvedSubtask, extract_submit_from_trials
 from adapter_agent.util.exception import AllTasksCompleted
+
+MAX_SOLVED_SUBTASKS = 5
 
 logger = logging.getLogger(__name__)
 
@@ -229,6 +233,45 @@ class TaskNetwork:
         self.nodes[child.item.id] = child
         self._add_edge(parent_id, child.item.id)
 
+    def get_solved_subtasks(self, task_id: str) -> list[SolvedSubtask]:
+        """Collect (instruction, submit code) for direct children that are solved.
+
+        For each child marked `is_sft_solved`, walk its successful attempts from
+        newest to oldest and pick the first one whose final assistant message
+        contains a parseable `<submit>...</submit>` block. Children with only
+        unparseable trials are skipped. If more than MAX_SOLVED_SUBTASKS qualify,
+        a random sample is returned to bound prompt size.
+        """
+        child_ids = self.children_map.get(task_id, [])
+        results: list[SolvedSubtask] = []
+        for child_id in child_ids:
+            node = self.nodes.get(child_id)
+            if node is None or not node.is_sft_solved:
+                continue
+            successful = sorted(
+                (a for a in node.sft_conclusions if a.result.is_successful()),
+                key=lambda a: a.timestamp,
+                reverse=True,
+            )
+            for attempt in successful:
+                result = attempt.result
+                if not isinstance(result, RewireSessionResultNormal):
+                    continue
+                code = extract_submit_from_trials(result.trials)
+                if code is None:
+                    continue
+                results.append(
+                    SolvedSubtask(
+                        instruction=node.item.instruction,
+                        submit_code=code,
+                    )
+                )
+                break
+
+        if len(results) > MAX_SOLVED_SUBTASKS:
+            return random.sample(results, MAX_SOLVED_SUBTASKS)
+        return results
+
     def get_next_task(self) -> TaskNetworkTask:
         # knowledge_to_slice = self.get_knowledge_to_slice()
         # if knowledge_to_slice:
@@ -262,7 +305,7 @@ class TaskNetwork:
         while True:
             node = self.nodes[curr_id]
             children = self.children_map.get(curr_id, [])
-            generation = self._should_generate_subtask(curr_id)
+            generation = self._should_generate_subtask(curr_id, subtree_trials)
 
             if generation:
                 if node.is_pseudo_root():
@@ -451,23 +494,37 @@ class TaskNetwork:
         node = self.nodes[node_id]
         return node.sft_attempts_count + self.executing_tasks.get(node_id, 0)
 
-    def _should_generate_subtask(self, node_id: str) -> bool:
+    def _should_generate_subtask(
+        self, node_id: str, subtree_trials: dict[str, int]
+    ) -> bool:
         children = self.children_map.get(node_id, [])
         # Progressive widening condition with virtual nodes
         # |A(s)|_effective = |children| + executing_generations
+        # N(s) は subtree 全体の試行数（ローカルに留めると、子ができた時点で
+        # トラバースが素通りして親の n_s が増えず横に広がらない）
         node = self.nodes[node_id]
 
         if node.is_pseudo_root():
             if len(self.tasks_pool) == 0:
                 return False
+            # pseudo_root は直接の子のローカル n_s 合計を使う既存挙動を維持。
+            # subtree 全体に切り替えると孫以下まで含まれて新ブランチが過剰生成され、
+            # 既存ブランチのラジアル拡張のためのバジェットを奪ってしまう。
             n_s = sum(self._get_ns(child_id) for child_id in children)
             effective_children_count = len(
                 [c for c in children if not self.nodes[c].is_sft_solved]
             )
         else:
-            n_s = self._get_ns(node_id)
-            effective_children_count = len(children) + self.executing_generations.get(
-                node_id, 0
+            n_s = subtree_trials.get(node_id, self._get_ns(node_id))
+            # solved な子は PW 上限に含めない。pseudo_root と挙動を揃える。
+            # 99/100 が解けているような状況で残りの 1 個を理由に展開を止めると
+            # 探索が無駄に縮退する。n_s 側は solved subtree の試行も含めたまま
+            # 残すので、進捗が出ているノードほど追加生成しやすくなる。
+            unsolved_children_count = sum(
+                1 for c in children if not self.nodes[c].is_sft_solved
+            )
+            effective_children_count = (
+                unsolved_children_count + self.executing_generations.get(node_id, 0)
             )
         return (
             effective_children_count

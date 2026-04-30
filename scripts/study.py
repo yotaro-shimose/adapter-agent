@@ -3,8 +3,10 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 import tinker
+from agents.extensions.models.litellm_model import LitellmModel
 from oai_utils import AgentsSDKModel
 from oai_utils.tinker import TinkerModel, setup_tinkermodel
 from prisma import Prisma
@@ -17,7 +19,7 @@ from adapter_agent.internalize.studier import KnowledgeStudier
 from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
 from adapter_agent.library.knowledge_db import KnowledgeDB
 from adapter_agent.library.wiki_manager import WikiManager
-from adapter_agent.model_helper import get_gemini
+from adapter_agent.model_helper import get_gemini, get_gemini_lite
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.rl.env.session_result import (
     RewireSessionResultFailure,
@@ -39,21 +41,43 @@ from adapter_agent.util.logger_util import setup_base_loglevel
 DEFAULT_SOLVER_MODEL_NAME = "Qwen/Qwen3-8B"
 DEFAULT_RUST_LIBDIR = Path("repositories/numrs")
 
+SolverKind = Literal["tinker", "gemini"]
+
 
 @dataclass
 class WorkerResources:
     """Per-worker resources that can be constructed independently in each process."""
 
-    solver_model: TinkerModel
+    solver_model: TinkerModel | LitellmModel
     verifier_model: AgentsSDKModel
     rust_doc_analyzer: AsyncRustDocAnalyzer
     wiki_manager: WikiManager
     reflector: Reflector
     prisma: Prisma
+    qwen_no_think: bool
+
+
+def build_solver_model(
+    solver_kind: SolverKind,
+    solver_model_name: str = DEFAULT_SOLVER_MODEL_NAME,
+    solver_model_ckpt_path: str | None = None,
+) -> TinkerModel | LitellmModel:
+    if solver_kind == "tinker":
+        service_client = tinker.ServiceClient()
+        solver_model, _tokenizer, _renderer = setup_tinkermodel(
+            service_client=service_client,
+            path=solver_model_ckpt_path,
+            model_name=solver_model_name,
+        )
+        return solver_model
+    if solver_kind == "gemini":
+        return get_gemini()
+    raise ValueError(f"Unknown solver_kind: {solver_kind}")
 
 
 async def build_worker_resources(
     wiki_version: str,
+    solver_kind: SolverKind = "tinker",
     solver_model_name: str = DEFAULT_SOLVER_MODEL_NAME,
     solver_model_ckpt_path: str | None = None,
     rust_libdir: Path = DEFAULT_RUST_LIBDIR,
@@ -64,12 +88,12 @@ async def build_worker_resources(
     analyzers, and model clients are not picklable, so they must be built
     in the process that uses them.
     """
-    service_client = tinker.ServiceClient()
-    solver_model, _tokenizer, _renderer = setup_tinkermodel(
-        service_client=service_client,
-        path=solver_model_ckpt_path,
-        model_name=solver_model_name,
+    solver_model = build_solver_model(
+        solver_kind=solver_kind,
+        solver_model_name=solver_model_name,
+        solver_model_ckpt_path=solver_model_ckpt_path,
     )
+    qwen_no_think = solver_kind == "tinker"
 
     rust_doc_analyzer = await AsyncRustDocAnalyzer.create_from_libdir(rust_libdir)
 
@@ -77,7 +101,7 @@ async def build_worker_resources(
     await prisma.connect()
     wiki_manager = WikiManager(prisma, version=wiki_version)
 
-    verifier_model = get_gemini()
+    verifier_model = get_gemini_lite()
     reflector = Reflector(model=verifier_model)
 
     return WorkerResources(
@@ -87,6 +111,7 @@ async def build_worker_resources(
         wiki_manager=wiki_manager,
         reflector=reflector,
         prisma=prisma,
+        qwen_no_think=qwen_no_think,
     )
 
 
@@ -113,13 +138,14 @@ def build_study_actor(
         studier=studier,
         json_path=json_path,
         reflector=resources.reflector,
+        qwen_no_think=resources.qwen_no_think,
     )
 
 
 @dataclass
 class StudyActor:
     task_network: TaskNetwork
-    solver_model: TinkerModel
+    solver_model: TinkerModel | LitellmModel
     verifier_model: AgentsSDKModel
     rust_doc_analyzer: AsyncRustDocAnalyzer
     wiki_manager: WikiManager
@@ -127,6 +153,7 @@ class StudyActor:
     studier: KnowledgeStudier
     json_path: Path
     reflector: Reflector
+    qwen_no_think: bool
 
     async def run(self):
         while True:
@@ -147,6 +174,7 @@ class StudyActor:
     async def study(self, current: TaskResultContext[StudyTask, StudyTaskCompleted]):
         await self._sync_graph()
         task = current.task
+        solved_subtasks = self.task_network.get_solved_subtasks(task.id)
 
         ret = await ss_solve_verify(
             solver_model=self.solver_model,
@@ -154,9 +182,10 @@ class StudyActor:
             rust_doc_analyzer=self.rust_doc_analyzer,
             task=task.task,
             max_turns=10,
-            qwen_no_think=True,
+            qwen_no_think=self.qwen_no_think,
             runtime_settings=RuntimeSettings.docker_numrs2(),
             wiki_manager=self.wiki_manager,
+            solved_subtasks=solved_subtasks,
         )
 
         if isinstance(ret, RewireSessionResultNormal):
@@ -191,7 +220,7 @@ class StudyActor:
             current.register_result(task.complete(ret))
         else:
             try:
-                analyzer = Analyzer(model=get_gemini())
+                analyzer = Analyzer(model=get_gemini_lite())
                 subtask = await analyzer.analyze_trajectory(ret.trials)
                 print(f"New Task: {subtask.instruction}")
                 current.register_result(task.complete(ret, new_task=subtask))
@@ -235,7 +264,7 @@ class ExperimentContext:
 async def setup_experiment(
     experiment_name: str,
     reset: bool = True,
-    num_tasks: int = 40,
+    num_tasks: slice = slice(0, 50),
     json_path: Path = Path("graphvis/public/data.json"),
 ) -> ExperimentContext:
     """Initialize the shared state that a study run operates over.
@@ -262,7 +291,7 @@ async def setup_experiment(
 
     verifier_model = get_gemini()
     gh_tasks = load_gh_archive()
-    task_network = TaskNetwork(tasks_pool=gh_tasks[:num_tasks])
+    task_network = TaskNetwork(tasks_pool=gh_tasks[num_tasks])
 
     await rl_db.update_graph_json(task_network.to_dict())
 
@@ -296,17 +325,23 @@ async def teardown_experiment(ctx: ExperimentContext):
 
 async def main():
     reset = True
-    num_workers = 40
+    num_workers = 50
     launch_interval = 2
     setup_base_loglevel()
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     experiment_name = f"study_{timestamp}"
-    solver_model_ckpt_path = None
+
+    solver_kind: SolverKind = "gemini"
+    solver_model_ckpt_path: str | None = None
     # solver_model_ckpt_path = "tinker://77d12766-fb79-5995-ab03-108a8de53af1:train:0/sampler_weights/rl_0020"
 
     ctx = await setup_experiment(experiment_name, reset=reset)
-    resources = await build_worker_resources(wiki_version=experiment_name, solver_model_ckpt_path=solver_model_ckpt_path)
+    resources = await build_worker_resources(
+        wiki_version=experiment_name,
+        solver_kind=solver_kind,
+        solver_model_ckpt_path=solver_model_ckpt_path,
+    )
 
     worker_tasks = []
     for i in range(num_workers):
