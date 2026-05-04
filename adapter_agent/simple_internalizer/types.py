@@ -140,6 +140,9 @@ class RLConfig:
     rl_seed: int = 42  # initial RL task ordering shuffle seed
 
 
+_CACHE_BASE = Path(".cache/simple_internalizer")
+
+
 @dataclass
 class PipelineConfig:
     """SimplePipeline 用設定。SubConfig を合成で保持。`rl=None` で RL ループを
@@ -155,13 +158,18 @@ class PipelineConfig:
     eval: EvalSettings
     checkpoint: CheckpointSettings
 
-    # Pipeline flow
-    cache_dir: Path = Path(".cache/simple_internalizer")
+    # Pipeline flow. `cache_dir=None` → `.cache/simple_internalizer/<library_name>`
+    # so numrs2 / hisab artifacts live in disjoint trees by default.
+    cache_dir: Path | None = None
     generation_concurrency: int = 400
 
     # Stage configs (None disables that stage)
     sft: SFTConfig | None = None
     rl: RLConfig | None = None
+
+    def __post_init__(self) -> None:
+        if self.cache_dir is None:
+            self.cache_dir = _CACHE_BASE / self.library_name
 
 
 @dataclass
@@ -180,6 +188,10 @@ class STaRPipelineConfig:
     checkpoint: CheckpointSettings
     star: STaRSettings
 
-    # Pipeline flow
+    # Pipeline flow. cache_dir is library-namespaced (see PipelineConfig).
     max_iterations: int = 50
-    cache_dir: Path = Path(".cache/simple_internalizer")
+    cache_dir: Path | None = None
+
+    def __post_init__(self) -> None:
+        if self.cache_dir is None:
+            self.cache_dir = _CACHE_BASE / self.library_name

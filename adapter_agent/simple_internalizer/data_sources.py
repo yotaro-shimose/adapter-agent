@@ -72,9 +72,24 @@ def load_gh_archive_suite(
     task_slice: slice,
     for_rl: bool,
     for_eval: bool,
+    csv_path: Path | None = None,
+    difficulty: str | None = "Easy",
 ) -> SeedSuite:
-    """Pick a contiguous window out of load_gh_archive() as a SeedSuite."""
-    tasks: list[Task] = load_gh_archive()[task_slice]
+    """Pick a contiguous window out of load_gh_archive() as a SeedSuite.
+
+    `csv_path` selects which library's benchmark to read; pass
+    ``LibrarySpec.<name>().benchmark_csv`` to switch. ``None`` (default)
+    falls back to ``load_gh_archive``'s built-in numrs2 path.
+
+    `difficulty` filters rows. Default ``"Easy"`` matches the historical
+    numrs2 behavior; pass ``None`` (or use ``LibrarySpec.default_difficulty``)
+    to disable the filter — required for hisab where Easy rows are sparse.
+    """
+    if csv_path is not None:
+        archive = load_gh_archive(difficulty=difficulty, csv_path=csv_path)
+    else:
+        archive = load_gh_archive(difficulty=difficulty)
+    tasks: list[Task] = archive[task_slice]
     return SeedSuite(name=name, tasks=tasks, for_rl=for_rl, for_eval=for_eval)
 
 

@@ -42,9 +42,10 @@ class SimplifiedSolverEnvState:
     solved_subtasks: list[SolvedSubtask] = field(default_factory=list)
 
     @classmethod
-    def numrs2(
+    def for_library(
         cls,
         task: Task,
+        library_name: str,
         internalized_knowledge: str | None = None,
         blocked_knowledge_ids: set[str] | None = None,
         qwen_no_think: bool = False,
@@ -53,7 +54,7 @@ class SimplifiedSolverEnvState:
     ) -> Self:
         return cls(
             task=task,
-            library_name="numrs2",
+            library_name=library_name,
             internalized_knowledge=internalized_knowledge,
             messages=[],
             blocked_knowledge_ids=blocked_knowledge_ids or set(),

@@ -16,16 +16,18 @@ Three named recipes; pick one via `CONFIG = ...` near the bottom.
 import asyncio
 import dataclasses
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 import tinker
+from agents import set_tracing_disabled
 from dotenv import load_dotenv
 from prisma import Prisma
 
 from adapter_agent.data import QRA
 from adapter_agent.hierarchical.agent.generator import GeneratorAgent
+from adapter_agent.library.library_spec import LibrarySpec
 from adapter_agent.model_helper import get_gemini
 from adapter_agent.rl.config import ModelLoadingSettings
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
@@ -46,6 +48,11 @@ from adapter_agent.simple_internalizer.types import (
 )
 from adapter_agent.study.qra_distiller import QRADistiller
 
+# Disable OpenAI Agents SDK telemetry posts. With generation_concurrency=400,
+# the SDK's tracing client floods OpenAI's /v1/traces endpoint and gets 429'd
+# even though the underlying Gemini calls are semaphore-throttled.
+set_tracing_disabled(True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -55,6 +62,11 @@ logging.getLogger("adapter_agent.internalize").setLevel(logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 GRANULAR_ID = "granular_prep_20260430_055104"
+
+# Hisab study lineage. Output of `prepare_granular_knowledge.py` running
+# HISAB_STUDY_PREP against study_20260504_070444 with no path prefix
+# (8 api/ + 15 concepts/ + 1 MOC = 24 articles total).
+HISAB_GRANULAR_ID = "granular_prep_hisab_20260504_073544"
 
 # SFT-completed checkpoint (output of SFT_RECIPE).
 _SFT_CHECKPOINT_BASE_8B = "tinker://b8d2d31a-ed4d-511f-bd4b-956eaccdc204:train:0"
@@ -70,6 +82,11 @@ _ROLLOUT = RolloutSettings(
     runtime_pool_size=50,
     worker_count=50,
 )
+
+# hisab variants — same shape as the numrs2 ones, only the runtime image
+# (and downstream the library identity) differs.
+_RUNTIME_HISAB = LibrarySpec.hisab().cloudrun_runtime()
+_ROLLOUT_HISAB = dataclasses.replace(_ROLLOUT, runtime_settings=_RUNTIME_HISAB)
 
 _EVAL = EvalSettings(
     eval_rollout=4,
@@ -97,6 +114,15 @@ class RunRecipe:
     # SFT extras (only consumed when pipeline_config.sft is set).
     sft_study_experiment_name: str | None
     sft_traj_qra_id: str | None
+
+    # Library identity. Drives rustdoc JSON path (startup sanity check) and
+    # the gh_archive benchmark CSV that build_*/load_gh_archive_suite reads.
+    # Default keeps numrs2-era recipes unchanged; hisab recipes override.
+    library_spec: LibrarySpec = field(default_factory=LibrarySpec.numrs2)
+
+    @property
+    def json_path(self) -> Path:
+        return self.library_spec.libdir / "target/doc" / f"{self.library_spec.name}.json"
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +250,52 @@ TASK_RL_RECIPE = RunRecipe(
 # これによって出来上がったチェックポイント
 # "tinker://c263af3f-acfd-5d93-a297-2dc732548b74:train:0/sampler_weights/rl_0010"
 
-CONFIG = TASK_RL_RECIPE
+
+# ---------------------------------------------------------------------------
+# Hisab recipes
+# ---------------------------------------------------------------------------
+
+# Hisab equivalent of SFT_RECIPE: fresh LoRA → granular SFT (k_sft=32 over
+# hisab granular knowledge from study_20260504_070444) + study trajectory
+# QRAs distilled from the same experiment → exit (SFT-only).
+#
+# `gh_archive_eval_slice=None` because `load_gh_archive_suite` still pulls
+# the numrs2 benchmark CSV — flip this to `slice(150, 200)` once the suite
+# loader is plumbed for hisab's `data/benchmarks/hisab_2026-05-04/` source.
+HISAB_SFT_RECIPE = RunRecipe(
+    simple_train_id_prefix="continue_rl_sft_hisab",
+    granular_id=HISAB_GRANULAR_ID,
+    pipeline_config=PipelineConfig(
+        simple_train_id="",
+        library_name="hisab",
+        model_loading_settings=ModelLoadingSettings(
+            model_name="Qwen/Qwen3-32B",
+            lora_rank=32,
+        ),
+        rollout=_ROLLOUT_HISAB,
+        eval=_EVAL,
+        checkpoint=_CHECKPOINT,
+        sft=SFTConfig(
+            k_sft=32,
+            epochs=2,
+            batch_size=128,
+            sft_seed=42,
+            save_checkpoint=True,
+        ),
+        rl=None,
+        generation_concurrency=400,
+    ),
+    rl_k_per_knowledge=0,
+    eval_k_per_knowledge=0,
+    gh_archive_rl_slice=None,
+    gh_archive_eval_slice=slice(150, 200),
+    sft_study_experiment_name="study_20260504_070444",
+    sft_traj_qra_id="study_20260504_070444_v1",
+    library_spec=LibrarySpec.hisab(),
+)
+
+
+CONFIG = HISAB_SFT_RECIPE
 
 
 # ---------------------------------------------------------------------------
@@ -234,9 +305,8 @@ async def main() -> None:
     load_dotenv()
     cfg = CONFIG
 
-    json_path = Path("repositories/numrs/target/doc/numrs2.json")
-    if not json_path.exists():
-        logger.error(f"RustDoc JSON not found at {json_path}")
+    if not cfg.json_path.exists():
+        logger.error(f"RustDoc JSON not found at {cfg.json_path}")
         return
 
     simple_train_id = (
@@ -304,6 +374,8 @@ async def main() -> None:
                 task_slice=sl,
                 for_rl=True,
                 for_eval=False,
+                csv_path=cfg.library_spec.benchmark_csv,
+                difficulty=cfg.library_spec.default_difficulty,
             )
             step_repr = f":{sl.step}" if sl.step is not None else ""
             logger.info(
@@ -319,6 +391,8 @@ async def main() -> None:
                 task_slice=sl,
                 for_rl=False,
                 for_eval=True,
+                csv_path=cfg.library_spec.benchmark_csv,
+                difficulty=cfg.library_spec.default_difficulty,
             )
             step_repr = f":{sl.step}" if sl.step is not None else ""
             logger.info(

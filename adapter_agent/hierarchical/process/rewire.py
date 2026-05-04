@@ -51,10 +51,12 @@ async def ss_solve_verify(
     internalized_knowledge: str | None = None,
     blocked_knowledge_ids: set[str] | None = None,
     solved_subtasks: list[SolvedSubtask] | None = None,
+    library_name: str = "numrs2",
 ) -> RewireSessionResult:
     verifier = Verifier(model=verifier_model)
-    ss_state = SimplifiedSolverEnvState.numrs2(
+    ss_state = SimplifiedSolverEnvState.for_library(
         task=task,
+        library_name=library_name,
         qwen_no_think=qwen_no_think,
         internalized_knowledge=internalized_knowledge,
         blocked_knowledge_ids=blocked_knowledge_ids,

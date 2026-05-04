@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Awaitable, Iterable, Literal
 
 import tinker
+from agents import set_tracing_disabled
 from agents.extensions.models.litellm_model import LitellmModel
 from dotenv import load_dotenv
 from oai_utils import AgentsSDKModel
@@ -56,6 +57,9 @@ from adapter_agent.simple_internalizer.data_sources import load_gh_archive_suite
 from adapter_agent.simple_internalizer.executor import InternalizeExecutor
 from adapter_agent.simple_internalizer.rollout_engine import build_solver_system_prompt
 from adapter_agent.simple_internalizer.types import SeedSuite
+
+# Suppress Agents SDK tracing telemetry — see scripts/run_continue_rl.py for context.
+set_tracing_disabled(True)
 
 # --- Dataset splits (reference; pick one for `EvalConfig.task_slice`) ---
 STUDY_SLICE = slice(0, 50)

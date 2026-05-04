@@ -48,15 +48,27 @@ End-to-end pipeline for generating, enhancing, classifying, and visualizing benc
 
 ### 1. Generate (BigQuery → Gemini)
 
-`scripts/build_numrs2_benchmark.py` pulls numpy snippets from BigQuery, asks Gemini to derive self-contained benchmark problems, then rewrites the kept problems to mandate the target library.
+`scripts/build_benchmark.py` pulls source-library snippets (numpy by default) from BigQuery, asks Gemini to derive self-contained benchmark problems, then rewrites the kept problems to mandate the target library.
 
 ```bash
-uv run python scripts/build_numrs2_benchmark.py \
-  --name numrs2_$(date +%F) \
-  --library-summary repositories/numrs/SUMMARY.md \
+# numrs2 ← numpy (default)
+uv run python scripts/build_benchmark.py \
+  --target-name numrs2 \
+  --target-summary repositories/numrs/SUMMARY.md \
+  --limit 1000 \
+  --difficulty Easy
+
+# hisab ← scipy
+uv run python scripts/build_benchmark.py \
+  --target-name hisab \
+  --target-summary repositories/hisab/SUMMARY.md \
+  --source-name scipy \
   --limit 1000 \
   --difficulty Easy
 ```
+
+`--source-import` accepts SQL `LIKE` substrings (repeatable, OR-ed) when the
+default lookup for `--source-name` is missing.
 
 Notable flags:
 - `--skip-generate` — reuse an existing `original.csv` instead of re-querying BigQuery.

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Literal
 
 import tinker
+from agents import set_tracing_disabled
 from agents.extensions.models.litellm_model import LitellmModel
 from oai_utils import AgentsSDKModel
 from oai_utils.tinker import TinkerModel, setup_tinkermodel
@@ -18,9 +19,9 @@ from adapter_agent.hierarchical.process.rewire import ss_solve_verify
 from adapter_agent.internalize.studier import KnowledgeStudier
 from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
 from adapter_agent.library.knowledge_db import KnowledgeDB
+from adapter_agent.library.library_spec import LibrarySpec
 from adapter_agent.library.wiki_manager import WikiManager
 from adapter_agent.model_helper import get_gemini, get_gemini_lite
-from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.rl.env.session_result import (
     RewireSessionResultFailure,
     RewireSessionResultNormal,
@@ -37,9 +38,11 @@ from adapter_agent.rl.task_net import (
 from adapter_agent.util.exception import AllTasksCompleted
 from adapter_agent.util.logger_util import setup_base_loglevel
 
+# Suppress Agents SDK tracing telemetry — see scripts/run_continue_rl.py for context.
+set_tracing_disabled(True)
+
 
 DEFAULT_SOLVER_MODEL_NAME = "Qwen/Qwen3-8B"
-DEFAULT_RUST_LIBDIR = Path("repositories/numrs")
 
 SolverKind = Literal["tinker", "gemini"]
 
@@ -55,6 +58,7 @@ class WorkerResources:
     reflector: Reflector
     prisma: Prisma
     qwen_no_think: bool
+    library_spec: LibrarySpec
 
 
 def build_solver_model(
@@ -76,11 +80,11 @@ def build_solver_model(
 
 
 async def build_worker_resources(
+    library_spec: LibrarySpec,
     wiki_version: str,
     solver_kind: SolverKind = "tinker",
     solver_model_name: str = DEFAULT_SOLVER_MODEL_NAME,
     solver_model_ckpt_path: str | None = None,
-    rust_libdir: Path = DEFAULT_RUST_LIBDIR,
 ) -> WorkerResources:
     """Construct per-process resources that StudyActor depends on.
 
@@ -95,7 +99,9 @@ async def build_worker_resources(
     )
     qwen_no_think = solver_kind == "tinker"
 
-    rust_doc_analyzer = await AsyncRustDocAnalyzer.create_from_libdir(rust_libdir)
+    rust_doc_analyzer = await AsyncRustDocAnalyzer.create_from_libdir(
+        library_spec.libdir
+    )
 
     prisma = Prisma()
     await prisma.connect()
@@ -112,6 +118,7 @@ async def build_worker_resources(
         reflector=reflector,
         prisma=prisma,
         qwen_no_think=qwen_no_think,
+        library_spec=library_spec,
     )
 
 
@@ -139,6 +146,7 @@ def build_study_actor(
         json_path=json_path,
         reflector=resources.reflector,
         qwen_no_think=resources.qwen_no_think,
+        library_spec=resources.library_spec,
     )
 
 
@@ -154,6 +162,7 @@ class StudyActor:
     json_path: Path
     reflector: Reflector
     qwen_no_think: bool
+    library_spec: LibrarySpec
 
     async def run(self):
         while True:
@@ -183,9 +192,10 @@ class StudyActor:
             task=task.task,
             max_turns=10,
             qwen_no_think=self.qwen_no_think,
-            runtime_settings=RuntimeSettings.docker_numrs2(),
+            runtime_settings=self.library_spec.docker_runtime(),
             wiki_manager=self.wiki_manager,
             solved_subtasks=solved_subtasks,
+            library_name=self.library_spec.name,
         )
 
         if isinstance(ret, RewireSessionResultNormal):
@@ -263,6 +273,7 @@ class ExperimentContext:
 
 async def setup_experiment(
     experiment_name: str,
+    library_spec: LibrarySpec,
     reset: bool = True,
     num_tasks: slice = slice(0, 50),
     json_path: Path = Path("graphvis/public/data.json"),
@@ -290,7 +301,7 @@ async def setup_experiment(
     await knowledge_db.initialize()
 
     verifier_model = get_gemini()
-    gh_tasks = load_gh_archive()
+    gh_tasks = load_gh_archive(difficulty=None, csv_path=library_spec.benchmark_csv)
     task_network = TaskNetwork(tasks_pool=gh_tasks[num_tasks])
 
     await rl_db.update_graph_json(task_network.to_dict())
@@ -299,7 +310,7 @@ async def setup_experiment(
         verifier_model=verifier_model,
         wiki_manager=wiki_manager,
         rl_db=rl_db,
-        runtime_settings=RuntimeSettings.docker_numrs2(),
+        runtime_settings=library_spec.docker_runtime(),
         task_network=task_network,
     )
     await studier.start()
@@ -336,8 +347,13 @@ async def main():
     solver_model_ckpt_path: str | None = None
     # solver_model_ckpt_path = "tinker://77d12766-fb79-5995-ab03-108a8de53af1:train:0/sampler_weights/rl_0020"
 
-    ctx = await setup_experiment(experiment_name, reset=reset)
+    library_spec = LibrarySpec.hisab()
+
+    ctx = await setup_experiment(
+        experiment_name, library_spec=library_spec, reset=reset
+    )
     resources = await build_worker_resources(
+        library_spec=library_spec,
         wiki_version=experiment_name,
         solver_kind=solver_kind,
         solver_model_ckpt_path=solver_model_ckpt_path,
