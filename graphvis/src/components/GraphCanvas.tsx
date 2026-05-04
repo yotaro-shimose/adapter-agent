@@ -22,7 +22,6 @@ export const GraphCanvasComponent: React.FC = () => {
   const [viewMode, setViewMode] = useState<'global' | 'local'>('global');
   const [focusNodeId, setFocusNodeId] = useState<string | null>(null);
   const [focusDepth, setFocusDepth] = useState<number>(1);
-  const [showKnowledge, setShowKnowledge] = useState<boolean>(true);
   const [selectedNode, setSelectedNode] = useState<CustomNode | null>(null);
 
   // Custom Hooks
@@ -35,8 +34,7 @@ export const GraphCanvasComponent: React.FC = () => {
     data,
     viewMode,
     focusNodeId,
-    focusDepth,
-    showKnowledge
+    focusDepth
   });
 
   const handleNodeSelect = useCallback((node: CustomNode) => {
@@ -84,8 +82,6 @@ export const GraphCanvasComponent: React.FC = () => {
         selectedExperiment={selectedExperiment}
         onSelectExperiment={setSelectedExperiment}
         onRefresh={refreshGraph}
-        showKnowledge={showKnowledge}
-        onToggleKnowledge={() => setShowKnowledge(!showKnowledge)}
         viewMode={viewMode}
         onSetGlobalView={() => {
           setViewMode('global');

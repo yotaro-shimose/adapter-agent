@@ -6,8 +6,6 @@ interface ControlPanelProps {
   selectedExperiment: string | null;
   onSelectExperiment: (exp: string) => void;
   onRefresh: () => void;
-  showKnowledge: boolean;
-  onToggleKnowledge: () => void;
   viewMode: 'global' | 'local';
   onSetGlobalView: () => void;
   focusDepth: number;
@@ -19,8 +17,6 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
   selectedExperiment,
   onSelectExperiment,
   onRefresh,
-  showKnowledge,
-  onToggleKnowledge,
   viewMode,
   onSetGlobalView,
   focusDepth,
@@ -40,13 +36,6 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
       )}
 
       <button onClick={onRefresh}>Refresh</button>
-
-      <button 
-        onClick={onToggleKnowledge}
-        className={showKnowledge ? 'active' : ''}
-      >
-        {showKnowledge ? 'Hide' : 'Show'} Knowledge
-      </button>
 
       {viewMode === 'local' && (
         <>

@@ -12,14 +12,13 @@ from oai_utils.tinker import TinkerModel, setup_tinkermodel
 from prisma import Prisma
 
 from adapter_agent.hierarchical.agent.analyzer import Analyzer
-from adapter_agent.hierarchical.agent.reflector import Reflector
 from adapter_agent.hierarchical.gh import load_gh_archive
 from adapter_agent.hierarchical.process.rewire import ss_solve_verify
 from adapter_agent.internalize.studier import KnowledgeStudier
 from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
 from adapter_agent.library.knowledge_db import KnowledgeDB
 from adapter_agent.library.wiki_manager import WikiManager
-from adapter_agent.model_helper import get_gemini, get_gemini_lite
+from adapter_agent.model_helper import get_gemini
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.rl.env.session_result import (
     RewireSessionResultFailure,
@@ -37,11 +36,10 @@ from adapter_agent.rl.task_net import (
 from adapter_agent.util.exception import AllTasksCompleted
 from adapter_agent.util.logger_util import setup_base_loglevel
 
-
-DEFAULT_SOLVER_MODEL_NAME = "Qwen/Qwen3-8B"
 DEFAULT_RUST_LIBDIR = Path("repositories/numrs")
 
-SolverKind = Literal["tinker", "gemini"]
+Backend = Literal["tinker", "gemini"]
+SolverKind = Backend  # legacy alias
 
 
 @dataclass
@@ -52,14 +50,16 @@ class WorkerResources:
     verifier_model: AgentsSDKModel
     rust_doc_analyzer: AsyncRustDocAnalyzer
     wiki_manager: WikiManager
-    reflector: Reflector
+    analyzer: Analyzer
     prisma: Prisma
+    library_name: str
     qwen_no_think: bool
+    verifier_qwen_no_think: bool
 
 
 def build_solver_model(
     solver_kind: SolverKind,
-    solver_model_name: str = DEFAULT_SOLVER_MODEL_NAME,
+    solver_model_name: str,
     solver_model_ckpt_path: str | None = None,
 ) -> TinkerModel | LitellmModel:
     if solver_kind == "tinker":
@@ -75,12 +75,31 @@ def build_solver_model(
     raise ValueError(f"Unknown solver_kind: {solver_kind}")
 
 
+def build_support_model(backend: Backend) -> AgentsSDKModel:
+    """Build the shared model used by Curator / Analyzer / Verifier."""
+    if backend == "tinker":
+        service_client = tinker.ServiceClient()
+        model, _tok, _renderer = setup_tinkermodel(
+            service_client=service_client,
+            model_name="Qwen/Qwen3-32B",
+        )
+        return model
+    if backend == "gemini":
+        return get_gemini()
+    raise ValueError(f"Unknown backend: {backend}")
+
+
 async def build_worker_resources(
     wiki_version: str,
-    solver_kind: SolverKind = "tinker",
-    solver_model_name: str = DEFAULT_SOLVER_MODEL_NAME,
+    solver_kind: SolverKind,
+    solver_model_name: str,
+    analyzer_model: AgentsSDKModel,
+    verifier_model: AgentsSDKModel,
+    library_name: str,
     solver_model_ckpt_path: str | None = None,
     rust_libdir: Path = DEFAULT_RUST_LIBDIR,
+    analyzer_qwen_no_think: bool = False,
+    verifier_qwen_no_think: bool = False,
 ) -> WorkerResources:
     """Construct per-process resources that StudyActor depends on.
 
@@ -101,17 +120,18 @@ async def build_worker_resources(
     await prisma.connect()
     wiki_manager = WikiManager(prisma, version=wiki_version)
 
-    verifier_model = get_gemini_lite()
-    reflector = Reflector(model=verifier_model)
+    analyzer = Analyzer(model=analyzer_model, qwen_no_think=analyzer_qwen_no_think)
 
     return WorkerResources(
         solver_model=solver_model,
         verifier_model=verifier_model,
         rust_doc_analyzer=rust_doc_analyzer,
         wiki_manager=wiki_manager,
-        reflector=reflector,
+        analyzer=analyzer,
         prisma=prisma,
+        library_name=library_name,
         qwen_no_think=qwen_no_think,
+        verifier_qwen_no_think=verifier_qwen_no_think,
     )
 
 
@@ -137,8 +157,10 @@ def build_study_actor(
         rl_db=rl_db,
         studier=studier,
         json_path=json_path,
-        reflector=resources.reflector,
+        analyzer=resources.analyzer,
+        library_name=resources.library_name,
         qwen_no_think=resources.qwen_no_think,
+        verifier_qwen_no_think=resources.verifier_qwen_no_think,
     )
 
 
@@ -152,8 +174,10 @@ class StudyActor:
     rl_db: RLDatabase
     studier: KnowledgeStudier
     json_path: Path
-    reflector: Reflector
+    analyzer: Analyzer
+    library_name: str
     qwen_no_think: bool
+    verifier_qwen_no_think: bool
 
     async def run(self):
         while True:
@@ -183,6 +207,8 @@ class StudyActor:
             task=task.task,
             max_turns=10,
             qwen_no_think=self.qwen_no_think,
+            verifier_qwen_no_think=self.verifier_qwen_no_think,
+            library_name=self.library_name,
             runtime_settings=RuntimeSettings.docker_numrs2(),
             wiki_manager=self.wiki_manager,
             solved_subtasks=solved_subtasks,
@@ -204,14 +230,11 @@ class StudyActor:
                 final_knowledge_title=None,
             )
 
-            # Enqueue for distillation if successful (and let Studier handle uniqueness & formalization)
+            # Enqueue for curation if successful; Studier handles uniqueness and the WikiCurator run.
             if ret.reward > 0:
-                print(f"Generating reflections for task {task.id}...")
-                reflections = await self.reflector.reflect(ret.trials)
                 await self.studier.enqueue_trajectory(
                     task_id=task.id,
                     instruction=task.task.instruction,
-                    reflections=reflections,
                     trajectory=ret.trials,
                 )
 
@@ -220,8 +243,7 @@ class StudyActor:
             current.register_result(task.complete(ret))
         else:
             try:
-                analyzer = Analyzer(model=get_gemini_lite())
-                subtask = await analyzer.analyze_trajectory(ret.trials)
+                subtask = await self.analyzer.analyze_trajectory(ret.trials)
                 print(f"New Task: {subtask.instruction}")
                 current.register_result(task.complete(ret, new_task=subtask))
             except Exception:
@@ -263,9 +285,12 @@ class ExperimentContext:
 
 async def setup_experiment(
     experiment_name: str,
+    curator_model: AgentsSDKModel,
+    library_name: str,
     reset: bool = True,
     num_tasks: slice = slice(0, 50),
     json_path: Path = Path("graphvis/public/data.json"),
+    curator_qwen_no_think: bool = False,
 ) -> ExperimentContext:
     """Initialize the shared state that a study run operates over.
 
@@ -289,14 +314,15 @@ async def setup_experiment(
     knowledge_db = KnowledgeDB.for_experiment(experiment_name)
     await knowledge_db.initialize()
 
-    verifier_model = get_gemini()
     gh_tasks = load_gh_archive()
     task_network = TaskNetwork(tasks_pool=gh_tasks[num_tasks])
 
     await rl_db.update_graph_json(task_network.to_dict())
 
     studier = KnowledgeStudier(
-        verifier_model=verifier_model,
+        curator_model=curator_model,
+        curator_qwen_no_think=curator_qwen_no_think,
+        library_name=library_name,
         wiki_manager=wiki_manager,
         rl_db=rl_db,
         runtime_settings=RuntimeSettings.docker_numrs2(),
@@ -323,29 +349,91 @@ async def teardown_experiment(ctx: ExperimentContext):
     await ctx.prisma.disconnect()
 
 
+# ---------------------------------------------------------------------------
+# Recipes
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class StudyConfig:
+    """End-to-end study experiment configuration. All knobs in one place."""
+
+    backend: Backend
+    library_name: str
+
+    # Solver-specific (relevant when backend == "tinker"; ignored for gemini).
+    solver_model_name: str = "Qwen/Qwen3-32B"
+    solver_model_ckpt_path: str | None = None
+
+    # Worker pool.
+    num_workers: int = 100
+    launch_interval_s: float = 2.0
+
+    # Task selection from the gh archive.
+    num_tasks: slice = slice(0, 50)
+
+    # Whether to wipe the wiki version at the start of the experiment.
+    wiki_reset: bool = True
+
+    # Experiment name gets timestamped at run time as `{prefix}_{timestamp}`.
+    experiment_name_prefix: str = "study"
+
+
+# All-Qwen run: Solver, Curator, Analyzer, Verifier all served via Tinker.
+ALL_TINKER = StudyConfig(
+    backend="tinker",
+    library_name="numrs2",
+)
+
+
+# All-Gemini run: every agent uses Gemini through LiteLLM. Useful as a
+# reference / sanity-check baseline.
+ALL_GEMINI = StudyConfig(
+    backend="gemini",
+    library_name="numrs2",
+)
+
+
+CONFIG: StudyConfig = ALL_TINKER  # ← pick recipe here
+
+
+# ---------------------------------------------------------------------------
+
+
 async def main():
-    reset = True
-    num_workers = 50
-    launch_interval = 2
     setup_base_loglevel()
+    cfg = CONFIG
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    experiment_name = f"study_{timestamp}"
+    experiment_name = f"{cfg.experiment_name_prefix}_{timestamp}"
 
-    solver_kind: SolverKind = "gemini"
-    solver_model_ckpt_path: str | None = None
-    # solver_model_ckpt_path = "tinker://77d12766-fb79-5995-ab03-108a8de53af1:train:0/sampler_weights/rl_0020"
+    # Shared support model reused by Curator, Analyzer, and Verifier.
+    support_model = build_support_model(cfg.backend)
+    qwen_no_think = cfg.backend == "tinker"
 
-    ctx = await setup_experiment(experiment_name, reset=reset)
+    ctx = await setup_experiment(
+        experiment_name,
+        reset=cfg.wiki_reset,
+        num_tasks=cfg.num_tasks,
+        curator_model=support_model,
+        curator_qwen_no_think=qwen_no_think,
+        library_name=cfg.library_name,
+    )
     resources = await build_worker_resources(
         wiki_version=experiment_name,
-        solver_kind=solver_kind,
-        solver_model_ckpt_path=solver_model_ckpt_path,
+        solver_kind=cfg.backend,
+        solver_model_name=cfg.solver_model_name,
+        solver_model_ckpt_path=cfg.solver_model_ckpt_path,
+        analyzer_model=support_model,
+        analyzer_qwen_no_think=qwen_no_think,
+        verifier_model=support_model,
+        verifier_qwen_no_think=qwen_no_think,
+        library_name=cfg.library_name,
     )
 
     worker_tasks = []
-    for i in range(num_workers):
-        print(f"Launching worker {i + 1}/{num_workers}...")
+    for i in range(cfg.num_workers):
+        print(f"Launching worker {i + 1}/{cfg.num_workers}...")
         study_actor = build_study_actor(
             resources=resources,
             task_network=ctx.task_network,
@@ -354,8 +442,8 @@ async def main():
             json_path=ctx.json_path,
         )
         worker_tasks.append(asyncio.create_task(study_actor.run()))
-        if i < num_workers - 1:
-            await asyncio.sleep(launch_interval)
+        if i < cfg.num_workers - 1:
+            await asyncio.sleep(cfg.launch_interval_s)
 
     try:
         await asyncio.gather(*worker_tasks)

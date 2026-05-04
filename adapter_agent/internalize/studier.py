@@ -7,60 +7,70 @@ from typing import List, Optional, Set
 from oai_utils.agent import AgentsSDKModel
 from tinker_cookbook.renderers.base import Message as TinkerMessage
 
-from adapter_agent.hierarchical.agent.reflector import Reflection
+from adapter_agent.hierarchical.agent.reflector import extract_submit_content
+from adapter_agent.internalize.wiki_curator import WikiCurator
 from adapter_agent.library.wiki_manager import WikiManager
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.rl.rl_database import RLDatabase
 from adapter_agent.rl.task_net import TaskNetwork
 
-from adapter_agent.internalize.wiki_integrator import WikiIntegrator
-
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class DistillationRequest:
+class CurationRequest:
     task_id: str
     instruction: str
-    reflections: List[Reflection]
     trajectory: List[TinkerMessage]
     timestamp: datetime = field(default_factory=datetime.now)
 
 
 class KnowledgeStudier:
     """
-    Decoupled pipeline for studying successful trajectories and extracting knowledge.
+    Decoupled pipeline for studying successful trajectories and curating
+    them into the Wiki.
 
-    1. Receives successful trajectories.
-    2. Sequentially checks reflections for uniqueness to avoid race conditions.
-    3. Concurrently formalizes unique reflections (Cargo PoC + Markdown).
-    4. Marks knowledge as 'Ready' in TaskNetwork.
+    Each enqueued trajectory is processed by a single WikiCurator run that
+    mines the agent's verified-working answer for library knowledge and
+    commits it. The Reflector is no longer used; submit extraction happens
+    inline.
     """
 
     def __init__(
         self,
-        verifier_model: AgentsSDKModel,
+        curator_model: AgentsSDKModel,
         wiki_manager: WikiManager,
         rl_db: RLDatabase,
         runtime_settings: RuntimeSettings,
         task_network: TaskNetwork,  # Avoid circular import
+        library_name: str,
         concurrency: int = 4,
+        curator_qwen_no_think: bool = False,
     ):
-        self.verifier_model = verifier_model
+        self.curator_model = curator_model
+        self.curator_qwen_no_think = curator_qwen_no_think
+        self.library_name = library_name
         self.wiki_manager = wiki_manager
         self.rl_db = rl_db
         self.runtime_settings = runtime_settings
         self.task_network = task_network
         self.concurrency = concurrency
 
-        self.queue: asyncio.Queue[DistillationRequest] = asyncio.Queue()
+        self.curator = WikiCurator(
+            wiki_manager=self.wiki_manager,
+            model=self.curator_model,
+            library_name=self.library_name,
+            qwen_no_think=self.curator_qwen_no_think,
+        )
+
+        self.queue: asyncio.Queue[CurationRequest] = asyncio.Queue()
 
         self._processed_tasks: Set[str] = set()
         self._worker_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
 
     async def start(self):
-        """Start the background distillation worker."""
+        """Start the background curation worker."""
         if self._worker_task is not None:
             return
         self._worker_task = asyncio.create_task(self._main_loop())
@@ -78,14 +88,12 @@ class KnowledgeStudier:
         self,
         task_id: str,
         instruction: str,
-        reflections: List[Reflection],
         trajectory: List[TinkerMessage],
     ):
-        """Add a successful trajectory to the distillation queue."""
-        request = DistillationRequest(
+        """Add a successful trajectory to the curation queue."""
+        request = CurationRequest(
             task_id=task_id,
             instruction=instruction,
-            reflections=reflections,
             trajectory=trajectory,
         )
         await self.queue.put(request)
@@ -98,63 +106,47 @@ class KnowledgeStudier:
                 except asyncio.TimeoutError:
                     continue
 
-                # Step 1: Deduplication (Task Layer)
                 if request.task_id in self._processed_tasks:
                     logger.info(
-                        f"Skipping redundant knowledge generation for task {request.task_id}"
+                        f"Skipping redundant curation for task {request.task_id}"
                     )
                     self.queue.task_done()
                     continue
 
-                # Step 2: Skip manual uniqueness check, lean on the Integrator Agent
-                if not request.reflections:
-                    logger.info(f"No reflections for task {request.task_id}")
-                    await self.task_network.mark_knowledge_ready(request.task_id, [])
-                    self._processed_tasks.add(request.task_id)
-                    self.queue.task_done()
-                    continue
+                logger.info(f"Picked up task {request.task_id} for curation.")
+                await self._curate(request)
 
-                # Step 3: Formalize via WikiIntegrator (Globally Sequential)
-                logger.info(f"Picked up task {request.task_id} for distillation.")
-                await self._formalize_and_finalize(request, request.reflections)
-                
                 self._processed_tasks.add(request.task_id)
                 self.queue.task_done()
-                logger.info(f"Finished distillation for task {request.task_id}.")
+                logger.info(f"Finished curation for task {request.task_id}.")
 
             except Exception as e:
                 logger.exception(f"Error in KnowledgeStudier main loop: {e}")
 
-    async def _formalize_and_finalize(
-        self, request: DistillationRequest, reflections: List[Reflection]
-    ):
+    async def _curate(self, request: CurationRequest):
         """
-        Spawns an autonomous Integrator Agent for each reflection to audit and merge into the Wiki.
+        Run a single WikiCurator pass on the trajectory's task + final answer.
         """
-
-        logger.info(
-            f"Starting synthetic integration for {len(reflections)} reflections (task: {request.task_id})"
-        )
-
-        integrator = WikiIntegrator(
-            wiki_manager=self.wiki_manager, model=self.verifier_model
-        )
+        final_answer = extract_submit_content(request.trajectory)
+        if final_answer is None:
+            logger.warning(
+                f"Skipping curation for task {request.task_id}: no <submit> block in trajectory."
+            )
+            await self.task_network.mark_knowledge_ready(request.task_id, [])
+            return
 
         async with self.runtime_settings.build_runtime() as runtime:
-            # Process each reflection sequentially (or with limited concurrency) to avoid Wiki conflicts
-            for i, reflection in enumerate(reflections):
-                try:
-                    logger.info(
-                        f"Integrating reflection {i + 1}/{len(reflections)} for {request.task_id}..."
-                    )
-                    await integrator.integrate(reflection, runtime=runtime)
-                except Exception as e:
-                    logger.error(
-                        f"Failed to integrate reflection {i} for task {request.task_id}: {e}"
-                    )
+            try:
+                await self.curator.curate(
+                    task_instruction=request.instruction,
+                    final_answer=final_answer,
+                    runtime=runtime,
+                )
+            except Exception as e:
+                logger.error(
+                    f"Curation failed for task {request.task_id}: {e}"
+                )
 
-        # Notify TaskNetwork that knowledge is ready
         await self.task_network.mark_knowledge_ready(request.task_id, [])
         await self.rl_db.update_graph_json(self.task_network.to_dict())
-        logger.info(f"Knowledge integration complete for task {request.task_id}")
-
+        logger.info(f"Curation complete for task {request.task_id}")

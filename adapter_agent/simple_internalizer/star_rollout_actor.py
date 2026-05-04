@@ -86,7 +86,7 @@ class STaRRolloutActor:
         self._shared = SharedSamplingClient(sampling_client)
         _, renderer = get_tokenizer_renderer(sampling_client, self._model_name)
 
-        verifier = Verifier(model=self._verifier_model)
+        verifier = Verifier(model=self._verifier_model, library_name=self._library_name)
         self._runtime_pool = RuntimePool(
             self._runtime_settings, max_size=self._runtime_pool_size
         )

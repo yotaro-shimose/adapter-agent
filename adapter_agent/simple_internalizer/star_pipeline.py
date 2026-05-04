@@ -182,7 +182,8 @@ class STaRPipeline:
             max_size=config.rollout.runtime_pool_size,
         )
         eval_executor = InternalizeExecutor(
-            runtime_pool=eval_runtime_pool, verifier=Verifier(model=verifier_model)
+            runtime_pool=eval_runtime_pool,
+            verifier=Verifier(model=verifier_model, library_name=config.library_name),
         )
         system_prompt = build_solver_system_prompt(config.library_name)
         eval_rollout_engine = RolloutEngine(

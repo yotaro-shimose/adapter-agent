@@ -95,7 +95,7 @@ class RolloutActor:
             data={"create": {"id": self._simple_train_id}, "update": {}},
         )
 
-        verifier = Verifier(model=self._verifier_model)
+        verifier = Verifier(model=self._verifier_model, library_name=self._library_name)
         self._runtime_pool = RuntimePool(
             self._runtime_settings, max_size=self._runtime_pool_size
         )

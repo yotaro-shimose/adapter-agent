@@ -127,7 +127,6 @@ async def main() -> None:
             sft_batch_size=64,
             sft_epochs_per_round=1,
             sft_adam_params=tinker.AdamParams(learning_rate=2e-4),
-            cpt=False,
         ),
         max_iterations=100,
     )

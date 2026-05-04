@@ -415,9 +415,7 @@ def get_simplified_solver_initial_messages(
     renderer: Renderer | None,
 ) -> list[TinkerMessage]:
     PROMPT = f"""<Role>
-You are a Rust engineer.
-Your goal is to create a solution to achieve the user's request through the iterative process.
-You create a solution using simple playground to find the correct code.
+You are a Rust engineer learning to use the `{env_state.library_name}` library. Your goal is to solve the user's task by discovering the library's idiomatic APIs through iteration in a simple playground.
 </Role>
 
 <Context>
@@ -480,12 +478,13 @@ At the end of every tool response, you will see a `[STATUS]` section:
             + "\n</SolvedSubtasks>\n"
         )
 
-    guidelines = """\
+    guidelines = f"""\
 Verification: Once again, you MUST verify your answer. You should make your best efforts to avoid hallucination and make sure your answer is correct.
 Self-contained: Note your solution has been fully self-contained including both fully functioning source code and explanation.
 Testing Code: Before submitting the final answer, use the `<write_and_run>...</write_and_run>` tags to test code and see outputs. Avoid JSON syntax errors.
 One Action at a Time: You MUST only use one tool tag per turn. Response containing multiple tags (e.g. two searches or a search and a test) will be rejected.
 Code block inclusion: Your final answer MUST include exactly one `<submit>\\n<your_code_here>\\n</submit>` block. Its content will be pasted to main.rs and executed for final verification to END the task.
+Library-First Implementation: Solve the problem using `{env_state.library_name}` as much as possible — prefer library APIs over stdlib equivalents whenever the library offers a way to do the same thing. A solution that imports `{env_state.library_name}` but reimplements the work in pure stdlib has bypassed the task and will be rejected by verification.
 Wiki Exploration: Always check the internal Wiki (`wiki_ls`, `wiki_read`) first for high-quality, project-specific knowledge. Use the provided `<MapOfContent>` as your primary index to find relevant articles. You are encouraged to read multiple related articles in a single turn (up to 5) to save turns and quota.
 Documentation Fallback: Use `search_library_doc` only if the Wiki does not contain the necessary information. Note that this tool provides raw technical details from the crate's official documentation.
 Error Reflection: If `<write_and_run>` test fails, analyze the compiler error carefully. Check the Wiki or documentation for specific causes of the error code (e.g., E0308).

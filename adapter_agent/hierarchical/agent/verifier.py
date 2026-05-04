@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from openai.types.shared import Reasoning
 from agents import ModelSettings, RunContextWrapper, StopAtTools, function_tool
 from oai_utils.agent import AgentRunFailure, AgentsSDKModel, AgentWrapper
+from oai_utils.tinker import TinkerModel
 from pydantic import BaseModel
 
 from adapter_agent.data import QA
@@ -54,6 +55,8 @@ def report_failure(
 
 @dataclass(kw_only=True)
 class Verifier[T: AgentsSDKModel](BaseAgent[T]):
+    library_name: str
+    qwen_no_think: bool = False
 
     async def verify(
         self,
@@ -65,7 +68,7 @@ class Verifier[T: AgentsSDKModel](BaseAgent[T]):
         """
         Questionに対してAnswerが問題を解決できるものとなっているかどうかをコードの実行結果などを通じて検証して、QAが正しければTrueをリターンする。
         """
-        PROMPT = """
+        PROMPT = f"""
 <Role>
 You are a Quality Assurance engineer for Rust code.
 Your task is to verify the following Solution for the given Question.
@@ -89,8 +92,16 @@ You must:
 - If the output is logically incorrect for the question, report failure.
 - If the provided answer is not self-contained verifiable answer, report failure, even when the execution output and main.rs are correct.
     - Carefully check if the answer contains the same verified code as main.rs.
+- The solution must actually use the `{self.library_name}` library, not just import it. Concretely: `main.rs` must contain at least one `use {self.library_name}::...` import AND make a call to something brought in by that import (a function from the library, or a method on a type that came from the library). A solution that imports `{self.library_name}` but performs the real work via stdlib or hand-rolled functions has bypassed the task — report failure.
 </Guidelines>
 """
+        model_settings = ModelSettings(
+            tool_choice="required",
+            parallel_tool_calls=True,
+            # Tinker does not support OpenAI-style reasoning effort, so only
+            # set it for non-Tinker models.
+            reasoning=None if isinstance(self.model, TinkerModel) else Reasoning(effort="none"),
+        )
         agent = AgentWrapper.create(
             name="Verifier",
             instructions=PROMPT,
@@ -100,9 +111,7 @@ You must:
                 report_success,
                 report_failure,
             ],
-            model_settings=ModelSettings(
-                tool_choice="required", parallel_tool_calls=True, reasoning=Reasoning(effort="none")
-            ),
+            model_settings=model_settings,
             tool_use_behavior=StopAtTools(
                 stop_at_tool_names=[report_success.name, report_failure.name]
             ),
@@ -132,6 +141,8 @@ You must:
 {execution_output}
 </Execution Output>
 """
+        if self.qwen_no_think:
+            input_prompt = "/no_think " + input_prompt
 
         try:
             await agent.run(input_prompt, context=context)

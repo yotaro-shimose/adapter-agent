@@ -595,7 +595,7 @@ async def _run_single_turn(
     verifier_model: AgentsSDKModel,
 ) -> list[TaskEvalResult]:
     runtime_settings = RuntimeSettings.cloudrun_numrs2()
-    verifier = Verifier(model=verifier_model)
+    verifier = Verifier(model=verifier_model, library_name=cfg.library_name)
     runtime_pool = RuntimePool(runtime_settings, max_size=cfg.runtime_pool_size)
     executor = InternalizeExecutor(runtime_pool=runtime_pool, verifier=verifier)
     system_prompt = build_solver_system_prompt(cfg.library_name)

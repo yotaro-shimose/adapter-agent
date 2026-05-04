@@ -1,12 +1,11 @@
 import { useState } from 'react';
 import { GraphCanvasComponent } from './components/GraphCanvas';
-import { ShadowTuning } from './components/ShadowTuning';
 import { WikiVis } from './components/WikiVis';
 import { TrajectoryExplorer } from './components/TrajectoryExplorer';
 import './App.css';
 
 function App() {
-  const [view, setView] = useState<'graph' | 'wiki' | 'shadow' | 'trajectory'>('shadow');
+  const [view, setView] = useState<'graph' | 'wiki' | 'trajectory'>('trajectory');
 
   return (
     <div className="App" style={{ display: 'flex', flexDirection: 'column', height: '100vh', width: '100vw', backgroundColor: '#0f111a', color: '#fff', boxSizing: 'border-box' }}>
@@ -14,13 +13,11 @@ function App() {
          <h2 style={{ margin: 0, marginRight: '20px', fontSize: '1.2rem', fontWeight: 600, background: 'linear-gradient(90deg, #61dafb, #9b59b6)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>Adapter Agent Vis</h2>
          <button onClick={() => setView('graph')} style={{ padding: '8px 16px', background: view === 'graph' ? 'rgba(97, 218, 251, 0.15)' : 'transparent', color: view === 'graph' ? '#61dafb' : '#888', border: `1px solid ${view === 'graph' ? '#61dafb' : '#444'}`, borderRadius: '6px', cursor: 'pointer', transition: 'all 0.2s' }}>Hierarchical Graph</button>
          <button onClick={() => setView('trajectory')} style={{ padding: '8px 16px', background: view === 'trajectory' ? 'rgba(241, 196, 15, 0.15)' : 'transparent', color: view === 'trajectory' ? '#f1c40f' : '#888', border: `1px solid ${view === 'trajectory' ? '#f1c40f' : '#444'}`, borderRadius: '6px', cursor: 'pointer', transition: 'all 0.2s' }}>Trajectories</button>
-         <button onClick={() => setView('shadow')} style={{ padding: '8px 16px', background: view === 'shadow' ? 'rgba(155, 89, 182, 0.15)' : 'transparent', color: view === 'shadow' ? '#9b59b6' : '#888', border: `1px solid ${view === 'shadow' ? '#9b59b6' : '#444'}`, borderRadius: '6px', cursor: 'pointer', transition: 'all 0.2s' }}>Shadow Tuning</button>
          <button onClick={() => setView('wiki')} style={{ padding: '8px 16px', background: view === 'wiki' ? 'rgba(46, 204, 113, 0.15)' : 'transparent', color: view === 'wiki' ? '#2ecc71' : '#888', border: `1px solid ${view === 'wiki' ? '#2ecc71' : '#444'}`, borderRadius: '6px', cursor: 'pointer', transition: 'all 0.2s' }}>Wiki Explorer</button>
        </div>
        <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
          {view === 'graph' && <GraphCanvasComponent />}
          {view === 'trajectory' && <TrajectoryExplorer />}
-         {view === 'shadow' && <ShadowTuning />}
          {view === 'wiki' && <WikiVis />}
        </div>
     </div>

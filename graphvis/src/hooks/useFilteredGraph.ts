@@ -6,10 +6,9 @@ interface FilterProps {
   viewMode: 'global' | 'local';
   focusNodeId: string | null;
   focusDepth: number;
-  showKnowledge: boolean;
 }
 
-export function useFilteredGraph({ data, viewMode, focusNodeId, focusDepth, showKnowledge }: FilterProps) {
+export function useFilteredGraph({ data, viewMode, focusNodeId, focusDepth }: FilterProps) {
   const [displayData, setDisplayData] = useState<{ nodes: CustomNode[], links: CustomLink[] } | null>(null);
 
   useEffect(() => {
@@ -41,20 +40,16 @@ export function useFilteredGraph({ data, viewMode, focusNodeId, focusDepth, show
       }
     }
 
-    let filteredNodes = data.nodes.filter(n => neighborhood.has(n.id));
-    
-    if (!showKnowledge) {
-      filteredNodes = filteredNodes.filter(n => n.type !== 'knowledge');
-    }
+    const filteredNodes = data.nodes.filter(n => neighborhood.has(n.id));
 
     const filteredLinks = data.links.filter(l => {
       const sId = typeof l.source === 'string' ? l.source : (l.source as any).id;
       const tId = typeof l.target === 'string' ? l.target : (l.target as any).id;
-      return neighborhood.has(sId) && neighborhood.has(tId) && filteredNodes.find(n => n.id === sId) && filteredNodes.find(n => n.id === tId);
+      return neighborhood.has(sId) && neighborhood.has(tId);
     });
 
     setDisplayData({ nodes: filteredNodes, links: filteredLinks });
-  }, [data, viewMode, focusNodeId, focusDepth, showKnowledge]);
+  }, [data, viewMode, focusNodeId, focusDepth]);
 
   return displayData;
 }

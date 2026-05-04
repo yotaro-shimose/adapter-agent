@@ -211,6 +211,7 @@ async def main() -> None:
             resources=study_resources,
             in_queue=study_task_queue,
             qra_out_queue=qra_out_queue,
+            library_name="numrs2",
             num_workers=STUDY_WORKERS,
             json_path=Path("graphvis/public/study_data.json"),
             qra_budget_config=QRABudgetConfig(

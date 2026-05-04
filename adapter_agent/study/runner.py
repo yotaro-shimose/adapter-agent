@@ -360,6 +360,7 @@ async def setup_study_runner(
     resources: StudyWorkerResources,
     in_queue: asyncio.Queue[StudyTask],
     qra_out_queue: asyncio.Queue[tuple[str, QRA]],
+    library_name: str,
     num_workers: int = 4,
     json_path: Path = Path("graphvis/public/data.json"),
     qra_budget_config: QRABudgetConfig | None = None,
@@ -379,11 +380,12 @@ async def setup_study_runner(
     await rl_db.update_graph_json(task_network.to_dict())
 
     studier = KnowledgeStudier(
-        verifier_model=resources.verifier_model,
+        curator_model=resources.verifier_model,
         wiki_manager=resources.wiki_manager,
         rl_db=rl_db,
         runtime_settings=RuntimeSettings.docker_numrs2(),
         task_network=task_network,
+        library_name=library_name,
     )
     await studier.start()
 

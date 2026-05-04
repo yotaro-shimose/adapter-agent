@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass(kw_only=True)
 class Analyzer[T: AgentsSDKModel](BaseAgent[T]):
+    qwen_no_think: bool = False
+
     async def analyze_trajectory(self, trajectory: list[TinkerMessage]) -> Task:
         """
         Trajectoryを分析してなぜSolverが失敗したのかを理解する。
@@ -50,13 +52,17 @@ Provide your reasoning, and then output the subtask instruction inside a <subtas
         # Filter out system messages to avoid tool description pollution
         filtered_trajectory = [m for m in trajectory if m.get("role") != "system"]
 
-        result = await agent.run(
-            f"""\
+        input_prompt = f"""\
 Analyze the following trajectory and generate a sub-task.
 <Trajectory>
 {format_trajectory_transcript(filtered_trajectory)}
 </Trajectory>
-""",
+"""
+        if self.qwen_no_think:
+            input_prompt = "/no_think " + input_prompt
+
+        result = await agent.run(
+            input_prompt,
             run_config=RunConfig(tracing_disabled=True),
         )
         response_text = result.final_output()

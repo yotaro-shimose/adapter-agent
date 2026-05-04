@@ -173,7 +173,7 @@ class SimplePipeline:
         config.cache_dir.mkdir(parents=True, exist_ok=True)
 
         verifier_model: AgentsSDKModel = config.rollout.verifier_model or get_gemini_lite()
-        verifier = Verifier(model=verifier_model)
+        verifier = Verifier(model=verifier_model, library_name=config.library_name)
         generator: GeneratorAgent | None = None
         if config.sft is not None:
             generator_model: AgentsSDKModel = (
