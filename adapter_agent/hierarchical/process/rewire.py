@@ -46,14 +46,15 @@ async def ss_solve_verify(
     task: Task,
     max_turns: int,
     runtime_settings: RuntimeSettings,
-    wiki_manager: WikiManager,
+    wiki_manager: WikiManager | None = None,
     qwen_no_think: bool = False,
     internalized_knowledge: str | None = None,
     blocked_knowledge_ids: set[str] | None = None,
     solved_subtasks: list[SolvedSubtask] | None = None,
     library_name: str = "numrs2",
+    reference_knowledge: str | None = None,
 ) -> RewireSessionResult:
-    verifier = Verifier(model=verifier_model)
+    verifier = Verifier(model=verifier_model, library_name=library_name)
     ss_state = SimplifiedSolverEnvState.for_library(
         task=task,
         library_name=library_name,
@@ -61,6 +62,7 @@ async def ss_solve_verify(
         internalized_knowledge=internalized_knowledge,
         blocked_knowledge_ids=blocked_knowledge_ids,
         solved_subtasks=solved_subtasks,
+        reference_knowledge=reference_knowledge,
     )
     try:
         renderer = (

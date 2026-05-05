@@ -31,6 +31,17 @@ class LibrarySpec(BaseModel):
     def cloudrun_runtime(self) -> RuntimeSettings:
         return RuntimeSettings(type="cloudrun", image_uri=self.cloudrun_image_uri)
 
+    @property
+    def summary_path(self) -> Path:
+        return self.libdir / "SUMMARY.md"
+
+    def read_summary(self) -> str:
+        """Return SUMMARY.md contents. Raises FileNotFoundError if missing."""
+        path = self.summary_path
+        if not path.exists():
+            raise FileNotFoundError(f"Library summary missing: {path}")
+        return path.read_text()
+
     @classmethod
     def numrs2(cls) -> Self:
         return cls(

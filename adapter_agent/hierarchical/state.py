@@ -16,10 +16,31 @@ logger = logging.getLogger(__name__)
 
 
 
+class RolloutSample(BaseModel):
+    """Per-sample audit metadata for one rollout in an RLGroup.
+
+    Stored as `RLGroup.samples`. `reward` lives separately in `RLGroup.rewards`
+    so the GRPO hot path keeps its tight `list[float]` representation.
+    """
+
+    answer: str
+    reasoning: str = ""
+    parsed: bool
+    success: bool
+    execution_output: str
+    verification_output: str
+
+
 class RLGroup(BaseModel):
     trajectories: list[Trajectory]
     rewards: list[float]
     sampling_client_version: int = -1
+    # Audit metadata — optional, populated by RLWorkerPool when DB persistence
+    # of rollouts is desired. None on the Ray path (TODO: plumb through).
+    suite_name: str | None = None
+    task_id: str | None = None
+    instruction: str | None = None
+    samples: list[RolloutSample] | None = None
 
 
 class TaskPool(BaseModel):

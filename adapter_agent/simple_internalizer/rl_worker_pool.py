@@ -7,14 +7,13 @@ from tinker_cookbook.completers import TokensWithLogprobs
 from tinker_cookbook.rl import Trajectory
 from tinker_cookbook.rl.types import Transition
 
-from adapter_agent.hierarchical.state import RLGroup
+from adapter_agent.hierarchical.state import RLGroup, RolloutSample
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.rl.shared_sampling_client import (
     IndexedSamplingClient,
     SharedSamplingClient,
 )
 
-from .distilled_qra_manager import DistilledQRAManager
 from .rollout_engine import RolloutEngine
 from .types import RLSource, SeedSuite
 
@@ -27,7 +26,7 @@ class RLWorkerPool:
     - `__aenter__` で seed_suites をタスクキューに seeding し、N ワーカーを stagger を
       挟んで起動する。
     - 各ワーカーは task を取り出して RolloutEngine を回し、RLGroup を結果キューへ push、
-      all-fail 時は `distilled.on_all_fail` を呼び、同じ task を再エンキューする。
+      同じ task を再エンキューする。
     - `next_group()` は結果キューから 1 グループ取り出す。
     - `__aexit__` で spawner と全ワーカーを cancel し、gather で回収する。
     """
@@ -41,7 +40,6 @@ class RLWorkerPool:
         stagger_s: float,
         num_samples: int,
         sampling_params: tinker.SamplingParams,
-        distilled: DistilledQRAManager,
         rl_seed: int = 42,
     ) -> None:
         self._engine = rollout_engine
@@ -51,7 +49,6 @@ class RLWorkerPool:
         self._stagger_s = stagger_s
         self._num_samples = num_samples
         self._sampling_params = sampling_params
-        self._distilled = distilled
         self._rl_seed = rl_seed
 
         self._tasks_queue: asyncio.Queue[tuple[Task, RLSource]] = asyncio.Queue()
@@ -107,7 +104,6 @@ class RLWorkerPool:
                 group = await self._collect_rl_group(task, source, indexed_client)
                 if group:
                     await self._results_queue.put(group)
-                    self._distilled.on_all_fail(task, group)
 
                 self._tasks_queue.task_done()
                 await self._tasks_queue.put((task, source))
@@ -132,6 +128,7 @@ class RLWorkerPool:
 
         trajectories: list[Trajectory] = []
         rewards: list[float] = []
+        samples: list[RolloutSample] = []
         for o in batch.outcomes:
             ac = TokensWithLogprobs(tokens=o.tokens, maybe_logprobs=o.logprobs)
             trajectories.append(
@@ -145,9 +142,23 @@ class RLWorkerPool:
                 )
             )
             rewards.append(1.0 if o.success else 0.0)
+            samples.append(
+                RolloutSample(
+                    answer=o.answer,
+                    reasoning=o.reasoning,
+                    parsed=o.parsed,
+                    success=o.success,
+                    execution_output=o.execution_output,
+                    verification_output=o.verification_output,
+                )
+            )
 
         return RLGroup(
             trajectories=trajectories,
             rewards=rewards,
             sampling_client_version=indexed_client.version,
+            suite_name=source.id,
+            task_id=task.id,
+            instruction=task.instruction,
+            samples=samples,
         )

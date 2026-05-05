@@ -40,6 +40,10 @@ class SimplifiedSolverEnvState:
     blocked_knowledge_ids: set[str] = field(default_factory=set)
     qwen_no_think: bool = False
     solved_subtasks: list[SolvedSubtask] = field(default_factory=list)
+    # Inline reference material pasted into the initial user message — used by
+    # QRA-synthesis flows where the solver is shown the source Knowledge as
+    # ground truth instead of having to discover it via wiki/doc tools.
+    reference_knowledge: str | None = None
 
     @classmethod
     def for_library(
@@ -51,6 +55,7 @@ class SimplifiedSolverEnvState:
         qwen_no_think: bool = False,
         moc_content: str | None = None,
         solved_subtasks: list[SolvedSubtask] | None = None,
+        reference_knowledge: str | None = None,
     ) -> Self:
         return cls(
             task=task,
@@ -61,6 +66,7 @@ class SimplifiedSolverEnvState:
             qwen_no_think=qwen_no_think,
             moc_content=moc_content,
             solved_subtasks=solved_subtasks or [],
+            reference_knowledge=reference_knowledge,
         )
 
     def with_messages(self, messages: list[TinkerMessage]) -> Self:
@@ -73,6 +79,7 @@ class SimplifiedSolverEnvState:
             qwen_no_think=self.qwen_no_think,
             moc_content=self.moc_content,
             solved_subtasks=self.solved_subtasks,
+            reference_knowledge=self.reference_knowledge,
         )
 
 
@@ -91,7 +98,9 @@ class SimplifiedSolverEnv(MessageEnv):
     initial_state: SimplifiedSolverEnvState
     runtime_settings: RuntimeSettings
     search_model: Any
-    wiki_manager: WikiManager
+    # `None` disables wiki tools entirely — the env rejects `<wiki_ls/>` and
+    # `<wiki_read>` and the prompt is built without any wiki section.
+    wiki_manager: WikiManager | None
     rust_doc_analyzer: AsyncRustDocAnalyzer
     initial_messages: list[TinkerMessage]
     reward_fn: LLMAsAJudgeSingleTurn
@@ -244,6 +253,22 @@ class SimplifiedSolverEnv(MessageEnv):
                 # Check for Wiki Exploration Tools
                 ls_match = re.search(r"<wiki_ls\s*/>", text_content)
                 if ls_match:
+                    if self.wiki_manager is None:
+                        content = (
+                            "[SYSTEM ERROR] WIKI_DISABLED\n"
+                            "The Wiki is not available in this environment. "
+                            "`<wiki_ls />` and `<wiki_read>` are disabled. "
+                            "Use `<search_library_doc>` and `<write_and_run>` instead.\n"
+                            f"\n[STATUS]\nRemainingTurns: {self.mutable_state.remaining_turns}"
+                        )
+                        new_message = TinkerMessage(role="user", content=content)
+                        self.history.append(new_message)
+                        return SSStepResult(
+                            reward=0.0,
+                            episode_done=False,
+                            next_messages=self.history,
+                            conclusion="not_finished",
+                        )
                     titles = await self.wiki_manager.ls()
                     title_list = (
                         "\n".join([f"- [[{t}]]" for t in titles])
@@ -269,6 +294,22 @@ class SimplifiedSolverEnv(MessageEnv):
                     r"<wiki_read>(.*?)</wiki_read>", text_content, re.DOTALL
                 )
                 if read_matches:
+                    if self.wiki_manager is None:
+                        content = (
+                            "[SYSTEM ERROR] WIKI_DISABLED\n"
+                            "The Wiki is not available in this environment. "
+                            "`<wiki_ls />` and `<wiki_read>` are disabled. "
+                            "Use `<search_library_doc>` and `<write_and_run>` instead.\n"
+                            f"\n[STATUS]\nRemainingTurns: {self.mutable_state.remaining_turns}"
+                        )
+                        new_message = TinkerMessage(role="user", content=content)
+                        self.history.append(new_message)
+                        return SSStepResult(
+                            reward=0.0,
+                            episode_done=False,
+                            next_messages=self.history,
+                            conclusion="not_finished",
+                        )
                     search_limit = self.mutable_state.total_turns // 2
                     if self.mutable_state.search_count >= search_limit:
                         content = (
@@ -411,57 +452,73 @@ class SimplifiedSolverEnv(MessageEnv):
 
 def get_simplified_solver_initial_messages(
     env_state: SimplifiedSolverEnvState,
-    tree_structure: str,
     tools: list[ToolSpec],
     renderer: Renderer | None,
+    wiki_enabled: bool = True,
 ) -> list[TinkerMessage]:
+    # Tool catalog. Wiki tools are conditional; the rest are always present.
+    tool_bullets = []
+    if wiki_enabled:
+        tool_bullets.append(
+            "- `<wiki_ls />` — list all available Wiki articles."
+        )
+        tool_bullets.append(
+            "- `<wiki_read>Article_Title</wiki_read>` — read a Wiki article. Up to 5 `<wiki_read>` tags may be combined in one response."
+        )
+    tool_bullets.append(
+        f"- `<search_library_doc>query</search_library_doc>` — official Rust docs for `{env_state.library_name}` (signatures, error codes)."
+    )
+    tool_bullets.append(
+        "- `<write_and_run>...rust source...</write_and_run>` — overwrite `src/main.rs` with the contents and run `cargo run`; output is returned to you."
+    )
+    tool_bullets.append(
+        "- `<submit>...rust source...</submit>` — your final `src/main.rs`. ENDS the task and triggers verification."
+    )
+    tool_block = "\n".join(tool_bullets)
+
+    one_tag_rule = (
+        "Emit EXACTLY ONE tool tag per response."
+        + (" (Multiple `<wiki_read>` tags in one response are allowed.)" if wiki_enabled else "")
+        + " The system processes only the first tag it finds."
+    )
+
     PROMPT = f"""<Role>
-You are a Rust engineer.
-Your goal is to create a solution to achieve the user's request through the iterative process.
-You create a solution using simple playground to find the correct code.
+You are a Rust engineer iteratively solving a coding task in a cargo project.
+The `{env_state.library_name}` library is preinstalled as a dependency; its API is new to you and not in your training data.
 </Role>
 
-<Context>
-You are working in a cargo-initialized project.
-You need to solve the problem using `{env_state.library_name}` library which is already installed as a dependency (e.g. via `cargo add`).
-Note `{env_state.library_name}` is a new library you should be unfamilier with.
-</Context>
+<Tools>
+{one_tag_rule}
 
-<HowTo>
-You have a simplified coding environment with the following tools:
-- `wiki_ls`: Use `<wiki_ls />` to list all available Wiki articles.
-- `wiki_read`: Use `<wiki_read>Article_Title</wiki_read>` to read specific knowledge. You can use up to 5 `<wiki_read>` tags in a single response to read multiple articles at once.
-- `search_library_doc`: Use `<search_library_doc>query</search_library_doc>` to search official Rust documentation for specific API signatures or error details.
-
-IMPORTANT: You MUST ONLY use ONE tool tag (`<wiki_ls />`, `<wiki_read>`, `<search_library_doc>`, `<write_and_run>`, or `<submit>`) in a single response, EXCEPT for `<wiki_read>` which allows up to 5 tags simultaneously. Do not mix `<wiki_read>` with other tools.
-The system will only process the FIRST tag it detects if the response is valid (except for multiple `<wiki_read>` tags).
-
-To TEST your code implementation without ending the task, simply output your Rust code inside plain XML tags like this (do NOT use JSON!):
-<write_and_run>
-fn main() {{
-    // your test code here
-}}
-</write_and_run>
-The system will automatically extract the code, write it to `src/main.rs`, run `cargo run`, and give you the output to help you iterate.
-
-Once you confirmed that the solution works, you must output your FINAL answer as a complete, fully functioning source code enclosed in a `<submit> ... </submit>` block. You can also provide any necessary explanation.
-Note: Outputting a `<submit> ... </submit>` block will IMMEDIATELY SUBMIT your answer and run the final verification, which will END the task.
-</HowTo>
-
-<MandatoryFirstStep>
-Before writing any code or searching for documentation, you MUST first review the available knowledge in the Wiki. 
-Start by checking the articles mentioned in the `<MapOfContent>` and reading them using `<wiki_read>` to understand the established patterns and APIs. 
-This is critical to avoid hallucinations and ensure your code aligns with the project's architecture.
-</MandatoryFirstStep>
-
-<ResourceManagement>
-At the end of every tool response, you will see a `[STATUS]` section:
-- `RemainingSearchQuota`: Number of `search_library_doc` or `wiki_read` turns you can still make. Note that `wiki_read` consumes 1 quota per turn regardless of how many articles (up to 5) are read. `wiki_ls` does NOT consume this quota.
-- `RemainingTurns`: Total number of actions (turns) remaining before the task is forced to end.
-</ResourceManagement>
+{tool_block}
+</Tools>
 """
 
-    if env_state.moc_content:
+    guideline_bullets = []
+    if wiki_enabled:
+        guideline_bullets.append(
+            "- Start by exploring the Wiki via `<MapOfContent>` and `<wiki_read>` before writing code."
+        )
+        guideline_bullets.append(
+            "- `search_library_doc` is a fallback for what the Wiki doesn't cover."
+        )
+    else:
+        guideline_bullets.append(
+            "- `<ReferenceKnowledge>` (when provided) is authoritative for the library API. Prefer it over guessing."
+        )
+        guideline_bullets.append(
+            "- Use `search_library_doc` only for what reference knowledge doesn't cover."
+        )
+    guideline_bullets.append(
+        "- Always verify with `<write_and_run>` before `<submit>`."
+    )
+    if env_state.solved_subtasks:
+        guideline_bullets.append(
+            "- `<SolvedSubtasks>` shows verified solutions to related problems — reuse the patterns."
+        )
+    PROMPT += f"\n<Guidelines>\n{chr(10).join(guideline_bullets)}\n</Guidelines>\n"
+
+    if wiki_enabled and env_state.moc_content:
         PROMPT += f"\n<MapOfContent>\n{env_state.moc_content}\n</MapOfContent>\n"
 
     if env_state.solved_subtasks:
@@ -475,37 +532,19 @@ At the end of every tool response, you will see a `[STATUS]` section:
             )
         PROMPT += (
             "\n<SolvedSubtasks>\n"
-            "You previously solved the following related sub-problems. "
-            "Their final, verified solutions are shown so you can reuse the approach in your current task.\n\n"
             + "\n\n".join(subtask_blocks)
             + "\n</SolvedSubtasks>\n"
         )
 
-    guidelines = """\
-Verification: Once again, you MUST verify your answer. You should make your best efforts to avoid hallucination and make sure your answer is correct.
-Self-contained: Note your solution has been fully self-contained including both fully functioning source code and explanation.
-Testing Code: Before submitting the final answer, use the `<write_and_run>...</write_and_run>` tags to test code and see outputs. Avoid JSON syntax errors.
-One Action at a Time: You MUST only use one tool tag per turn. Response containing multiple tags (e.g. two searches or a search and a test) will be rejected.
-Code block inclusion: Your final answer MUST include exactly one `<submit>\\n<your_code_here>\\n</submit>` block. Its content will be pasted to main.rs and executed for final verification to END the task.
-Wiki Exploration: Always check the internal Wiki (`wiki_ls`, `wiki_read`) first for high-quality, project-specific knowledge. Use the provided `<MapOfContent>` as your primary index to find relevant articles. You are encouraged to read multiple related articles in a single turn (up to 5) to save turns and quota.
-Documentation Fallback: Use `search_library_doc` only if the Wiki does not contain the necessary information. Note that this tool provides raw technical details from the crate's official documentation.
-Error Reflection: If `<write_and_run>` test fails, analyze the compiler error carefully. Check the Wiki or documentation for specific causes of the error code (e.g., E0308).
-Solved Subtasks: If a `<SolvedSubtasks>` section is provided, study the included `<Problem>` and `<Solution>` pairs first as concrete reference implementations before writing new code.
-"""
-    PROMPT += f"\n<Guidelines>\n{guidelines}\n</Guidelines>"
-
     initial_message = f"""<Task>
 {env_state.task.instruction}
 </Task>
-
-<Current Directory Structure>
-{tree_structure}
-</Current Directory Structure>
-
-<Current src/main.rs>
-{CARGO_INIT_MAIN_RS}
-</Current src/main.rs>
 """
+
+    if env_state.reference_knowledge:
+        initial_message += (
+            f"\n<ReferenceKnowledge>\n{env_state.reference_knowledge}\n</ReferenceKnowledge>\n"
+        )
 
     if env_state.qwen_no_think:
         initial_message = "/no_think " + initial_message
@@ -526,7 +565,7 @@ async def build_simplified_solver_msg_env(
     rust_doc_analyzer: AsyncRustDocAnalyzer,
     runtime_settings: RuntimeSettings,
     search_model: Any,
-    wiki_manager: WikiManager,
+    wiki_manager: WikiManager | None,
     max_turns: int = 10,
     renderer: Renderer | None = None,
 ) -> SimplifiedSolverEnv:
@@ -534,9 +573,12 @@ async def build_simplified_solver_msg_env(
     async with runtime_settings.build_runtime() as runtime:
         tree_structure = await runtime.tree(".", exclude=exclude, truncate=20)
 
-    # Fetch root MOC.md from Wiki
-    moc_content = await wiki_manager.read("MOC.md")
-    env_state.moc_content = moc_content
+    if wiki_manager is not None:
+        # Fetch root MOC.md from Wiki
+        moc_content = await wiki_manager.read("MOC.md")
+        env_state.moc_content = moc_content
+    else:
+        env_state.moc_content = None
 
     mutable_state = SimplifiedSolverMutableState(
         remaining_turns=max_turns, total_turns=max_turns
@@ -550,9 +592,9 @@ async def build_simplified_solver_msg_env(
         rust_doc_analyzer=rust_doc_analyzer,
         initial_messages=get_simplified_solver_initial_messages(
             env_state=env_state,
-            tree_structure=tree_structure,
             tools=[],
             renderer=renderer,
+            wiki_enabled=wiki_manager is not None,
         ),
         reward_fn=LLMAsAJudgeSingleTurn(
             task=env_state.task,

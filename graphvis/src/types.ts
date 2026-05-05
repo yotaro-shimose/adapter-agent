@@ -94,24 +94,86 @@ export interface TaskSummary {
   latest_created_at: string | null;
 }
 
-export interface OpenBookQA {
-  id: number;
-  knowledge_id: string;
-  title: string;
-  question: string;
-  answer: string;
+export interface SimpleRun {
+  simple_train_id: string;
+  created_at: string | null;
+  latest_rollout_at: string | null;
+  total_rollouts: number;
+  success_count: number;
+  max_rl_step: number | null;
 }
 
-export interface OpenBookTrajectory {
+export interface SimpleRunStepSummary {
+  rl_step: number;
+  suite_name: string;
+  total_count: number;
+  success_count: number;
+  avg_reward: number | null;
+  unique_tasks: number;
+}
+
+export interface SimpleRolloutListItem {
   id: number;
-  qa_id: number;
+  rl_step: number;
+  suite_name: string;
+  task_id: string;
+  group_idx: number;
+  sample_idx: number;
+  num_samples: number;
+  instruction: string;
+  parsed: boolean;
+  success: boolean;
+  reward: number;
+  sampling_client_version: number;
+  created_at: string | null;
+}
+
+export interface SimpleRolloutDetail extends SimpleRolloutListItem {
+  simple_train_id: string;
+  answer: string;
+  reasoning: string;
+  execution_output: string;
+  verification_output: string;
+}
+
+export interface SftCacheSummary {
+  id: string;
+  granular_id: string | null;
+  library_name: string | null;
+  description: string | null;
+  created_at: string | null;
+  latest_item_at: string | null;
+  total_items: number;
+  verified_items: number;
+  unique_knowledges: number;
+}
+
+export interface SftCacheItemListItem {
+  id: number;
+  cache_id: string;
+  knowledge_id: string;
+  knowledge_title: string;
   question: string;
-  hint: string;
+  verified: boolean;
+  conclusion: string;
+  created_at: string | null;
+}
+
+export interface SftTrialMessage {
+  role: 'system' | 'user' | 'assistant' | 'tool' | string;
+  content: string | ContentPart[];
+  // tinker messages may carry tool_calls / tool_call_id but the synthesis
+  // solver doesn't use them (XML tag-based protocol instead).
+  tool_calls?: unknown;
+  tool_call_id?: unknown;
+  [k: string]: unknown;
+}
+
+export interface SftCacheItemDetail extends SftCacheItemListItem {
   reasoning: string;
   answer: string;
-  success: boolean;
-  dataset: 'train' | 'holdout' | null;
-  execution_output?: string | null;
-  verification_output?: string | null;
+  verifier_reasoning: string;
+  reward: number | null;
+  trials: SftTrialMessage[] | null;
 }
 

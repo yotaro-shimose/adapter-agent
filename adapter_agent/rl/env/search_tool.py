@@ -28,7 +28,7 @@ class SearchTool(Tool):
     def __init__(
         self,
         analyzer: AsyncRustDocAnalyzer,
-        wiki_manager: WikiManager,
+        wiki_manager: WikiManager | None,
         mutable_state: SimplifiedSolverMutableState,
     ):
         self.analyzer = analyzer

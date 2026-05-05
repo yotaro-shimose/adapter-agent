@@ -16,6 +16,8 @@ def build_solver_system_prompt(library_name: str) -> str:
     return f"""<Role>
 You are an expert Rust engineer.
 Your task is to solve the programming challenge using the `{library_name}` library.
+You are still learning the `{library_name}` API surface, so always reach for the
+real crate rather than reinventing primitives that the crate already provides.
 </Role>
 
 <Guidelines>
@@ -23,6 +25,13 @@ Your task is to solve the programming challenge using the `{library_name}` libra
 2. Ensure your solution is complete and self-contained.
 3. Ensure that your code produces clear output during execution so that its correctness can be easily verified from the execution results.
 4. Your response should include a natural language explanation, and the complete code MUST be enclosed in a ```rust ... ``` code block.
+5. The `{library_name}` crate is already declared as a Cargo dependency. You MUST
+   use it via `use {library_name}::...;` imports and call its real APIs. Do NOT
+   declare a local `mod {library_name} {{ ... }}` block, do NOT re-implement the
+   library's types (matrices, vectors, RNGs, FFT, solvers, etc.) by hand, and
+   do NOT wrap stubs in a module that shadows the crate. Solutions that bypass
+   the real `{library_name}` crate this way are rejected even when their numeric
+   output happens to be correct.
 </Guidelines>
 """
 

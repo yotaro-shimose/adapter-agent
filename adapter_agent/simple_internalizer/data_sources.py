@@ -97,25 +97,37 @@ async def generate_qras_cached(
     generator: GeneratorAgent,
     knowledge: Knowledge,
     count: int,
-    prefix: str,
-    cache_dir: Path,
+    cache_id: str,
+    prisma_client: Prisma,
     generation_concurrency: int,
     is_coding: bool = True,
 ) -> list[QRA]:
-    """Generate `count` QRAs for one knowledge item, caching the result on disk.
+    """Generate `count` QRAs for one knowledge item, caching rows in `sft_cache_items`.
 
-    The semaphore caps in-flight LLM calls. The QRA generator is allowed to
-    return None (model failure); we retry until a valid QRA comes back.
+    Lookup key: (cache_id, knowledge_id). If at least `count` rows already exist
+    we return the first `count`; otherwise we generate the deficit, INSERT, and
+    return the union. Caller must ensure `cache_id` exists in `sft_caches`
+    (use `ensure_sft_cache(...)` once per batch).
     """
-    cache_file = cache_dir / f"{knowledge.id}_{prefix}_{count}.pkl"
-    if cache_file.exists():
+    existing = await prisma_client.sftcacheitem.find_many(
+        where={"cache_id": cache_id, "knowledge_id": knowledge.id},
+        order={"id": "asc"},
+        take=count,
+    )
+    if len(existing) >= count:
         logger.info(
-            f"Loading {count} {prefix} QRAs for '{knowledge.title}' from cache."
+            f"Cache hit: {count} {cache_id} QRAs for '{knowledge.title}'."
         )
-        with open(cache_file, "rb") as f:
-            return pickle.load(f)
+        return [
+            QRA(question=r.question, reasoning=r.reasoning, answer=r.answer)
+            for r in existing[:count]
+        ]
 
-    logger.info(f"Generating {count} {prefix} QRAs for '{knowledge.title}'...")
+    deficit = count - len(existing)
+    logger.info(
+        f"Generating {deficit} {cache_id} QRAs for '{knowledge.title}' "
+        f"(found {len(existing)} in cache)..."
+    )
     sem = asyncio.Semaphore(generation_concurrency)
 
     async def _gen() -> QRA:
@@ -130,13 +142,52 @@ async def generate_qras_cached(
                     return qra
                 await asyncio.sleep(0.1)
 
-    results: list[QRA] = await asyncio.gather(*[_gen() for _ in range(count)])
+    new_qras: list[QRA] = await asyncio.gather(*[_gen() for _ in range(deficit)])
 
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    with open(cache_file, "wb") as f:
-        pickle.dump(results, f)
+    if new_qras:
+        await prisma_client.sftcacheitem.create_many(
+            data=[
+                {
+                    "cache_id": cache_id,
+                    "knowledge_id": knowledge.id,
+                    "knowledge_title": knowledge.title,
+                    "question": q.question,
+                    "reasoning": q.reasoning,
+                    "answer": q.answer,
+                }
+                for q in new_qras
+            ]
+        )
 
-    return results
+    return [
+        QRA(question=r.question, reasoning=r.reasoning, answer=r.answer)
+        for r in existing
+    ] + new_qras
+
+
+async def ensure_sft_cache(
+    prisma_client: Prisma,
+    cache_id: str,
+    *,
+    granular_id: str | None = None,
+    library_name: str | None = None,
+    description: str | None = None,
+) -> None:
+    """Idempotent upsert of the parent `sft_caches` row. Call once per batch
+    before invoking `generate_qras_cached` so the FK in `sft_cache_items` resolves.
+    """
+    await prisma_client.sftcache.upsert(
+        where={"id": cache_id},
+        data={
+            "create": {
+                "id": cache_id,
+                "granular_id": granular_id,
+                "library_name": library_name,
+                "description": description,
+            },
+            "update": {},
+        },
+    )
 
 
 async def load_study_root_qras_cached(
@@ -245,34 +296,45 @@ async def build_knowledge_suites(
     generator: GeneratorAgent,
     knowledge_list: list[Knowledge],
     k_per_knowledge: int,
-    cache_dir: Path,
-    name_prefix: str,
+    cache_id: str,
+    prisma_client: Prisma,
     for_rl: bool,
     for_eval: bool,
+    name_prefix: str | None = None,
+    granular_id: str | None = None,
+    library_name: str | None = None,
     generation_concurrency: int = 400,
 ) -> list[SeedSuite]:
     """One SeedSuite per knowledge item, each holding `k_per_knowledge`
-    LLM-generated question tasks. Suite name = f"{name_prefix}__{knowledge.title}"
+    LLM-generated question tasks. Suite name = f"{name_prefix or cache_id}__{knowledge.title}"
     so per-knowledge metrics & DB rows stay separable."""
+    await ensure_sft_cache(
+        prisma_client,
+        cache_id,
+        granular_id=granular_id,
+        library_name=library_name,
+        description=f"build_knowledge_suites k={k_per_knowledge}",
+    )
     suites_per_k = await asyncio.gather(
         *[
             generate_qras_cached(
                 generator=generator,
                 knowledge=k,
                 count=k_per_knowledge,
-                prefix=name_prefix,
-                cache_dir=cache_dir,
+                cache_id=cache_id,
+                prisma_client=prisma_client,
                 generation_concurrency=generation_concurrency,
             )
             for k in knowledge_list
         ]
     )
+    suite_prefix = name_prefix or cache_id
     suites: list[SeedSuite] = []
     for k, qras in zip(knowledge_list, suites_per_k):
         tasks = [Task(instruction=q.question) for q in qras]
         suites.append(
             SeedSuite(
-                name=f"{name_prefix}__{k.title}",
+                name=f"{suite_prefix}__{k.title}",
                 tasks=tasks,
                 for_rl=for_rl,
                 for_eval=for_eval,

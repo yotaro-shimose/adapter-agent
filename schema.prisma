@@ -57,8 +57,8 @@ model Knowledge {
 model SimpleTrainRun {
   id              String   @id // simple_train_id
   created_at      DateTime @default(now())
-  sft_qnas        SimpleSftQna[]
   star_qnas       StarQna[]
+  rl_rollouts     SimpleRlRollout[]
 
   @@map("simple_train_runs")
   granular_knowledges GranularKnowledge[]
@@ -79,25 +79,79 @@ model GranularKnowledge {
   @@index([simple_train_id])
 }
 
-model SimpleSftQna {
+// User-named cache of generated QRAs, keyed by `id` (e.g. "PoC", "hisab_sft_v1").
+// Replaces both the old per-knowledge pickle cache AND the dead `simple_sft_qnas`
+// audit log — same row is now both the cache lookup and the audit.
+model SftCache {
+  id           String   @id
+  granular_id  String?  // source granular knowledge batch
+  library_name String?
+  description  String?
+  created_at   DateTime @default(now())
+  items        SftCacheItem[]
+
+  @@map("sft_caches")
+}
+
+model SftCacheItem {
   id              Int      @id @default(autoincrement())
-  simple_train_id String
-  simple_train    SimpleTrainRun @relation(fields: [simple_train_id], references: [id], onDelete: Cascade)
+  cache_id        String
+  cache           SftCache @relation(fields: [cache_id], references: [id], onDelete: Cascade)
 
   knowledge_id    String
   knowledge_title String
-
   question        String
-  reasoning       String
+  reasoning       String   @default("")
   answer          String
+
+  // PoC / synthesis flow only — empty for plain pickle-replacement caches.
+  // `verified=true` means the answer was checked end-to-end via ss_solve_verify.
+  verified           Boolean  @default(false)
+  verifier_reasoning String   @default("")
+  conclusion         String   @default("")
+  // Multi-turn investigation log from the synthesis-solver (system/user/assistant
+  // messages, tool tags & their results). Null for non-synthesis caches.
+  trials_json        Json?
+  reward             Float?
 
   created_at      DateTime @default(now())
 
-  @@map("simple_sft_qnas")
-  @@index([simple_train_id])
+  @@map("sft_cache_items")
+  @@index([cache_id])
   @@index([knowledge_id])
-
 }
+
+model SimpleRlRollout {
+  id                  Int      @id @default(autoincrement())
+  simple_train_id     String
+  simple_train        SimpleTrainRun @relation(fields: [simple_train_id], references: [id], onDelete: Cascade)
+
+  rl_step             Int
+  suite_name          String   // e.g. "knowledge_rl__title", "gh_archive_rl"
+  task_id             String   // Task.id (stable within run)
+
+  // One row per (group, sample). `sample_idx` indexes within the group.
+  group_idx           Int      // 0..N for groups produced this iter
+  sample_idx          Int      // 0..num_samples-1 within the group
+  num_samples         Int      // group size (= rollout.num_samples)
+
+  instruction         String
+  answer              String
+  reasoning           String   @default("")
+  parsed              Boolean
+  success             Boolean
+  reward              Float
+  execution_output    String
+  verification_output String
+  sampling_client_version Int
+
+  created_at          DateTime @default(now())
+
+  @@map("simple_rl_rollouts")
+  @@index([simple_train_id])
+  @@index([simple_train_id, rl_step])
+}
+
 
 model StarQna {
   id              Int      @id @default(autoincrement())
@@ -131,48 +185,3 @@ model WikiArticle {
   @@map("wiki_articles")
 }
 
-model OpenBookExperiment {
-  experiment_name String   @id
-  created_at      DateTime @default(now())
-  qnas            OpenBookQA[]
-  trajectories    OpenBookTrajectory[]
-
-  @@map("openbook_experiments")
-}
-
-model OpenBookQA {
-  id              Int                @id @default(autoincrement())
-  experiment_name String
-  experiment      OpenBookExperiment @relation(fields: [experiment_name], references: [experiment_name], onDelete: Cascade)
-  
-  knowledge_id    String
-  title           String
-  question        String
-  answer          String
-  
-  @@map("openbook_qnas")
-  @@index([experiment_name])
-}
-
-model OpenBookTrajectory {
-  id              Int                @id @default(autoincrement())
-  experiment_name String
-  experiment      OpenBookExperiment @relation(fields: [experiment_name], references: [experiment_name], onDelete: Cascade)
-
-  qa_id           Int
-  
-  question        String
-  hint            String
-
-  reasoning       String
-  answer          String
-  success         Boolean
-  
-  execution_output    String?
-  verification_output String?
-  
-  dataset         String?  // "train" or "holdout"
-  
-  @@map("openbook_trajectories")
-  @@index([experiment_name])
-}

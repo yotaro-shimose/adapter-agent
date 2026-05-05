@@ -229,56 +229,277 @@ async def get_wiki_article_content(version: str, title: str):
         "updated_at": article.updated_at.isoformat()
     }
 
-@app.get("/api/openbook/experiments")
-async def list_openbook_experiments():
-    try:
-        client = await _db_manager.get_client()
-        experiments = await client.openbookexperiment.find_many(
-            order={"created_at": "desc"}
-        )
-        return [e.experiment_name for e in experiments]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+# --- SIMPLE RL ROLLOUT ENDPOINTS ---
+# Per-script-execution view: each `run_continue_rl.py` invocation produces
+# a unique `simple_train_id` ("<prefix>_<timestamp>") and writes rows to
+# `simple_rl_rollouts`. These endpoints surface that table.
 
-@app.get("/api/openbook/{experiment_name}/data")
-async def get_openbook_data(experiment_name: str):
+@app.get("/api/simple_runs")
+async def list_simple_runs():
+    """Per simple_train_id summary: created_at + step/rollout counts.
+
+    Aggregates on the SQL side so the response stays small even with
+    many runs and 100k+ rollouts each.
+    """
     client = await _db_manager.get_client()
-    
-    qas = await client.openbookqa.find_many(
-        where={"experiment_name": experiment_name},
-        order={"knowledge_id": "asc"}
+    rows = await client.query_raw(
+        '''
+        SELECT
+            r.id AS simple_train_id,
+            r.created_at AS created_at,
+            COALESCE(s.total_rollouts, 0)::int AS total_rollouts,
+            COALESCE(s.success_count, 0)::int AS success_count,
+            s.max_rl_step,
+            s.latest_rollout_at
+        FROM simple_train_runs r
+        LEFT JOIN (
+            SELECT
+                simple_train_id,
+                COUNT(*) AS total_rollouts,
+                SUM(CASE WHEN success THEN 1 ELSE 0 END) AS success_count,
+                MAX(rl_step) AS max_rl_step,
+                MAX(created_at) AS latest_rollout_at
+            FROM simple_rl_rollouts
+            GROUP BY simple_train_id
+        ) s ON s.simple_train_id = r.id
+        WHERE COALESCE(s.total_rollouts, 0) > 0
+        ORDER BY COALESCE(s.latest_rollout_at, r.created_at) DESC
+        ''',
     )
-    
-    trajectories = await client.openbooktrajectory.find_many(
-        where={"experiment_name": experiment_name},
-        order={"id": "asc"}
+    return [
+        {
+            "simple_train_id": r["simple_train_id"],
+            "created_at": r.get("created_at"),
+            "latest_rollout_at": r.get("latest_rollout_at"),
+            "total_rollouts": r["total_rollouts"],
+            "success_count": r["success_count"],
+            "max_rl_step": r.get("max_rl_step"),
+        }
+        for r in rows
+    ]
+
+
+@app.get("/api/simple_runs/{simple_train_id}/summary")
+async def get_simple_run_summary(simple_train_id: str):
+    """Per-(rl_step, suite_name) aggregates for one run."""
+    client = await _db_manager.get_client()
+    rows = await client.query_raw(
+        '''
+        SELECT
+            rl_step,
+            suite_name,
+            COUNT(*)::int AS total_count,
+            SUM(CASE WHEN success THEN 1 ELSE 0 END)::int AS success_count,
+            AVG(reward)::float AS avg_reward,
+            COUNT(DISTINCT task_id)::int AS unique_tasks
+        FROM simple_rl_rollouts
+        WHERE simple_train_id = $1
+        GROUP BY rl_step, suite_name
+        ORDER BY rl_step ASC, suite_name ASC
+        ''',
+        simple_train_id,
     )
-    
+    return [
+        {
+            "rl_step": r["rl_step"],
+            "suite_name": r["suite_name"],
+            "total_count": r["total_count"],
+            "success_count": r["success_count"],
+            "avg_reward": r.get("avg_reward"),
+            "unique_tasks": r["unique_tasks"],
+        }
+        for r in rows
+    ]
+
+
+@app.get("/api/simple_runs/{simple_train_id}/rollouts")
+async def list_simple_run_rollouts(
+    simple_train_id: str,
+    rl_step: int | None = None,
+    suite_name: str | None = None,
+    task_id: str | None = None,
+    success: str | None = None,  # "true"/"false"/None
+    limit: int = 500,
+):
+    """List rollout rows for a run with optional filters.
+
+    Excludes the heavy `answer`/`execution_output`/`verification_output`
+    columns to keep this fast — fetch a single row via /rollout/{id}.
+    """
+    client = await _db_manager.get_client()
+    where: dict = {"simple_train_id": simple_train_id}
+    if rl_step is not None:
+        where["rl_step"] = rl_step
+    if suite_name is not None:
+        where["suite_name"] = suite_name
+    if task_id is not None:
+        where["task_id"] = task_id
+    if success in ("true", "false"):
+        where["success"] = success == "true"
+
+    rows = await client.simplerlrollout.find_many(
+        where=where,
+        order=[{"rl_step": "desc"}, {"group_idx": "asc"}, {"sample_idx": "asc"}],
+        take=max(1, min(limit, 5000)),
+    )
+    return [
+        {
+            "id": r.id,
+            "rl_step": r.rl_step,
+            "suite_name": r.suite_name,
+            "task_id": r.task_id,
+            "group_idx": r.group_idx,
+            "sample_idx": r.sample_idx,
+            "num_samples": r.num_samples,
+            "instruction": r.instruction,
+            "parsed": r.parsed,
+            "success": r.success,
+            "reward": r.reward,
+            "sampling_client_version": r.sampling_client_version,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in rows
+    ]
+
+
+@app.get("/api/simple_runs/{simple_train_id}/rollout/{rollout_id}")
+async def get_simple_run_rollout(simple_train_id: str, rollout_id: int):
+    """Full content for a single rollout (heavy fields included)."""
+    client = await _db_manager.get_client()
+    r = await client.simplerlrollout.find_unique(where={"id": rollout_id})
+    if not r or r.simple_train_id != simple_train_id:
+        raise HTTPException(status_code=404, detail="Rollout not found in this run")
     return {
-        "qas": [
-            {
-                "id": q.id,
-                "knowledge_id": q.knowledge_id,
-                "title": q.title,
-                "question": q.question,
-                "answer": q.answer
-            } for q in qas
-        ],
-        "trajectories": [
-            {
-                "id": t.id,
-                "qa_id": t.qa_id,
-                "question": t.question,
-                "hint": t.hint,
-                "reasoning": t.reasoning,
-                "answer": t.answer,
-                "success": t.success,
-                "dataset": t.dataset,
-                "execution_output": t.execution_output,
-                "verification_output": t.verification_output
-            } for t in trajectories
-        ]
+        "id": r.id,
+        "simple_train_id": r.simple_train_id,
+        "rl_step": r.rl_step,
+        "suite_name": r.suite_name,
+        "task_id": r.task_id,
+        "group_idx": r.group_idx,
+        "sample_idx": r.sample_idx,
+        "num_samples": r.num_samples,
+        "instruction": r.instruction,
+        "answer": r.answer,
+        "reasoning": getattr(r, "reasoning", "") or "",
+        "parsed": r.parsed,
+        "success": r.success,
+        "reward": r.reward,
+        "execution_output": r.execution_output,
+        "verification_output": r.verification_output,
+        "sampling_client_version": r.sampling_client_version,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
     }
+
+
+# --- SFT CACHE ENDPOINTS ---
+# User-named caches of generated QRAs (replaces the old pickle cache + the
+# dropped `simple_sft_qnas` audit log). Keyed by `SftCache.id`.
+
+@app.get("/api/sft_caches")
+async def list_sft_caches():
+    """Per-cache summary: `(id, granular_id, library_name, total/verified counts, latest_at)`."""
+    client = await _db_manager.get_client()
+    rows = await client.query_raw(
+        '''
+        SELECT
+            c.id AS id,
+            c.granular_id AS granular_id,
+            c.library_name AS library_name,
+            c.description AS description,
+            c.created_at AS created_at,
+            COALESCE(s.total_items, 0)::int AS total_items,
+            COALESCE(s.verified_items, 0)::int AS verified_items,
+            COALESCE(s.unique_knowledges, 0)::int AS unique_knowledges,
+            s.latest_item_at
+        FROM sft_caches c
+        LEFT JOIN (
+            SELECT
+                cache_id,
+                COUNT(*) AS total_items,
+                SUM(CASE WHEN verified THEN 1 ELSE 0 END) AS verified_items,
+                COUNT(DISTINCT knowledge_id) AS unique_knowledges,
+                MAX(created_at) AS latest_item_at
+            FROM sft_cache_items
+            GROUP BY cache_id
+        ) s ON s.cache_id = c.id
+        ORDER BY COALESCE(s.latest_item_at, c.created_at) DESC
+        ''',
+    )
+    return [
+        {
+            "id": r["id"],
+            "granular_id": r.get("granular_id"),
+            "library_name": r.get("library_name"),
+            "description": r.get("description"),
+            "created_at": r.get("created_at"),
+            "latest_item_at": r.get("latest_item_at"),
+            "total_items": r["total_items"],
+            "verified_items": r["verified_items"],
+            "unique_knowledges": r["unique_knowledges"],
+        }
+        for r in rows
+    ]
+
+
+@app.get("/api/sft_caches/{cache_id}/items")
+async def list_sft_cache_items(
+    cache_id: str,
+    knowledge_id: str | None = None,
+    verified: str | None = None,  # "true"/"false"/None
+    limit: int = 500,
+):
+    """Item list for a cache. Heavy fields (`answer`, `verifier_reasoning`)
+    are excluded — use /item/{id} for full content."""
+    client = await _db_manager.get_client()
+    where: dict = {"cache_id": cache_id}
+    if knowledge_id is not None:
+        where["knowledge_id"] = knowledge_id
+    if verified in ("true", "false"):
+        where["verified"] = verified == "true"
+    rows = await client.sftcacheitem.find_many(
+        where=where,
+        order=[{"id": "asc"}],
+        take=max(1, min(limit, 5000)),
+    )
+    return [
+        {
+            "id": r.id,
+            "cache_id": r.cache_id,
+            "knowledge_id": r.knowledge_id,
+            "knowledge_title": r.knowledge_title,
+            "question": r.question,
+            "verified": r.verified,
+            "conclusion": r.conclusion,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in rows
+    ]
+
+
+@app.get("/api/sft_caches/{cache_id}/item/{item_id}")
+async def get_sft_cache_item(cache_id: str, item_id: int):
+    """Full content for a single SFT cache item, including the multi-turn
+    investigation log (`trials`) when available."""
+    client = await _db_manager.get_client()
+    r = await client.sftcacheitem.find_unique(where={"id": item_id})
+    if not r or r.cache_id != cache_id:
+        raise HTTPException(status_code=404, detail="Item not found in this cache")
+    return {
+        "id": r.id,
+        "cache_id": r.cache_id,
+        "knowledge_id": r.knowledge_id,
+        "knowledge_title": r.knowledge_title,
+        "question": r.question,
+        "reasoning": r.reasoning,
+        "answer": r.answer,
+        "verified": r.verified,
+        "verifier_reasoning": r.verifier_reasoning,
+        "conclusion": r.conclusion,
+        "reward": r.reward,
+        "trials": r.trials_json,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    }
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8000)

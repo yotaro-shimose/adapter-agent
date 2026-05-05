@@ -18,6 +18,7 @@ import dataclasses
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 
 import tinker
@@ -25,7 +26,6 @@ from agents import set_tracing_disabled
 from dotenv import load_dotenv
 from prisma import Prisma
 
-from adapter_agent.data import QRA
 from adapter_agent.hierarchical.agent.generator import GeneratorAgent
 from adapter_agent.library.library_spec import LibrarySpec
 from adapter_agent.model_helper import get_gemini
@@ -36,7 +36,13 @@ from adapter_agent.simple_internalizer.data_sources import (
     build_knowledge_suites,
     load_gh_archive_suite,
     load_granular_knowledge,
-    load_study_root_qras_cached,
+)
+from adapter_agent.simple_internalizer.sft_qra_loaders import (
+    SftLoaderContext,
+    SftSuiteFactory,
+    load_granular_sft_suite,
+    load_sft_cache_suite,
+    load_study_root_sft_suite,
 )
 from adapter_agent.simple_internalizer.types import (
     CheckpointSettings,
@@ -45,6 +51,8 @@ from adapter_agent.simple_internalizer.types import (
     RolloutSettings,
     SeedSuite,
     SFTConfig,
+    SftSuite,
+    default_cache_dir,
 )
 from adapter_agent.study.qra_distiller import QRADistiller
 
@@ -109,11 +117,15 @@ class RunRecipe:
     rl_k_per_knowledge: int  # 0 disables knowledge-derived RL suite
     eval_k_per_knowledge: int  # 0 disables knowledge-derived eval suite
     gh_archive_rl_slice: slice | None  # gh_archive RL suite slice; None disables
-    gh_archive_eval_slice: slice | None  # additional gh_archive eval slice; None disables
+    gh_archive_eval_slice: (
+        slice | None
+    )  # additional gh_archive eval slice; None disables
 
-    # SFT extras (only consumed when pipeline_config.sft is set).
-    sft_study_experiment_name: str | None
-    sft_traj_qra_id: str | None
+    # SFT data sources (only consumed when pipeline_config.sft is set).
+    # Each entry is a `partial`-bound loader that, given the per-run
+    # SftLoaderContext, returns one `SftSuite`. The pipeline flattens all
+    # returned suites into the SFT pool. Empty list = no SFT data.
+    sft_sources: list[SftSuiteFactory] = field(default_factory=list)
 
     # Library identity. Drives rustdoc JSON path (startup sanity check) and
     # the gh_archive benchmark CSV that build_*/load_gh_archive_suite reads.
@@ -122,7 +134,9 @@ class RunRecipe:
 
     @property
     def json_path(self) -> Path:
-        return self.library_spec.libdir / "target/doc" / f"{self.library_spec.name}.json"
+        return (
+            self.library_spec.libdir / "target/doc" / f"{self.library_spec.name}.json"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +151,7 @@ SFT_RECIPE = RunRecipe(
     pipeline_config=PipelineConfig(
         simple_train_id="",  # filled at run time
         library_name="numrs2",
+        cache_dir=default_cache_dir("numrs2"),
         model_loading_settings=ModelLoadingSettings(
             model_name="Qwen/Qwen3-32B",
             lora_rank=32,
@@ -145,7 +160,6 @@ SFT_RECIPE = RunRecipe(
         eval=_EVAL,
         checkpoint=_CHECKPOINT,
         sft=SFTConfig(
-            k_sft=32,
             epochs=2,
             batch_size=128,
             sft_seed=42,
@@ -158,8 +172,20 @@ SFT_RECIPE = RunRecipe(
     eval_k_per_knowledge=0,
     gh_archive_rl_slice=None,
     gh_archive_eval_slice=slice(150, 200),
-    sft_study_experiment_name="study_20260430_024306",
-    sft_traj_qra_id="study_20260430_024306_v1",
+    sft_sources=[
+        partial(
+            load_granular_sft_suite,
+            name="granular_numrs2",
+            cache_id="sft__numrs2",
+            k_per_knowledge=32,
+        ),
+        partial(
+            load_study_root_sft_suite,
+            name="study_root_numrs2",
+            experiment_name="study_20260430_024306",
+            traj_qra_id="study_20260430_024306_v1",
+        ),
+    ],
 )
 
 
@@ -171,6 +197,7 @@ RL_RECIPE = RunRecipe(
     pipeline_config=PipelineConfig(
         simple_train_id="",
         library_name="numrs2",
+        cache_dir=default_cache_dir("numrs2"),
         model_loading_settings=ModelLoadingSettings(
             model_name="Qwen/Qwen3-32B",
             resume_trainer_path=f"{_SFT_CHECKPOINT_BASE_32B}/weights/init_sft",
@@ -182,9 +209,10 @@ RL_RECIPE = RunRecipe(
         checkpoint=_CHECKPOINT,
         sft=None,  # SFT already done; checkpoint loaded.
         rl=RLConfig(
-            # ~1 pass over the dataset: tasks (= rl_k_per_knowledge × |knowledge|
-            # = 32 × 70 = 2,240) divided by batch_size (48) → ceil(2240/48) = 47.
-            max_iterations=47,
+            # Short probe run (10 updates) under the new stub-rejecting verifier
+            # + anti-stub solver prompt — to check whether the stub strategy
+            # actually erodes within a handful of GRPO updates.
+            max_iterations=10,
             adam_params=tinker.AdamParams(learning_rate=7e-5),
             loss_fn="ppo",
             batch_size=48,
@@ -200,8 +228,6 @@ RL_RECIPE = RunRecipe(
     eval_k_per_knowledge=1,
     gh_archive_rl_slice=None,
     gh_archive_eval_slice=None,
-    sft_study_experiment_name=None,
-    sft_traj_qra_id=None,
 )
 
 
@@ -216,6 +242,7 @@ TASK_RL_RECIPE = RunRecipe(
     pipeline_config=PipelineConfig(
         simple_train_id="",
         library_name="numrs2",
+        cache_dir=default_cache_dir("numrs2"),
         model_loading_settings=ModelLoadingSettings(
             model_name="Qwen/Qwen3-32B",
             resume_trainer_path=f"{_TASK_RL_CHECKPOINT_BASE}/weights/rl_0040",
@@ -244,8 +271,6 @@ TASK_RL_RECIPE = RunRecipe(
     eval_k_per_knowledge=0,
     gh_archive_rl_slice=slice(0, 150),
     gh_archive_eval_slice=slice(150, 200),
-    sft_study_experiment_name=None,
-    sft_traj_qra_id=None,
 )
 # これによって出来上がったチェックポイント
 # "tinker://c263af3f-acfd-5d93-a297-2dc732548b74:train:0/sampler_weights/rl_0010"
@@ -268,6 +293,7 @@ HISAB_SFT_RECIPE = RunRecipe(
     pipeline_config=PipelineConfig(
         simple_train_id="",
         library_name="hisab",
+        cache_dir=default_cache_dir("hisab"),
         model_loading_settings=ModelLoadingSettings(
             model_name="Qwen/Qwen3-32B",
             lora_rank=32,
@@ -276,7 +302,6 @@ HISAB_SFT_RECIPE = RunRecipe(
         eval=_EVAL,
         checkpoint=_CHECKPOINT,
         sft=SFTConfig(
-            k_sft=32,
             epochs=2,
             batch_size=128,
             sft_seed=42,
@@ -289,13 +314,158 @@ HISAB_SFT_RECIPE = RunRecipe(
     eval_k_per_knowledge=0,
     gh_archive_rl_slice=None,
     gh_archive_eval_slice=slice(150, 200),
-    sft_study_experiment_name="study_20260504_070444",
-    sft_traj_qra_id="study_20260504_070444_v1",
+    sft_sources=[
+        partial(
+            load_granular_sft_suite,
+            name="granular_hisab",
+            cache_id="sft__hisab",
+            k_per_knowledge=32,
+        ),
+        partial(
+            load_study_root_sft_suite,
+            name="study_root_hisab",
+            experiment_name="study_20260504_070444",
+            traj_qra_id="study_20260504_070444_v1",
+        ),
+    ],
     library_spec=LibrarySpec.hisab(),
 )
 
 
-CONFIG = HISAB_SFT_RECIPE
+# Hisab SFT, but using only the augmentation-pipeline output (no granular,
+# no study-root). The QRAs in `pipeline_v1_qra` are verified Q/R/A triples
+# from `study2_pipeline.py`; this recipe trains exclusively on those.
+HISAB_SFT_FROM_PIPELINE_RECIPE = RunRecipe(
+    simple_train_id_prefix="continue_rl_sft_hisab_pipeline",
+    granular_id=GRANULAR_ID,
+    pipeline_config=PipelineConfig(
+        simple_train_id="",
+        library_name="hisab",
+        cache_dir=default_cache_dir("hisab"),
+        model_loading_settings=ModelLoadingSettings(
+            model_name="Qwen/Qwen3-32B",
+            lora_rank=32,
+        ),
+        rollout=_ROLLOUT_HISAB,
+        eval=_EVAL,
+        checkpoint=_CHECKPOINT,
+        sft=SFTConfig(
+            epochs=2,
+            batch_size=128,
+            sft_seed=42,
+            save_checkpoint=True,
+        ),
+        rl=None,
+        generation_concurrency=400,
+    ),
+    rl_k_per_knowledge=0,
+    eval_k_per_knowledge=0,
+    gh_archive_rl_slice=None,
+    gh_archive_eval_slice=slice(150, 200),
+    sft_sources=[
+        partial(
+            load_sft_cache_suite,
+            name="pipeline_v1_qra",
+            cache_id="pipeline_v1_qra",
+            verified_only=True,
+        ),
+    ],
+    library_spec=LibrarySpec.hisab(),
+)
+
+
+# Output of HISAB_SFT_RECIPE (see /tmp/hisab-sft.log).
+_HISAB_SFT_CHECKPOINT_BASE = "tinker://25175663-6abf-5703-90ad-0a92081da02e:train:0"
+
+
+# Hisab equivalent of RL_RECIPE: resume from HISAB_SFT_RECIPE's checkpoint →
+# skip SFT → knowledge-derived RL + eval suites (build_knowledge_suites) over
+# the 101 hisab granular knowledge entries → GRPO loop.
+HISAB_KNOWLEDGE_RL_RECIPE = RunRecipe(
+    simple_train_id_prefix="continue_rl_hisab",
+    granular_id=HISAB_GRANULAR_ID,
+    pipeline_config=PipelineConfig(
+        simple_train_id="",
+        library_name="hisab",
+        cache_dir=default_cache_dir("hisab"),
+        model_loading_settings=ModelLoadingSettings(
+            model_name="Qwen/Qwen3-32B",
+            resume_trainer_path=f"{_HISAB_SFT_CHECKPOINT_BASE}/weights/init_sft",
+            resume_sampler_path=f"{_HISAB_SFT_CHECKPOINT_BASE}/sampler_weights/init_sft",
+            lora_rank=32,
+        ),
+        rollout=_ROLLOUT_HISAB,
+        eval=_EVAL,
+        checkpoint=_CHECKPOINT,
+        sft=None,
+        rl=RLConfig(
+            num_passes=1,
+            adam_params=tinker.AdamParams(learning_rate=7e-5),
+            loss_fn="ppo",
+            batch_size=48,
+            update_epochs=1,
+            max_version_lag=1,
+            kl_penalty_coef=0.0,
+            kl_discount_factor=0.0,
+            skip_update=False,
+        ),
+        generation_concurrency=400,
+    ),
+    rl_k_per_knowledge=32,
+    eval_k_per_knowledge=1,
+    gh_archive_rl_slice=None,
+    gh_archive_eval_slice=None,
+    library_spec=LibrarySpec.hisab(),
+)
+
+
+# Hisab equivalent of TASK_RL_RECIPE: RL directly on hisab gh_archive[0:150],
+# eval on [150:200]. Resumes from HISAB_KNOWLEDGE_RL_RECIPE's rl_0060 (1-pass
+# run terminated at iter 60 because num_passes=1 stopped before iter 68 and
+# the old code didn't save a final checkpoint — see /tmp/hisab-knowledge-rl.log).
+_HISAB_TASK_RL_CHECKPOINT_BASE = "tinker://a7e97833-7934-558e-842d-a29f8a2bd48f:train:0"
+_HISAB_TASK_RL_CHECKPOINT_NAME = "rl_0060"
+_HISAB_TASK_RL_ROLLOUT = dataclasses.replace(_ROLLOUT_HISAB, num_samples=16)
+
+HISAB_TASK_RL_RECIPE = RunRecipe(
+    simple_train_id_prefix="continue_rl_task_hisab",
+    granular_id=HISAB_GRANULAR_ID,
+    pipeline_config=PipelineConfig(
+        simple_train_id="",
+        library_name="hisab",
+        cache_dir=default_cache_dir("hisab"),
+        model_loading_settings=ModelLoadingSettings(
+            model_name="Qwen/Qwen3-32B",
+            resume_trainer_path=f"{_HISAB_TASK_RL_CHECKPOINT_BASE}/weights/{_HISAB_TASK_RL_CHECKPOINT_NAME}",
+            resume_sampler_path=f"{_HISAB_TASK_RL_CHECKPOINT_BASE}/sampler_weights/{_HISAB_TASK_RL_CHECKPOINT_NAME}",
+            lora_rank=32,
+        ),
+        rollout=_HISAB_TASK_RL_ROLLOUT,
+        eval=_EVAL,
+        checkpoint=_CHECKPOINT,
+        sft=None,
+        rl=RLConfig(
+            num_passes=20,
+            adam_params=tinker.AdamParams(learning_rate=7e-5),
+            loss_fn="ppo",
+            batch_size=48,
+            update_epochs=1,
+            max_version_lag=1,
+            kl_penalty_coef=0.0,
+            kl_discount_factor=0.0,
+            skip_update=False,
+        ),
+        generation_concurrency=400,
+    ),
+    rl_k_per_knowledge=0,
+    eval_k_per_knowledge=0,
+    gh_archive_rl_slice=slice(0, 150),
+    gh_archive_eval_slice=slice(150, 200),
+    library_spec=LibrarySpec.hisab(),
+)
+
+
+CONFIG = HISAB_KNOWLEDGE_RL_RECIPE
 
 
 # ---------------------------------------------------------------------------
@@ -324,10 +494,31 @@ async def main() -> None:
     prisma = Prisma()
     await prisma.connect()
     try:
-        knowledge_list = await load_granular_knowledge(prisma, cfg.granular_id)
-        logger.info(
-            f"Loaded {len(knowledge_list)} granular knowledge rows from '{cfg.granular_id}'."
+        # Granular knowledge is only consumed by `build_knowledge_suites`
+        # and the granular SFT loader. Other SFT loaders (sft_cache,
+        # study-root) don't need it. Skip the DB query when nothing wants it.
+        needs_granular_sft_loader = (
+            pipeline_config.sft is not None
+            and any(
+                getattr(s, "func", None) is load_granular_sft_suite
+                for s in cfg.sft_sources
+            )
         )
+        needs_knowledge = (
+            needs_granular_sft_loader
+            or cfg.rl_k_per_knowledge > 0
+            or cfg.eval_k_per_knowledge > 0
+        )
+        if needs_knowledge:
+            knowledge_list = await load_granular_knowledge(prisma, cfg.granular_id)
+            logger.info(
+                f"Loaded {len(knowledge_list)} granular knowledge rows from '{cfg.granular_id}'."
+            )
+        else:
+            knowledge_list = []
+            logger.info(
+                "Skipping granular knowledge load (no SFT and no knowledge-derived suites)."
+            )
 
         seed_suites: list[SeedSuite] = []
         if cfg.rl_k_per_knowledge > 0 or cfg.eval_k_per_knowledge > 0:
@@ -338,8 +529,11 @@ async def main() -> None:
                     generator=generator,
                     knowledge_list=knowledge_list,
                     k_per_knowledge=cfg.rl_k_per_knowledge,
-                    cache_dir=pipeline_config.cache_dir,
+                    cache_id=f"knowledge_rl__{cfg.library_spec.name}",
+                    prisma_client=prisma,
                     name_prefix="knowledge_rl",
+                    granular_id=cfg.granular_id,
+                    library_name=cfg.library_spec.name,
                     for_rl=True,
                     for_eval=False,
                     generation_concurrency=pipeline_config.generation_concurrency,
@@ -355,8 +549,11 @@ async def main() -> None:
                     generator=generator,
                     knowledge_list=knowledge_list,
                     k_per_knowledge=cfg.eval_k_per_knowledge,
-                    cache_dir=pipeline_config.cache_dir,
+                    cache_id=f"knowledge_eval__{cfg.library_spec.name}",
+                    prisma_client=prisma,
                     name_prefix="knowledge_eval",
+                    granular_id=cfg.granular_id,
+                    library_name=cfg.library_spec.name,
                     for_rl=False,
                     for_eval=True,
                     generation_concurrency=pipeline_config.generation_concurrency,
@@ -401,24 +598,22 @@ async def main() -> None:
             )
             seed_suites.append(gh_eval_suite)
 
-        extra_sft_qras: list[QRA] = []
-        if (
-            pipeline_config.sft is not None
-            and cfg.sft_study_experiment_name
-            and cfg.sft_traj_qra_id
-        ):
-            distiller = QRADistiller(model=get_gemini())
-            extra_sft_qras = await load_study_root_qras_cached(
-                prisma_client=prisma,
-                experiment_name=cfg.sft_study_experiment_name,
-                traj_qra_id=cfg.sft_traj_qra_id,
-                distiller=distiller,
+        sft_suites: list[SftSuite] = []
+        if pipeline_config.sft is not None and cfg.sft_sources:
+            # Build deps eagerly — they're cheap (model client wrappers) and
+            # individual loaders pick what they need from `ctx`.
+            sft_ctx = SftLoaderContext(
+                prisma=prisma,
+                library_name=cfg.library_spec.name,
                 cache_dir=pipeline_config.cache_dir,
+                generation_concurrency=pipeline_config.generation_concurrency,
+                knowledge_list=knowledge_list,
+                generator=GeneratorAgent(model=get_gemini()),
+                distiller=QRADistiller(model=get_gemini()),
             )
-            logger.info(
-                f"Loaded {len(extra_sft_qras)} study root QRAs from "
-                f"'{cfg.sft_study_experiment_name}'."
-            )
+            sft_suites = [await src(sft_ctx) for src in cfg.sft_sources]
+            for s in sft_suites:
+                logger.info(f"SFT source loaded: {s.name} -> {len(s.qras)} QRAs")
     finally:
         await prisma.disconnect()
 
@@ -426,7 +621,7 @@ async def main() -> None:
         config=pipeline_config,
         knowledge_list=knowledge_list,
         seed_suites=seed_suites,
-        extra_sft_qras=extra_sft_qras,
+        sft_suites=sft_suites,
     )
 
     try:

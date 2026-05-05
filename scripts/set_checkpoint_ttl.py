@@ -16,6 +16,16 @@ TINKER_PATHS = [
     "tinker://4d530b2a-8dff-5335-a4fc-eb5e78fa797b:train:0/sampler_weights/rl_0040",  # SIP 32B Knowledge RL final checkpoint
     "tinker://c263af3f-acfd-5d93-a297-2dc732548b74:train:0/weights/rl_0010",  # SIP 32B Task RL final checkpoint
     "tinker://c263af3f-acfd-5d93-a297-2dc732548b74:train:0/sampler_weights/rl_0010",  # SIP 32B Task RL final checkpoint
+    "tinker://25175663-6abf-5703-90ad-0a92081da02e:train:0/weights/init_sft",  # hisab 32B SFT checkpoint
+    "tinker://25175663-6abf-5703-90ad-0a92081da02e:train:0/sampler_weights/init_sft",  # hisab 32B SFT checkpoint
+    "tinker://a7e97833-7934-558e-842d-a29f8a2bd48f:train:0/weights/rl_0060",  # hisab 32B Knowledge RL checkpoint (1-pass run, terminated at iter 60)
+    "tinker://a7e97833-7934-558e-842d-a29f8a2bd48f:train:0/sampler_weights/rl_0060",  # hisab 32B Knowledge RL checkpoint (1-pass run, terminated at iter 60)
+    "tinker://b48e4aae-6e11-56ce-9078-c0cfd02db410:train:0/weights/rl_0010",  # hisab 32B Task RL mid checkpoint
+    "tinker://b48e4aae-6e11-56ce-9078-c0cfd02db410:train:0/sampler_weights/rl_0010",  # hisab 32B Task RL mid checkpoint
+    "tinker://b48e4aae-6e11-56ce-9078-c0cfd02db410:train:0/weights/rl_0012",  # hisab 32B Task RL final checkpoint (3 passes × 4 iter/pass)
+    "tinker://b48e4aae-6e11-56ce-9078-c0cfd02db410:train:0/sampler_weights/rl_0012",  # hisab 32B Task RL final checkpoint (3 passes × 4 iter/pass)
+    "tinker://9d9c8ae1-c805-5189-9ed2-ee3cc1dd6c16:train:0/weights/rl_0040",  # hisab 32B Task RL2 (10-pass) checkpoint
+    "tinker://9d9c8ae1-c805-5189-9ed2-ee3cc1dd6c16:train:0/sampler_weights/rl_0040",  # hisab 32B Task RL2 (10-pass) checkpoint
 
 ]
 THIRTY_DAYS_SECONDS = 30 * 24 * 3600

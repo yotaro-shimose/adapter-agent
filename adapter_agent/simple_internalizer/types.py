@@ -6,6 +6,7 @@ from oai_utils import AgentsSDKModel
 from pydantic import BaseModel
 from tinker.types.loss_fn_type import LossFnType
 
+from adapter_agent.data import QRA
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.rl.config import ModelLoadingSettings
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
@@ -16,6 +17,19 @@ class SeedSuite(BaseModel):
     tasks: list[Task]
     for_rl: bool = True
     for_eval: bool = True
+
+
+class SftSuite(BaseModel):
+    """A named bag of QRAs for SFT bootstrap.
+
+    Mirrors `SeedSuite` for SFT data: callers assemble a `list[SftSuite]`
+    from arbitrary loaders (granular knowledge, sft_cache_items table,
+    study root distillation, ...) and the pipeline flattens them at
+    train time. The `name` is purely a provenance tag for logging.
+    """
+
+    name: str
+    qras: list[QRA]
 
 
 @dataclass
@@ -106,10 +120,16 @@ class STaRSettings:
 
 @dataclass
 class SFTConfig:
-    """SFT-stage settings. Presence of this config enables the SFT stage;
-    set `PipelineConfig.sft = None` to skip SFT entirely."""
+    """SFT-stage training settings.
 
-    k_sft: int = 32
+    Presence of this config enables the SFT stage; set `PipelineConfig.sft
+    = None` to skip SFT entirely. The actual SFT data is provided to
+    `SimplePipeline.create(sft_suites=...)` by the caller — the pipeline is
+    agnostic to how those QRAs were produced (granular knowledge generation,
+    augmentation pipeline, study-root distillation, ...). See
+    `simple_internalizer/sft_qra_loaders.py` for ready-made loaders.
+    """
+
     epochs: int = 1
     batch_size: int = 32
     sft_seed: int = 42
@@ -117,15 +137,20 @@ class SFTConfig:
     adam_params: tinker.AdamParams = field(
         default_factory=lambda: tinker.AdamParams(learning_rate=1e-4)
     )
-    generator_model: AgentsSDKModel | None = None
 
 
 @dataclass
 class RLConfig:
     """RL (GRPO) stage settings. Set `PipelineConfig.rl = None` to skip the
-    RL loop entirely (eval-only / SFT-only runs)."""
+    RL loop entirely (eval-only / SFT-only runs).
 
-    max_iterations: int = 50
+    Set EXACTLY ONE of `num_passes` (declarative — N passes over the RL
+    task pool) or `max_iterations` (raw step count). Both set or neither
+    set raises at construction time.
+    """
+
+    max_iterations: int | None = None
+    num_passes: int | None = None
     adam_params: tinker.AdamParams = field(
         default_factory=lambda: tinker.AdamParams(learning_rate=1e-5)
     )
@@ -139,8 +164,24 @@ class RLConfig:
     skip_update: bool = False
     rl_seed: int = 42  # initial RL task ordering shuffle seed
 
+    def __post_init__(self) -> None:
+        if (self.max_iterations is None) == (self.num_passes is None):
+            raise ValueError(
+                "RLConfig: set exactly one of `max_iterations` or `num_passes` "
+                f"(got max_iterations={self.max_iterations}, num_passes={self.num_passes})."
+            )
+
 
 _CACHE_BASE = Path(".cache/simple_internalizer")
+
+
+def default_cache_dir(library_name: str) -> Path:
+    """Library-namespaced cache directory under `.cache/simple_internalizer/`.
+
+    Use at the recipe boundary (e.g. `cache_dir=default_cache_dir(library_name)`)
+    so the field stays a strict `Path` rather than `Path | None`.
+    """
+    return _CACHE_BASE / library_name
 
 
 @dataclass
@@ -157,19 +198,13 @@ class PipelineConfig:
     rollout: RolloutSettings
     eval: EvalSettings
     checkpoint: CheckpointSettings
+    cache_dir: Path
 
-    # Pipeline flow. `cache_dir=None` → `.cache/simple_internalizer/<library_name>`
-    # so numrs2 / hisab artifacts live in disjoint trees by default.
-    cache_dir: Path | None = None
     generation_concurrency: int = 400
 
     # Stage configs (None disables that stage)
     sft: SFTConfig | None = None
     rl: RLConfig | None = None
-
-    def __post_init__(self) -> None:
-        if self.cache_dir is None:
-            self.cache_dir = _CACHE_BASE / self.library_name
 
 
 @dataclass
@@ -187,11 +222,6 @@ class STaRPipelineConfig:
     eval: EvalSettings
     checkpoint: CheckpointSettings
     star: STaRSettings
+    cache_dir: Path
 
-    # Pipeline flow. cache_dir is library-namespaced (see PipelineConfig).
     max_iterations: int = 50
-    cache_dir: Path | None = None
-
-    def __post_init__(self) -> None:
-        if self.cache_dir is None:
-            self.cache_dir = _CACHE_BASE / self.library_name

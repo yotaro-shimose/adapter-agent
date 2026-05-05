@@ -12,7 +12,6 @@ from adapter_agent.rl.env.runtime_pool import RuntimePool
 from adapter_agent.rl.env.runtime_settings import RuntimeSettings
 from adapter_agent.rl.postgres_db import PostgresDB
 from adapter_agent.rl.shared_sampling_client import SharedSamplingClient
-from adapter_agent.simple_internalizer.distilled_qra_manager import DistilledQRAManager
 from adapter_agent.simple_internalizer.executor import InternalizeExecutor
 from adapter_agent.simple_internalizer.rl_worker_pool import RLWorkerPool
 from adapter_agent.simple_internalizer.rollout_engine import (
@@ -95,7 +94,7 @@ class RolloutActor:
             data={"create": {"id": self._simple_train_id}, "update": {}},
         )
 
-        verifier = Verifier(model=self._verifier_model)
+        verifier = Verifier(model=self._verifier_model, library_name=self._library_name)
         self._runtime_pool = RuntimePool(
             self._runtime_settings, max_size=self._runtime_pool_size
         )
@@ -109,12 +108,6 @@ class RolloutActor:
             system_prompt=build_solver_system_prompt(self._library_name),
         )
 
-        # Study scope外: queue=None で on_all_fail は no-op
-        distilled = DistilledQRAManager(
-            qra_in_queue=None,
-            study_task_queue=None,
-        )
-
         self._pool = RLWorkerPool(
             rollout_engine=rollout_engine,
             shared_sampling_client=self._shared,
@@ -123,7 +116,6 @@ class RolloutActor:
             stagger_s=self._stagger_s,
             num_samples=self._num_samples,
             sampling_params=self._sampling_params,
-            distilled=distilled,
         )
         await self._pool.__aenter__()
         self._drain_task = asyncio.create_task(

@@ -1,7 +1,7 @@
 """Standalone evaluation for numrs2 coding-task benchmark.
 
 Reuses the same eval suite and execution+verification pipeline as
-`scripts/run_continue_rl_with_study.py` (via `gh_archive_eval`,
+`scripts/run_continue_rl.py` (via `gh_archive_eval`,
 `InternalizeExecutor`, `Verifier`) but detaches it from the RL loop.
 
 Two orthogonal axes control what is evaluated:
@@ -25,12 +25,13 @@ Edit the `CONFIG` instance near the top of this module to pick axes and
 point at a checkpoint or model.
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import os
 import statistics
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Awaitable, Iterable, Literal
 
 import tinker
@@ -49,6 +50,7 @@ from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.process.rewire import ss_solve_verify
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.library.async_rust_doc_analyzer import AsyncRustDocAnalyzer
+from adapter_agent.library.library_spec import LibrarySpec
 from adapter_agent.library.wiki_manager import WikiManager
 from adapter_agent.model_helper import get_gemini, get_gemini_lite
 from adapter_agent.rl.env.runtime_pool import RuntimePool
@@ -87,9 +89,12 @@ SolverConfig = TinkerSolverConfig | AgentsSolverConfig
 
 @dataclass(frozen=True)
 class SsSolveVerifyConfig:
-    """Settings for `EVAL_STRATEGY == "ss_solve_verify"` (mirrors study.py)."""
+    """Settings for `EVAL_STRATEGY == "ss_solve_verify"` (mirrors study.py).
 
-    rust_libdir: Path
+    The Rust libdir is sourced from `EvalConfig.library_spec.libdir` — only
+    eval-time knobs (wiki, max_turns, runtime_mode, …) live here.
+    """
+
     wiki_version: str  # ignored when `use_wiki` is False.
     max_turns: int
     qwen_no_think: bool
@@ -104,11 +109,15 @@ class EvalConfig:
     rollout: int
     concurrency: int
     runtime_pool_size: int
-    library_name: str
     verifier_model: Literal["gemini", "gemini_lite"]
     strategy: Literal["single_turn", "ss_solve_verify"]
     solver: SolverConfig
     ss: SsSolveVerifyConfig
+    # Library identity. Drives benchmark CSV (load_gh_archive_suite),
+    # runtime images (docker_runtime / cloudrun_runtime), the rust libdir
+    # used by ss_solve_verify, and the system-prompt library name.
+    # Default keeps numrs2-era recipes unchanged; hisab recipes override.
+    library_spec: LibrarySpec = field(default_factory=LibrarySpec.numrs2)
 
 
 # --- Shared sub-configs (re-used across named variants below) ---
@@ -135,6 +144,33 @@ _TINKER_SIP3 = TinkerSolverConfig(
     ),
 )
 
+# Hisab Knowledge_RL output (1-pass run, terminated at iter 60 because
+# checkpoint_interval=10 and num_passes=1 → 68 iters didn't land on a save).
+_TINKER_HISAB_KRL = TinkerSolverConfig(
+    model_name="Qwen/Qwen3-32B",
+    sampler_path=(
+        "tinker://a7e97833-7934-558e-842d-a29f8a2bd48f:train:0/sampler_weights/rl_0060"
+    ),
+)
+
+# Hisab TASK_RL final checkpoint (3 passes × 4 iter/pass = 12 iters; saved by
+# the new end-of-loop save logic since 12 isn't a multiple of checkpoint_interval).
+_TINKER_HISAB_TRL = TinkerSolverConfig(
+    model_name="Qwen/Qwen3-32B",
+    sampler_path=(
+        "tinker://b48e4aae-6e11-56ce-9078-c0cfd02db410:train:0/sampler_weights/rl_0012"
+    ),
+)
+
+# Hisab TASK_RL second run — was launched as 20 passes (= 80 iters), stopped
+# at iter 40 (10 passes). 2.5× the practice of _TINKER_HISAB_TRL.
+_TINKER_HISAB_TRL2 = TinkerSolverConfig(
+    model_name="Qwen/Qwen3-32B",
+    sampler_path=(
+        "tinker://9d9c8ae1-c805-5189-9ed2-ee3cc1dd6c16:train:0/sampler_weights/rl_0040"
+    ),
+)
+
 # Qwen3-8B base model — no fine-tuned sampler, used as the baseline.
 _TINKER_BASE = TinkerSolverConfig(
     model_name="Qwen/Qwen3-8B",
@@ -151,7 +187,6 @@ _TINKER_QWEN32B = TinkerSolverConfig(
 _AGENTS_GEMINI = AgentsSolverConfig(model="gemini")
 
 _SS_NUMRS_NOWIKI = SsSolveVerifyConfig(
-    rust_libdir=Path("repositories/numrs"),
     wiki_version="study_20260430_024306",  # 新版Easy だけど多様なタスクリスト solved by gemini
     # wiki_version="study_20260419_041136",  # Easy のやつ
     max_turns=10,
@@ -162,8 +197,25 @@ _SS_NUMRS_NOWIKI = SsSolveVerifyConfig(
 )
 
 _SS_NUMRS_WITHWIKI = SsSolveVerifyConfig(
-    rust_libdir=Path("repositories/numrs"),
     wiki_version="study_20260430_024306",  # 新版Easy だけど多様なタスクリスト solved by gemini
+    max_turns=10,
+    qwen_no_think=True,
+    runtime_mode="docker",
+    concurrency=50,
+    use_wiki=True,
+)
+
+_SS_HISAB_NOWIKI = SsSolveVerifyConfig(
+    wiki_version="study_20260504_070444",  # hisab study run
+    max_turns=10,
+    qwen_no_think=True,
+    runtime_mode="docker",
+    concurrency=50,
+    use_wiki=False,
+)
+
+_SS_HISAB_WITHWIKI = SsSolveVerifyConfig(
+    wiki_version="study_20260504_070444",
     max_turns=10,
     qwen_no_think=True,
     runtime_mode="docker",
@@ -180,7 +232,6 @@ SIP_RAG = EvalConfig(
     rollout=1,
     concurrency=50,
     runtime_pool_size=50,
-    library_name="numrs2",
     verifier_model="gemini_lite",
     strategy="ss_solve_verify",
     solver=_TINKER_RL0020,
@@ -193,7 +244,6 @@ SIP_SINGLE = EvalConfig(
     rollout=1,
     concurrency=50,
     runtime_pool_size=50,
-    library_name="numrs2",
     verifier_model="gemini_lite",
     strategy="single_turn",
     solver=_TINKER_RL0020,
@@ -206,7 +256,6 @@ BASE_RAG = EvalConfig(
     rollout=1,
     concurrency=50,
     runtime_pool_size=50,
-    library_name="numrs2",
     verifier_model="gemini_lite",
     strategy="ss_solve_verify",
     solver=_TINKER_BASE,
@@ -219,7 +268,6 @@ BASE_SINGLE = EvalConfig(
     rollout=1,
     concurrency=50,
     runtime_pool_size=50,
-    library_name="numrs2",
     verifier_model="gemini_lite",
     strategy="single_turn",
     solver=_TINKER_BASE,
@@ -232,7 +280,6 @@ BASE_WIKI = EvalConfig(
     rollout=1,
     concurrency=50,
     runtime_pool_size=50,
-    library_name="numrs2",
     verifier_model="gemini_lite",
     strategy="ss_solve_verify",
     solver=_TINKER_BASE,
@@ -245,7 +292,6 @@ GEMINI_SINGLE = EvalConfig(
     rollout=1,
     concurrency=50,
     runtime_pool_size=50,
-    library_name="numrs2",
     verifier_model="gemini_lite",
     strategy="single_turn",
     solver=_AGENTS_GEMINI,
@@ -258,7 +304,6 @@ GEMINI_RAG = EvalConfig(
     rollout=1,
     concurrency=50,
     runtime_pool_size=50,
-    library_name="numrs2",
     verifier_model="gemini_lite",
     strategy="ss_solve_verify",
     solver=_AGENTS_GEMINI,
@@ -271,7 +316,6 @@ GEMINI_WIKI = EvalConfig(
     rollout=1,
     concurrency=50,
     runtime_pool_size=50,
-    library_name="numrs2",
     verifier_model="gemini_lite",
     strategy="ss_solve_verify",
     solver=_AGENTS_GEMINI,
@@ -284,7 +328,6 @@ SIP2_SINGLE = EvalConfig(
     rollout=1,
     concurrency=50,
     runtime_pool_size=50,
-    library_name="numrs2",
     verifier_model="gemini_lite",
     strategy="single_turn",
     solver=_TINKER_SIP2,
@@ -297,7 +340,6 @@ SIP2_RAG = EvalConfig(
     rollout=1,
     concurrency=50,
     runtime_pool_size=50,
-    library_name="numrs2",
     verifier_model="gemini_lite",
     strategy="ss_solve_verify",
     solver=_TINKER_SIP2,
@@ -310,7 +352,6 @@ SIP3_SINGLE = EvalConfig(
     rollout=1,
     concurrency=50,
     runtime_pool_size=50,
-    library_name="numrs2",
     verifier_model="gemini_lite",
     strategy="single_turn",
     solver=_TINKER_SIP3,
@@ -323,7 +364,6 @@ QWEN32B_RAG = EvalConfig(
     rollout=1,
     concurrency=50,
     runtime_pool_size=50,
-    library_name="numrs2",
     verifier_model="gemini_lite",
     strategy="ss_solve_verify",
     solver=_TINKER_QWEN32B,
@@ -336,7 +376,6 @@ QWEN32B_WIKI = EvalConfig(
     rollout=1,
     concurrency=50,
     runtime_pool_size=50,
-    library_name="numrs2",
     verifier_model="gemini_lite",
     strategy="ss_solve_verify",
     solver=_TINKER_QWEN32B,
@@ -344,7 +383,156 @@ QWEN32B_WIKI = EvalConfig(
 )
 
 
-CONFIG = SIP3_SINGLE
+# --- Hisab named variants. Mirror the numrs2 set; library_spec drives benchmark
+# CSV, runtime images, rust libdir, and the system-prompt library name. ---
+
+# Qwen3-32B base × single_turn — bare hisab baseline.
+HISAB_BASE_SINGLE = EvalConfig(
+    task_slice=EVAL_SLICE,
+    rollout=1,
+    concurrency=50,
+    runtime_pool_size=50,
+    verifier_model="gemini_lite",
+    strategy="single_turn",
+    solver=_TINKER_QWEN32B,
+    ss=_SS_HISAB_NOWIKI,  # unused for single_turn
+    library_spec=LibrarySpec.hisab(),
+)
+
+# Qwen3-32B base × ss_solve_verify (rustdoc tools, no wiki) — RAG baseline.
+HISAB_BASE_RAG = EvalConfig(
+    task_slice=EVAL_SLICE,
+    rollout=1,
+    concurrency=50,
+    runtime_pool_size=50,
+    verifier_model="gemini_lite",
+    strategy="ss_solve_verify",
+    solver=_TINKER_QWEN32B,
+    ss=_SS_HISAB_NOWIKI,
+    library_spec=LibrarySpec.hisab(),
+)
+
+# Qwen3-32B base × ss_solve_verify with hisab wiki — full RAG baseline.
+HISAB_BASE_WIKI = EvalConfig(
+    task_slice=EVAL_SLICE,
+    rollout=1,
+    concurrency=50,
+    runtime_pool_size=50,
+    verifier_model="gemini_lite",
+    strategy="ss_solve_verify",
+    solver=_TINKER_QWEN32B,
+    ss=_SS_HISAB_WITHWIKI,
+    library_spec=LibrarySpec.hisab(),
+)
+
+# Hisab Knowledge_RL checkpoint × single_turn.
+HISAB_KRL_SINGLE = EvalConfig(
+    task_slice=EVAL_SLICE,
+    rollout=1,
+    concurrency=50,
+    runtime_pool_size=50,
+    verifier_model="gemini_lite",
+    strategy="single_turn",
+    solver=_TINKER_HISAB_KRL,
+    ss=_SS_HISAB_NOWIKI,  # unused for single_turn
+    library_spec=LibrarySpec.hisab(),
+)
+
+# Hisab Knowledge_RL × ss_solve_verify (rustdoc tools, no wiki).
+HISAB_KRL_RAG = EvalConfig(
+    task_slice=EVAL_SLICE,
+    rollout=1,
+    concurrency=50,
+    runtime_pool_size=50,
+    verifier_model="gemini_lite",
+    strategy="ss_solve_verify",
+    solver=_TINKER_HISAB_KRL,
+    ss=_SS_HISAB_NOWIKI,
+    library_spec=LibrarySpec.hisab(),
+)
+
+# Gemini × single_turn against hisab benchmark.
+HISAB_GEMINI_SINGLE = EvalConfig(
+    task_slice=EVAL_SLICE,
+    rollout=1,
+    concurrency=50,
+    runtime_pool_size=50,
+    verifier_model="gemini_lite",
+    strategy="single_turn",
+    solver=_AGENTS_GEMINI,
+    ss=_SS_HISAB_NOWIKI,  # unused for single_turn
+    library_spec=LibrarySpec.hisab(),
+)
+
+# Gemini × ss_solve_verify (rustdoc tools, no wiki) against hisab benchmark.
+HISAB_GEMINI_RAG = EvalConfig(
+    task_slice=EVAL_SLICE,
+    rollout=1,
+    concurrency=50,
+    runtime_pool_size=50,
+    verifier_model="gemini_lite",
+    strategy="ss_solve_verify",
+    solver=_AGENTS_GEMINI,
+    ss=_SS_HISAB_NOWIKI,
+    library_spec=LibrarySpec.hisab(),
+)
+
+# Hisab TASK_RL checkpoint × single_turn — the headline eval for the trained model.
+HISAB_TRL_SINGLE = EvalConfig(
+    task_slice=EVAL_SLICE,
+    rollout=1,
+    concurrency=50,
+    runtime_pool_size=50,
+    verifier_model="gemini_lite",
+    strategy="single_turn",
+    solver=_TINKER_HISAB_TRL,
+    ss=_SS_HISAB_NOWIKI,  # unused for single_turn
+    library_spec=LibrarySpec.hisab(),
+)
+
+# Hisab TASK_RL × single_turn × 8 rollouts/task — measures whether failures
+# are knowledge-gap (consistent 0/8) or instability (variable 1..7/8).
+HISAB_TRL_SINGLE_R8 = EvalConfig(
+    task_slice=EVAL_SLICE,
+    rollout=8,
+    concurrency=50,
+    runtime_pool_size=50,
+    verifier_model="gemini_lite",
+    strategy="single_turn",
+    solver=_TINKER_HISAB_TRL,
+    ss=_SS_HISAB_NOWIKI,
+    library_spec=LibrarySpec.hisab(),
+)
+
+# Hisab TASK_RL2 (10-pass, rl_0040) × single_turn × 8 rollouts/task — direct
+# comparison against HISAB_TRL_SINGLE_R8 (3-pass).
+HISAB_TRL2_SINGLE_R8 = EvalConfig(
+    task_slice=EVAL_SLICE,
+    rollout=8,
+    concurrency=50,
+    runtime_pool_size=50,
+    verifier_model="gemini_lite",
+    strategy="single_turn",
+    solver=_TINKER_HISAB_TRL2,
+    ss=_SS_HISAB_NOWIKI,
+    library_spec=LibrarySpec.hisab(),
+)
+
+# Hisab TASK_RL × ss_solve_verify (rustdoc tools, no wiki).
+HISAB_TRL_RAG = EvalConfig(
+    task_slice=EVAL_SLICE,
+    rollout=1,
+    concurrency=50,
+    runtime_pool_size=50,
+    verifier_model="gemini_lite",
+    strategy="ss_solve_verify",
+    solver=_TINKER_HISAB_TRL,
+    ss=_SS_HISAB_NOWIKI,
+    library_spec=LibrarySpec.hisab(),
+)
+
+
+CONFIG = HISAB_TRL2_SINGLE_R8
 
 
 logging.basicConfig(
@@ -546,11 +734,12 @@ async def _evaluate_task_ss_solve_verify(
     solver_model: TinkerModel | LitellmModel,
     verifier_model: AgentsSDKModel,
     rust_doc_analyzer: AsyncRustDocAnalyzer,
-    wiki_manager: WikiManager,
+    wiki_manager: WikiManager | _NullWikiManager,
     runtime_settings: RuntimeSettings,
     max_turns: int,
     qwen_no_think: bool,
     num_samples: int,
+    library_name: str,
 ) -> TaskEvalResult:
     is_tinker = isinstance(solver_model, TinkerModel)
 
@@ -565,6 +754,7 @@ async def _evaluate_task_ss_solve_verify(
                 runtime_settings=runtime_settings,
                 wiki_manager=wiki_manager,
                 qwen_no_think=qwen_no_think,
+                library_name=library_name,
             )
         except Exception as e:
             logger.warning(f"ss_solve_verify failed: {e}")
@@ -598,11 +788,11 @@ async def _run_single_turn(
     agents_model: AgentsSDKModel | None,
     verifier_model: AgentsSDKModel,
 ) -> list[TaskEvalResult]:
-    runtime_settings = RuntimeSettings.cloudrun_numrs2()
-    verifier = Verifier(model=verifier_model)
+    runtime_settings = cfg.library_spec.cloudrun_runtime()
+    verifier = Verifier(model=verifier_model, library_name=cfg.library_spec.name)
     runtime_pool = RuntimePool(runtime_settings, max_size=cfg.runtime_pool_size)
     executor = InternalizeExecutor(runtime_pool=runtime_pool, verifier=verifier)
-    system_prompt = build_solver_system_prompt(cfg.library_name)
+    system_prompt = build_solver_system_prompt(cfg.library_spec.name)
     backend: Literal["tinker", "agents"] = (
         "tinker" if isinstance(cfg.solver, TinkerSolverConfig) else "agents"
     )
@@ -656,17 +846,18 @@ async def _run_ss_solve_verify(
     verifier_model: AgentsSDKModel,
 ) -> list[TaskEvalResult]:
     ss = cfg.ss
+    libdir = cfg.library_spec.libdir
     runtime_settings = (
-        RuntimeSettings.docker_numrs2()
+        cfg.library_spec.docker_runtime()
         if ss.runtime_mode == "docker"
-        else RuntimeSettings.cloudrun_numrs2()
+        else cfg.library_spec.cloudrun_runtime()
     )
     wiki_label = ss.wiki_version if ss.use_wiki else "<disabled>"
     logger.info(
         f"Building ss_solve_verify resources "
-        f"(libdir={ss.rust_libdir}, wiki={wiki_label}, runtime={ss.runtime_mode})..."
+        f"(libdir={libdir}, wiki={wiki_label}, runtime={ss.runtime_mode})..."
     )
-    rust_doc_analyzer = await AsyncRustDocAnalyzer.create_from_libdir(ss.rust_libdir)
+    rust_doc_analyzer = await AsyncRustDocAnalyzer.create_from_libdir(libdir)
 
     prisma: Prisma | None = None
     wiki_manager: WikiManager | _NullWikiManager
@@ -691,6 +882,7 @@ async def _run_ss_solve_verify(
                     max_turns=ss.max_turns,
                     qwen_no_think=ss.qwen_no_think,
                     num_samples=cfg.rollout,
+                    library_name=cfg.library_spec.name,
                 )
 
             return await _gather_eval_with_progress(
@@ -712,6 +904,8 @@ async def main() -> None:
         task_slice=cfg.task_slice,
         for_rl=False,
         for_eval=True,
+        csv_path=cfg.library_spec.benchmark_csv,
+        difficulty=cfg.library_spec.default_difficulty,
     )
     suites: list[SeedSuite] = [eval_suite]
 
