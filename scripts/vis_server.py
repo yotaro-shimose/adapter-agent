@@ -446,16 +446,29 @@ async def list_sft_cache_items(
     cache_id: str,
     knowledge_id: str | None = None,
     verified: str | None = None,  # "true"/"false"/None
+    q: str | None = None,  # case-insensitive substring across body fields
     limit: int = 500,
 ):
     """Item list for a cache. Heavy fields (`answer`, `verifier_reasoning`)
-    are excluded — use /item/{id} for full content."""
+    are excluded — use /item/{id} for full content.
+
+    `q` searches question + reasoning + answer + verifier_reasoning. Empty
+    or whitespace-only `q` is ignored.
+    """
     client = await _db_manager.get_client()
     where: dict = {"cache_id": cache_id}
     if knowledge_id is not None:
         where["knowledge_id"] = knowledge_id
     if verified in ("true", "false"):
         where["verified"] = verified == "true"
+    if q is not None and q.strip():
+        needle = q.strip()
+        where["OR"] = [
+            {"question": {"contains": needle, "mode": "insensitive"}},
+            {"reasoning": {"contains": needle, "mode": "insensitive"}},
+            {"answer": {"contains": needle, "mode": "insensitive"}},
+            {"verifier_reasoning": {"contains": needle, "mode": "insensitive"}},
+        ]
     rows = await client.sftcacheitem.find_many(
         where=where,
         order=[{"id": "asc"}],

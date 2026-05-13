@@ -58,17 +58,29 @@ CONTEXT_EXCEEDED_MESSAGE = TinkerMessage(
 # submit is the final action of a session, so trailing junk after it doesn't
 # matter (the regex extracts the body regardless). The other four are
 # critical for preventing autoregressive multi-tag hallucination mid-session.
-def _stop_sequences_for(enable_search_tools: bool) -> tuple[list[str], list[str]]:
-    """Return `(stop_sequences, tag_names_for_close_restoration)`."""
+def _stop_sequences_for(
+    enable_search_tools: bool, enable_write_and_run: bool = True
+) -> tuple[list[str], list[str]]:
+    """Return `(stop_sequences, tag_names_for_close_restoration)`.
+
+    Gemini's `stopSequences` field is silently IGNORED when the list has 5+
+    entries; the helper picks the busiest 4 closers based on which tools
+    are enabled, dropping `</submit>` last (it's the terminal action so
+    trailing junk after it doesn't matter — the regex extracts the body
+    regardless).
+    """
+    closers: list[str] = []
+    tag_names: list[str] = ["submit"]  # always recoverable
+    if enable_write_and_run:
+        closers.append("</write_and_run>")
+        tag_names.append("write_and_run")
     if enable_search_tools:
-        return (
-            ["</write_and_run>", "</grep>", "</read>", "</ls>"],
-            ["submit", "write_and_run", "grep", "read", "ls"],
-        )
-    return (
-        ["</submit>", "</write_and_run>"],
-        ["submit", "write_and_run"],
-    )
+        closers.extend(["</grep>", "</read>", "</ls>"])
+        tag_names.extend(["grep", "read", "ls"])
+    if len(closers) < 4:
+        # Have room for </submit> too — include it for tighter stopping.
+        closers.append("</submit>")
+    return closers, tag_names
 
 
 def _restore_closing_tag(text: str, tag_names: list[str]) -> str:
@@ -103,6 +115,7 @@ async def solve_verify(
     solved_subtasks: list[SolvedSubtask] | None = None,
     reference_knowledge: str | None = None,
     enable_search_tools: bool = True,
+    enable_write_and_run: bool = True,
 ) -> RewireSessionResult:
     """Drive a `SourceSolverEnv` session to completion.
 
@@ -138,9 +151,10 @@ async def solve_verify(
             max_turns=max_turns,
             renderer=renderer,
             enable_search_tools=enable_search_tools,
+            enable_write_and_run=enable_write_and_run,
         )
         litellm_stop_sequences, litellm_tag_names = _stop_sequences_for(
-            enable_search_tools
+            enable_search_tools, enable_write_and_run
         )
 
         ob_messages = await msg_env.initial_observation()

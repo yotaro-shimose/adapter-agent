@@ -28,6 +28,17 @@ from tinker_cookbook.renderers.base import Message as TinkerMessage
 from tinker_cookbook.renderers.base import ToolSpec
 from tinker_cookbook.rl.message_env import MessageEnv
 
+logger = logging.getLogger(__name__)
+
+
+def _short_preview(text: str, limit: int = 400) -> str:
+    """Single-line preview of a tool result/code blob for log streams.
+    Keeps logs readable when the agent emits a large file body."""
+    one_line = text.replace("\n", " ⏎ ")
+    if len(one_line) <= limit:
+        return one_line
+    return one_line[:limit] + f" ... ({len(one_line) - limit} more chars)"
+
 from adapter_agent.hierarchical.agent.verifier import Verifier
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.rl.env.conclusion import SSConclusion
@@ -260,6 +271,11 @@ class SourceSolverEnv(MessageEnv):
     # tells the solver which API to use — re-discovery via search would defeat
     # the purpose. Also keeps stop-sequence count low enough for Gemini.
     enable_search_tools: bool = True
+    # When False, `<write_and_run>` is rejected — the solver gets exactly one
+    # shot via `<submit>` with no compile-and-run feedback loop. Used to
+    # handicap a strong policy (e.g. Gemini) so its eval score reflects
+    # one-shot reasoning instead of iterative debugging.
+    enable_write_and_run: bool = True
 
     async def initial_observation(self) -> list[TinkerMessage]:
         if not self.history:
@@ -297,6 +313,10 @@ class SourceSolverEnv(MessageEnv):
         try:
             self.history.append(message)
             self.mutable_state.remaining_turns -= 1
+            turn_used = (
+                self.mutable_state.total_turns - self.mutable_state.remaining_turns
+            )
+            turn_total = self.mutable_state.total_turns
 
             if isinstance(message["content"], str):
                 text_content = message["content"]
@@ -307,6 +327,13 @@ class SourceSolverEnv(MessageEnv):
                     if part["type"] == "text"
                 )
 
+            logger.debug(
+                "[turn %d/%d] assistant: %s",
+                turn_used,
+                turn_total,
+                _short_preview(text_content),
+            )
+
             # Multi-tag rejection (one tool tag per response).
             all_tags = re.findall(
                 r"<(grep|read|ls|write_and_run|submit)\b",
@@ -314,6 +341,12 @@ class SourceSolverEnv(MessageEnv):
                 re.DOTALL,
             )
             if len(all_tags) > 1:
+                logger.debug(
+                    "[turn %d/%d] rejected: multiple tool tags %s",
+                    turn_used,
+                    turn_total,
+                    sorted(set(all_tags)),
+                )
                 error_content = (
                     f"[SYSTEM ERROR] MULTIPLE_TOOL_TAGS_DETECTED\n"
                     f"You attempted to use multiple tool actions in a single response: {', '.join(set(all_tags))}.\n"
@@ -336,11 +369,48 @@ class SourceSolverEnv(MessageEnv):
 
             # write_and_run — overwrite src/main.rs and run cargo.
             wr = re.search(r"<write_and_run>(.*?)</write_and_run>", text_content, re.DOTALL)
+            if wr and not self.enable_write_and_run:
+                error_content = (
+                    "[SYSTEM ERROR] WRITE_AND_RUN_DISABLED\n"
+                    "The `<write_and_run>` tool is not available in this session. "
+                    "You must commit to your final answer with `<submit>` directly — "
+                    "you do not get to test-run code in this environment."
+                )
+                self.history.append(self._user_msg(error_content))
+                if self.mutable_state.remaining_turns <= 0:
+                    return SSStepResult(
+                        reward=0.0,
+                        episode_done=True,
+                        next_messages=self.history,
+                        conclusion="max_turns_exceeded",
+                    )
+                # Re-use the generic "not_finished" continuation conclusion —
+                # extending SSConclusion would require touching SSMetrics and
+                # the RL aggregator, and this is only ever an eval-time path.
+                return SSStepResult(
+                    reward=0.0,
+                    episode_done=False,
+                    next_messages=self.history,
+                    conclusion="not_finished",
+                )
             if wr:
                 code = wr.group(1).strip()
+                logger.debug(
+                    "[turn %d/%d] write_and_run (%d chars): %s",
+                    turn_used,
+                    turn_total,
+                    len(code),
+                    _short_preview(code),
+                )
                 async with self.runtime_pool.acquire() as runtime:
                     await runtime.set_content("src/main.rs", code)
                     run_ret, _ = await runtime.run_cargo()
+                logger.debug(
+                    "[turn %d/%d] cargo result: %s",
+                    turn_used,
+                    turn_total,
+                    _short_preview(run_ret),
+                )
                 content = f"<CargoRunResult>\n{run_ret}\n</CargoRunResult>"
                 self.history.append(self._user_msg(content))
                 if self.mutable_state.remaining_turns <= 0:
@@ -362,6 +432,9 @@ class SourceSolverEnv(MessageEnv):
             if sub:
                 code = sub.group(1).strip()
                 if not code:
+                    logger.debug(
+                        "[turn %d/%d] submit: EMPTY", turn_used, turn_total
+                    )
                     self.history.append(self._user_msg(
                         "[SYSTEM ERROR] EMPTY_SUBMIT — your <submit> block was empty. Provide a complete `fn main()` program.",
                     ))
@@ -378,11 +451,25 @@ class SourceSolverEnv(MessageEnv):
                         next_messages=self.history,
                         conclusion="no_code_found",
                     )
+                logger.debug(
+                    "[turn %d/%d] submit (%d chars): %s",
+                    turn_used,
+                    turn_total,
+                    len(code),
+                    _short_preview(code),
+                )
                 async with self.runtime_pool.acquire() as runtime:
                     await runtime.set_content("src/main.rs", code)
                     reward, conclusion, observation = await self.reward_fn(
                         self.history, runtime=runtime
                     )
+                logger.debug(
+                    "[turn %d/%d] verdict: reward=%s conclusion=%s",
+                    turn_used,
+                    turn_total,
+                    reward,
+                    conclusion,
+                )
                 self.history.append(TinkerMessage(role="user", content=observation))
                 return SSStepResult(
                     reward=reward,
@@ -394,6 +481,7 @@ class SourceSolverEnv(MessageEnv):
             # ls
             ls_match = re.search(r"<ls>(.*?)</ls>", text_content, re.DOTALL)
             if ls_match:
+                arg = ls_match.group(1).strip()
                 if not self.enable_search_tools:
                     output = (
                         "[SYSTEM ERROR] SEARCH_DISABLED — `<ls>` is not "
@@ -402,6 +490,10 @@ class SourceSolverEnv(MessageEnv):
                     )
                 else:
                     output = self._do_ls(ls_match.group(1))
+                logger.debug(
+                    "[turn %d/%d] ls %r -> %s",
+                    turn_used, turn_total, arg, _short_preview(output),
+                )
                 self.history.append(self._user_msg(output))
                 if self.mutable_state.remaining_turns <= 0:
                     return SSStepResult(
@@ -420,6 +512,7 @@ class SourceSolverEnv(MessageEnv):
             # read
             rd = re.search(r"<read>(.*?)</read>", text_content, re.DOTALL)
             if rd:
+                arg = rd.group(1).strip()
                 if not self.enable_search_tools:
                     output = (
                         "[SYSTEM ERROR] SEARCH_DISABLED — `<read>` is not "
@@ -428,6 +521,10 @@ class SourceSolverEnv(MessageEnv):
                     )
                 else:
                     output = self._do_read(rd.group(1))
+                logger.debug(
+                    "[turn %d/%d] read %r -> %s",
+                    turn_used, turn_total, arg, _short_preview(output),
+                )
                 self.history.append(self._user_msg(output))
                 if self.mutable_state.remaining_turns <= 0:
                     return SSStepResult(
@@ -446,6 +543,7 @@ class SourceSolverEnv(MessageEnv):
             # grep
             gr = re.search(r"<grep>(.*?)</grep>", text_content, re.DOTALL)
             if gr:
+                arg = gr.group(1).strip()
                 if not self.enable_search_tools:
                     output = (
                         "[SYSTEM ERROR] SEARCH_DISABLED — `<grep>` is not "
@@ -454,6 +552,10 @@ class SourceSolverEnv(MessageEnv):
                     )
                 else:
                     output = self._do_grep(gr.group(1))
+                logger.debug(
+                    "[turn %d/%d] grep %r -> %s",
+                    turn_used, turn_total, _short_preview(arg, 200), _short_preview(output),
+                )
                 self.history.append(self._user_msg(output))
                 if self.mutable_state.remaining_turns <= 0:
                     return SSStepResult(
@@ -474,6 +576,11 @@ class SourceSolverEnv(MessageEnv):
                 "<grep>, <read>, <ls>, <write_and_run>, or <submit>"
                 if self.enable_search_tools
                 else "<write_and_run> or <submit>"
+            )
+            logger.debug(
+                "[turn %d/%d] rejected: no tool tag in assistant message",
+                turn_used,
+                turn_total,
             )
             error_content = (
                 "[SYSTEM ERROR] NO_TOOL_TAG\n"
@@ -504,6 +611,7 @@ def get_source_solver_initial_messages(
     renderer: Renderer | None,
     max_turns: int,
     enable_search_tools: bool = True,
+    enable_write_and_run: bool = True,
 ) -> list[TinkerMessage]:
     one_tag_rule = (
         "Emit EXACTLY ONE tool tag per response. "
@@ -521,15 +629,21 @@ def get_source_solver_initial_messages(
             "discover what types and methods exist before writing code."
         )
 
+    tool_lines: list[str] = []
     if enable_search_tools:
-        tools_block = """- `<ls>relative/path</ls>` — list immediate children of a directory inside the library source.
-- `<read>relative/path</read>` or `<read>relative/path:START-END</read>` — read a source file (optionally a 1-indexed inclusive line range).
-- `<grep>pattern</grep>` or `<grep>{"pattern": "...", "path": "subdir/"}</grep>` — Python-regex search across `*.rs` files. Default path is the library root. JSON form is optional.
-- `<write_and_run>...rust source...</write_and_run>` — overwrite `src/main.rs` with the contents and run `cargo run`; output is returned to you.
-- `<submit>...rust source...</submit>` — your final `src/main.rs`. ENDS the task and triggers verification."""
-    else:
-        tools_block = """- `<write_and_run>...rust source...</write_and_run>` — overwrite `src/main.rs` with the contents and run `cargo run`; output is returned to you.
-- `<submit>...rust source...</submit>` — your final `src/main.rs`. ENDS the task and triggers verification."""
+        tool_lines.extend([
+            "- `<ls>relative/path</ls>` — list immediate children of a directory inside the library source.",
+            "- `<read>relative/path</read>` or `<read>relative/path:START-END</read>` — read a source file (optionally a 1-indexed inclusive line range).",
+            '- `<grep>pattern</grep>` or `<grep>{"pattern": "...", "path": "subdir/"}</grep>` — Python-regex search across `*.rs` files. Default path is the library root. JSON form is optional.',
+        ])
+    if enable_write_and_run:
+        tool_lines.append(
+            "- `<write_and_run>...rust source...</write_and_run>` — overwrite `src/main.rs` with the contents and run `cargo run`; output is returned to you."
+        )
+    tool_lines.append(
+        "- `<submit>...rust source...</submit>` — your final `src/main.rs`. ENDS the task and triggers verification."
+    )
+    tools_block = "\n".join(tool_lines)
 
     PROMPT = f"""<Role>
 {role_blurb}
@@ -545,25 +659,42 @@ def get_source_solver_initial_messages(
 You have at most {max_turns} turns total (1 tool call per turn). Each tool result
 is prefixed with `[turn k/{max_turns}]` so you always know where you are.
 If you reach the final turn without `<submit>`, the task is LOST. Pace yourself:
-{"explore early, then verify with `<write_and_run>` and `<submit>` while you still have budget."
-if enable_search_tools else
-"iterate with `<write_and_run>` to debug, then `<submit>` while you still have budget."}
+{
+    ("explore early, then verify with `<write_and_run>` and `<submit>` while you still have budget."
+     if enable_write_and_run else
+     "explore the source, reason carefully, then commit with `<submit>` — there is no test-run loop in this session.")
+    if enable_search_tools else
+    ("iterate with `<write_and_run>` to debug, then `<submit>` while you still have budget."
+     if enable_write_and_run else
+     "you have one shot: think carefully and emit `<submit>` directly — no exploration, no test-run loop.")
+}
 </Budget>
 """
 
     if enable_search_tools:
         guideline_bullets = [
-            f"- Start by exploring the `{env_state.library_name}` source layout (`<ls>src/</ls>`) before writing code.",
+            f"- The top-level `src/` listing for `{env_state.library_name}` is shown in `<LibrarySrcLayout>` below — pick a starting point and use `<grep>` / `<read>` (or `<ls>` for deeper subdirs) from there. Don't burn a turn re-listing `src/`.",
             "- Use `<grep>` to locate types/functions (e.g. `pub struct CsrMatrix`, `pub fn .*row`). Use `<read>` for surrounding context.",
-            "- Always verify with `<write_and_run>` before `<submit>`.",
         ]
     else:
         guideline_bullets = [
             "- You do NOT have library-source search this session. Rely on the "
             "task description and any `<ReferenceKnowledge>` / `<SolvedSubtasks>` "
             "below to know which API to call.",
-            "- Always verify with `<write_and_run>` before `<submit>`.",
         ]
+    if enable_write_and_run:
+        guideline_bullets.append(
+            "- Always verify with `<write_and_run>` before `<submit>`. "
+            "Compilation success is NOT enough — READ the printed output and "
+            "sanity-check it against the task at a few reference points "
+            "(boundaries, zero inputs, range endpoints). If the print is "
+            "opaque (e.g. truncated arrays), print specific indices."
+        )
+    else:
+        guideline_bullets.append(
+            "- There is NO test-run loop in this session: `<write_and_run>` is disabled. "
+            "Reason about the code carefully and emit `<submit>` directly. You get one shot."
+        )
     if env_state.reference_knowledge:
         guideline_bullets.insert(
             0,
@@ -574,6 +705,10 @@ if enable_search_tools else
             "- `<SolvedSubtasks>` shows verified solutions to related problems — reuse the patterns."
         )
     PROMPT += f"\n<Guidelines>\n{chr(10).join(guideline_bullets)}\n</Guidelines>\n"
+
+    if enable_search_tools:
+        src_listing = do_ls(env_state.libdir, "src")
+        PROMPT += f"\n<LibrarySrcLayout>\n{src_listing}\n</LibrarySrcLayout>\n"
 
     if env_state.solved_subtasks:
         subtask_blocks = []
@@ -618,6 +753,7 @@ async def build_source_solver_msg_env(
     max_turns: int = 12,
     renderer: Renderer | None = None,
     enable_search_tools: bool = True,
+    enable_write_and_run: bool = True,
 ) -> SourceSolverEnv:
     exclude = ["target", ".git"]
     async with runtime_pool.acquire() as runtime:
@@ -631,12 +767,14 @@ async def build_source_solver_msg_env(
         initial_state=env_state,
         runtime_pool=runtime_pool,
         enable_search_tools=enable_search_tools,
+        enable_write_and_run=enable_write_and_run,
         initial_messages=get_source_solver_initial_messages(
             env_state=env_state,
             tools=[],
             renderer=renderer,
             max_turns=max_turns,
             enable_search_tools=enable_search_tools,
+            enable_write_and_run=enable_write_and_run,
         ),
         reward_fn=LLMAsAJudgeSingleTurn(
             task=env_state.task,

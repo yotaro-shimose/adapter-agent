@@ -1,25 +1,31 @@
-"""study2_pipeline.py — fully pipelined study2 + study2_augment.
+"""study2_pipeline.py — stage-aware study2 + study2_augment pipeline.
 
-For each gh_archive task we run a coroutine that:
-  1. PLAN: source-aware planner enumerates `<InvestigationTarget>` items
-     (`plan_with_tools`).
-  2. INVESTIGATE: per item, `solve_verify` (search ON) writes + verifies a
-     code example. The result is persisted to `study2` SFT cache. If the
-     verifier accepts, the (instruction, answer) pair feeds the next stage.
-  3. AUGMENT: source-aware augmenter (`propose_variants`) proposes N
-     variants that exercise the same API but describe the goal in pure
-     problem-domain language (no API names leaked).
-  4. VARIANT VERIFY: per variant, `solve_verify` (search OFF) — fed the
-     original (instruction, answer) as a `SolvedSubtask` hint — writes
-     fresh code and only verified variants are persisted to `study2_aug`.
+Two start modes selected by `CONFIG.start_stage`:
+
+  - StartStage.PLAN: full pipeline. For each gh_archive task:
+      1. PLAN: source-aware planner enumerates `<InvestigationTarget>` items
+         (`plan_with_tools`).
+      2. INVESTIGATE: per item, `solve_verify` (search ON) writes + verifies a
+         code example. The result is persisted to the inv cache. If the
+         verifier accepts, the (instruction, answer) pair feeds the next stage.
+      3. AUGMENT: source-aware augmenter (`propose_variants`) proposes N
+         variants describing the goal in pure problem-domain language.
+      4. VARIANT VERIFY: per variant, `solve_verify` (search OFF) — fed the
+         original (instruction, answer) as a `SolvedSubtask` hint — writes
+         fresh code. Variants are persisted to the aug cache (verified or not).
+      5. REASON: verified variants get chain-of-thought filled in and land
+         in the qra cache as SFT-ready triples.
+
+  - StartStage.AUGMENT: skip plan + investigate. Read verified investigations
+    from an existing inv cache and run stages 3-5 only — useful when you want
+    more QRAs without re-running the expensive verify step.
 
 There is NO barrier between stages. As soon as one task's plan returns,
 its items start investigating; as soon as one item verifies, its augmenter
-fires; as soon as variants are proposed, they start verifying. The four
-semaphores below independently bound concurrency for each stage.
+fires; as soon as variants are proposed, they start verifying.
 
-Runtime: cloudrun, one shared RuntimePool sized to peak concurrent
-solve_verify load (INVESTIGATOR + VARIANT_VERIFIER).
+Runtime: cloudrun, one shared RuntimePool sized to the peak concurrent
+solve_verify load.
 
 Run with:
     uv run scripts/study2_pipeline.py
@@ -27,31 +33,33 @@ Run with:
 
 import asyncio
 import logging
-import re
 from dataclasses import dataclass
+from enum import Enum
 
 from agents import set_tracing_disabled
 from dotenv import load_dotenv
-from prisma import Json, Prisma
+from oai_utils.litellm import litellm_concurrent_limit
+from prisma import Prisma
 
-from adapter_agent.data import PydanticTinkerBaseMessage
 from adapter_agent.hierarchical.gh import load_gh_archive
-from adapter_agent.hierarchical.process.augment import (
-    Variants,
-    propose_variants,
-)
 from adapter_agent.hierarchical.process.plan_with_tools import (
     InvestigationPlan,
     plan_with_tools,
 )
-from adapter_agent.hierarchical.process.reasoner import fill_reasoning
-from adapter_agent.hierarchical.process.solve_verify import solve_verify
+from adapter_agent.hierarchical.qra_pipeline import (
+    Investigation,
+    InvestigationDispatch,
+    StageContext,
+    augment_verify_reason,
+    ensure_cache,
+    load_investigations_from_cache,
+    persist_investigation,
+    run_investigate,
+)
 from adapter_agent.hierarchical.types import Task
 from adapter_agent.library.library_spec import LibrarySpec
 from adapter_agent.model_helper import get_gemini, get_gemini_lite
 from adapter_agent.rl.env.runtime_pool import RuntimePool
-from adapter_agent.rl.env.session_result import RewireSessionResultSuccess
-from adapter_agent.rl.solved_subtask import SolvedSubtask
 from adapter_agent.util.logger_util import setup_base_loglevel
 
 set_tracing_disabled(True)
@@ -64,240 +72,223 @@ setup_base_loglevel()
 logger = logging.getLogger(__name__)
 
 
-# === Workload ===
-NUM_TASKS = slice(0, 30)
-ITEMS_PER_TASK_LIMIT = 5
-VARIANTS_PER_ITEM = 3
-
-# === Concurrency dials (independent semaphores per stage) ===
-PLANNER_CONCURRENCY = 50
-INVESTIGATOR_CONCURRENCY = 50
-AUGMENTER_CONCURRENCY = 50
-VARIANT_VERIFIER_CONCURRENCY = 100
-# Reasoning stage: pure LLM, no docker / cargo. Pump it up.
-REASONER_CONCURRENCY = 100
-
-# === Per-call turn budgets ===
-PLANNER_MAX_TURNS = 16
-INVESTIGATION_MAX_TURNS = 12
-AUGMENT_MAX_TURNS = 16
-VARIANT_VERIFY_MAX_TURNS = 12
-
-# === Cache ids ===
-# `EXPERIMENT_ID` namespaces both caches under one experiment so multiple
-# pipeline runs (or standalone study2 runs) don't trample each other. Bump
-# it when you want a fresh experiment kept side-by-side with previous ones;
-# leave it stable to overwrite on each run.
-EXPERIMENT_ID = "pipeline_v1"
-STUDY2_CACHE_ID = f"{EXPERIMENT_ID}_inv"
-AUGMENT_CACHE_ID = f"{EXPERIMENT_ID}_aug"
-# QRA cache holds verified variants with reasoning filled in (the SFT-ready
-# triples). Only verified variants — original investigations are skipped.
-QRA_CACHE_ID = f"{EXPERIMENT_ID}_qra"
-
-# === Runtime ===
-# Shared cloudrun pool sized to the peak concurrent solve_verify load.
-# (Planner + augmenter don't need runtimes — pure LLM calls.)
-RUNTIME_POOL_MAX_SIZE = INVESTIGATOR_CONCURRENCY + VARIANT_VERIFIER_CONCURRENCY
+# === Start-stage selector ===========================================
 
 
-# --- Data classes ---
+class StartStage(Enum):
+    """Where the pipeline begins.
+
+    PLAN: full pipeline. inv cache is the OUTPUT of investigate stage.
+    AUGMENT: skip plan + investigate. inv cache is the INPUT (verified rows
+        are reconstituted into Investigation objects and feed the aug stage).
+    """
+
+    PLAN = "plan"
+    AUGMENT = "augment"
+
+
+# === Sub-configs ====================================================
 
 
 @dataclass(frozen=True)
-class InvestigationDispatch:
-    task_id: str
-    task_instruction: str
-    item: str
+class WorkloadConfig:
+    """How much work to do per task.
 
+    `num_tasks` is only consumed in PLAN mode (it slices gh_archive). In
+    AUGMENT mode the work volume is set by how many verified rows live in
+    the source inv cache.
+    """
 
-@dataclass
-class Investigation:
-    dispatch: InvestigationDispatch
-    success: bool
-    conclusion: str
-    submit_code: str | None
-    verifier_reasoning: str | None
-    trials: list | None = None
-    reward: float | None = None
-    error: str | None = None
+    num_tasks: slice = slice(0, 30)
+    items_per_task_limit: int = 5
+    variants_per_item: int = 3
 
 
 @dataclass(frozen=True)
-class AugmentDispatch:
-    """One verified-investigation × one variant."""
+class StageConfig:
+    """Concurrency dials and per-call turn budgets.
 
-    investigation: Investigation
-    variant_instruction: str
+    Each stage's semaphore is independent; planner + augmenter + reasoner
+    are pure-LLM (no docker/cargo) so they can be pumped higher.
+    """
 
+    planner_concurrency: int = 50
+    investigator_concurrency: int = 50
+    augmenter_concurrency: int = 50
+    variant_verifier_concurrency: int = 100
+    reasoner_concurrency: int = 100
 
-@dataclass
-class AugmentResult:
-    dispatch: AugmentDispatch
-    success: bool
-    conclusion: str
-    submit_code: str | None
-    verifier_reasoning: str | None
-    trials: list | None = None
-    reward: float | None = None
-    error: str | None = None
-
-
-# --- Helpers (mirrors study2.py / study2_augment.py — kept inline so the
-#     pipeline script is self-contained and changes here don't ripple back). ---
+    planner_max_turns: int = 15
+    investigation_max_turns: int = 10
+    variant_verify_max_turns: int = 4
 
 
-def _serialize_trials(trials) -> list:
-    return [
-        PydanticTinkerBaseMessage.model_validate(m).model_dump(
-            mode="json", exclude_none=True
+@dataclass(frozen=True)
+class CacheConfig:
+    """Cache ids for each stage's persistence target.
+
+    PLAN mode: all three are outputs; existing rows are dropped and recreated.
+    AUGMENT mode: `inv_cache_id` is the read-only input; `aug_cache_id` and
+    `qra_cache_id` are outputs and get the drop+create treatment iff
+    `reset_target_caches=True`.
+    """
+
+    inv_cache_id: str
+    aug_cache_id: str
+    qra_cache_id: str
+    reset_target_caches: bool = True
+    verified_only_source: bool = True  # AUGMENT mode: filter inv rows
+
+
+@dataclass(frozen=True)
+class PipelineRecipe:
+    start_stage: StartStage
+    library_spec: LibrarySpec
+    workload: WorkloadConfig
+    stage: StageConfig
+    cache: CacheConfig
+
+    @property
+    def runtime_pool_max_size(self) -> int:
+        # PLAN mode runs investigator + variant-verifier concurrently;
+        # AUGMENT mode only the latter. Size to the actual peak.
+        if self.start_stage == StartStage.PLAN:
+            return (
+                self.stage.investigator_concurrency
+                + self.stage.variant_verifier_concurrency
+            )
+        return self.stage.variant_verifier_concurrency
+
+    @property
+    def litellm_pool_size(self) -> int:
+        s = self.stage
+        if self.start_stage == StartStage.PLAN:
+            return (
+                s.planner_concurrency
+                + s.investigator_concurrency
+                + s.augmenter_concurrency
+                + s.variant_verifier_concurrency
+                + s.reasoner_concurrency
+            )
+        return (
+            s.augmenter_concurrency
+            + s.variant_verifier_concurrency
+            + s.reasoner_concurrency
         )
-        for m in trials
-    ]
 
 
-def _extract_submit(trials) -> str | None:
-    for msg in reversed(trials):
-        content = msg.get("content")
-        if isinstance(content, str):
-            text = content
-        elif isinstance(content, list):
-            text = "".join(p.get("text", "") for p in content if p.get("type") == "text")
-        else:
-            continue
-        m = re.search(r"<submit>(.*?)</submit>", text, re.DOTALL)
-        if m:
-            return m.group(1).strip()
-    return None
+# === Recipes ========================================================
 
+# Original behaviour: full plan → investigate → augment → verify → reason.
+FULL_PIPELINE_V1 = PipelineRecipe(
+    start_stage=StartStage.PLAN,
+    library_spec=LibrarySpec.hisab(),
+    workload=WorkloadConfig(),
+    stage=StageConfig(),
+    cache=CacheConfig(
+        inv_cache_id="pipeline_v1_inv",
+        aug_cache_id="pipeline_v1_aug",
+        qra_cache_id="pipeline_v1_qra",
+    ),
+)
 
-def _build_investigation_task(item: str, library_name: str) -> str:
-    return f"""\
-Investigate the following aspect of the `{library_name}` library and produce a
-runnable Rust code example that demonstrates it.
+# Re-run aug → verify → reason against the v1 inv cache to grow QRA volume
+# without re-investigating. Outputs land in `_v2`-suffixed caches so the
+# original aug/qra caches stay intact and side-by-side.
+AUGMENT_FROM_V1 = PipelineRecipe(
+    start_stage=StartStage.AUGMENT,
+    library_spec=LibrarySpec.hisab(),
+    workload=WorkloadConfig(variants_per_item=8),
+    stage=StageConfig(),
+    cache=CacheConfig(
+        inv_cache_id="pipeline_v1_inv",
+        aug_cache_id="pipeline_v1_aug_v2",
+        qra_cache_id="pipeline_v1_qra_v2",
+    ),
+)
 
-<InvestigationTarget>
-{item}
-</InvestigationTarget>
-
-Requirements for your final `<submit>`:
-- A complete `fn main()` program (no missing pieces).
-- It MUST exercise the actual `{library_name}` API named by the investigation
-  target — not a hand-rolled equivalent in plain std.
-- It MUST compile and run successfully via `cargo run`.
-- It SHOULD print output that makes the demonstrated behavior visible
-  (e.g. computed values, intermediate states).
-- Keep it minimal — just enough to clearly show how the API is used.
-"""
-
-
-def _build_variant_task(variant: str, library_name: str) -> str:
-    return f"""\
-{variant}
-
-Requirements for your final `<submit>`:
-- A complete `fn main()` program (no missing pieces).
-- It MUST exercise the actual `{library_name}` API needed by the task — not
-  a hand-rolled equivalent in plain std.
-- It MUST compile and run successfully via `cargo run`.
-- It SHOULD print output that makes the demonstrated behavior visible.
-- Keep it minimal — just enough to clearly satisfy the task.
-"""
-
-
-_INVESTIGATION_TARGET_RE = re.compile(
-    r"<InvestigationTarget>\s*([\s\S]*?)\s*</InvestigationTarget>"
+# Version 2: full plan → investigate → augment → verify → reason from
+# scratch, sized 5x larger than v1 — 150 gh_archive tasks instead of 30,
+# and 8 augmented variants per investigation instead of 3. Lands in its
+# own `pipeline_v2_*` caches so v1's caches remain untouched.
+FULL_PIPELINE_V2 = PipelineRecipe(
+    start_stage=StartStage.PLAN,
+    library_spec=LibrarySpec.hisab(),
+    workload=WorkloadConfig(
+        num_tasks=slice(0, 150),
+        variants_per_item=8,
+    ),
+    stage=StageConfig(),
+    cache=CacheConfig(
+        inv_cache_id="pipeline_v2_inv",
+        aug_cache_id="pipeline_v2_aug",
+        qra_cache_id="pipeline_v2_qra",
+    ),
 )
 
 
-# --- Persistence ---
+# Smoke run on numrs2: same shape as v1 but downsized to 10 tasks × 5 items
+# × 3 variants. Dedicated `_numrs2` cache ids so the existing hisab v1/v2
+# caches stay intact.
+SMOKE_NUMRS2 = PipelineRecipe(
+    start_stage=StartStage.PLAN,
+    library_spec=LibrarySpec.numrs2(),
+    workload=WorkloadConfig(
+        num_tasks=slice(0, 10),
+        items_per_task_limit=5,
+        variants_per_item=3,
+    ),
+    stage=StageConfig(),
+    cache=CacheConfig(
+        inv_cache_id="pipeline_smoke_numrs2_inv",
+        aug_cache_id="pipeline_smoke_numrs2_aug",
+        qra_cache_id="pipeline_smoke_numrs2_qra",
+    ),
+)
+
+# Numrs2 equivalent of FULL_PIPELINE_V2: 150 gh_archive tasks × 5 items × 8
+# variants. Dedicated `_numrs2`-suffixed cache ids so the hisab v1/v2 caches
+# stay intact and side-by-side.
+FULL_PIPELINE_V2_NUMRS2 = PipelineRecipe(
+    start_stage=StartStage.PLAN,
+    library_spec=LibrarySpec.numrs2(),
+    workload=WorkloadConfig(
+        num_tasks=slice(0, 150),
+        variants_per_item=8,
+    ),
+    stage=StageConfig(),
+    cache=CacheConfig(
+        inv_cache_id="pipeline_v2_inv_numrs2",
+        aug_cache_id="pipeline_v2_aug_numrs2",
+        qra_cache_id="pipeline_v2_qra_numrs2",
+    ),
+)
 
 
-async def _persist_investigation(prisma: Prisma, inv: Investigation) -> None:
-    d = inv.dispatch
-    item_label = d.item if len(d.item) <= 120 else d.item[:117] + "..."
-    data: dict = {
-        "cache_id": STUDY2_CACHE_ID,
-        "knowledge_id": d.task_id,
-        "knowledge_title": item_label,
-        "question": _build_investigation_task(d.item, "").replace("``", "").strip(),
-        "reasoning": "",
-        "answer": inv.submit_code or "",
-        "verified": inv.success,
-        "verifier_reasoning": inv.verifier_reasoning or (inv.error or ""),
-        "conclusion": inv.conclusion,
-    }
-    if inv.trials is not None:
-        data["trials_json"] = Json(inv.trials)
-    if inv.reward is not None:
-        data["reward"] = inv.reward
-    await prisma.sftcacheitem.create(data=data)
-
-
-async def _persist_qra(prisma: Prisma, r: AugmentResult, reasoning: str) -> None:
-    """Persist a verified variant with reasoning filled in — the SFT-ready
-    QRA triple. Only called for variants that already verified."""
-    d = r.dispatch
-    title = d.variant_instruction
-    title = title if len(title) <= 120 else title[:117] + "..."
-    await prisma.sftcacheitem.create(data={
-        "cache_id": QRA_CACHE_ID,
-        "knowledge_id": f"{d.investigation.dispatch.task_id}#qra",
-        "knowledge_title": title,
-        "question": d.variant_instruction,
-        "reasoning": reasoning,
-        "answer": r.submit_code or "",
-        # Source variant was already verified — reasoning is descriptive.
-        "verified": True,
-        "verifier_reasoning": "",
-        "conclusion": "reasoning_filled",
-    })
-
-
-async def _persist_variant(prisma: Prisma, r: AugmentResult) -> None:
-    d = r.dispatch
-    title = d.variant_instruction
-    title = title if len(title) <= 120 else title[:117] + "..."
-    data: dict = {
-        "cache_id": AUGMENT_CACHE_ID,
-        # Source-link knowledge_id back to the original task.
-        "knowledge_id": f"{d.investigation.dispatch.task_id}#aug",
-        "knowledge_title": title,
-        "question": d.variant_instruction,
-        "reasoning": "",
-        "answer": r.submit_code or "",
-        "verified": r.success,
-        "verifier_reasoning": r.verifier_reasoning or (r.error or ""),
-        "conclusion": r.conclusion,
-    }
-    if r.trials is not None:
-        data["trials_json"] = Json(r.trials)
-    if r.reward is not None:
-        data["reward"] = r.reward
-    await prisma.sftcacheitem.create(data=data)
+CONFIG: PipelineRecipe = FULL_PIPELINE_V2_NUMRS2
 
 
 # --- Stage runners (each acquires its own semaphore) ---
+# Note: data classes, helpers, persistence, and shared stage runners
+# (run_investigate / run_augment / run_variant_verify / run_reason /
+# augment_verify_reason) now live in `adapter_agent.hierarchical.qra_pipeline`.
+# Only `_run_plan` stays inline here because its task framing is
+# study2-specific (gh_archive Task → investigation plan).
 
 
-async def _run_plan(
-    task: Task,
-    *,
-    library_spec: LibrarySpec,
-    library_summary: str,
-    planner_model,
-    sem: asyncio.Semaphore,
-    progress: dict,
-) -> InvestigationPlan | None:
+async def _run_plan(task: Task, ctx: StageContext) -> InvestigationPlan | None:
+    sem = ctx.sems["plan"]
+    progress = ctx.progresses["plan"]
+    spec = ctx.recipe.library_spec
     async with sem:
         try:
             plan = await plan_with_tools(
                 task_instruction=task.instruction,
-                library_name=library_spec.name,
-                libdir=library_spec.libdir,
-                library_summary=library_summary,
-                solver_model=planner_model,
-                max_turns=PLANNER_MAX_TURNS,
+                library_name=spec.name,
+                libdir=spec.libdir,
+                library_summary=ctx.library_summary,
+                solver_model=ctx.planner_model,
+                max_turns=ctx.recipe.stage.planner_max_turns,
             )
             progress["done"] += 1
             n = len(plan.items) if plan is not None else 0
@@ -318,354 +309,35 @@ async def _run_plan(
             return None
 
 
-async def _run_investigate(
-    dispatch: InvestigationDispatch,
-    *,
-    library_spec: LibrarySpec,
-    library_summary: str,
-    solver_model,
-    verifier_model,
-    runtime_pool: RuntimePool,
-    sem: asyncio.Semaphore,
-    progress: dict,
-) -> Investigation:
-    async with sem:
-        try:
-            result = await solve_verify(
-                solver_model=solver_model,
-                verifier_model=verifier_model,
-                task=Task(instruction=_build_investigation_task(
-                    dispatch.item, library_spec.name,
-                )),
-                libdir=library_spec.libdir,
-                library_name=library_spec.name,
-                runtime_pool=runtime_pool,
-                max_turns=INVESTIGATION_MAX_TURNS,
-                reference_knowledge=library_summary,
-                enable_search_tools=True,
-            )
-        except Exception as e:
-            progress["done"] += 1
-            print(
-                f"[inv ERR] {progress['done']}/{progress['total']} "
-                f"task={dispatch.task_id}: {e}",
-                flush=True,
-            )
-            logger.exception(f"investigator crashed: task={dispatch.task_id}")
-            return Investigation(
-                dispatch=dispatch,
-                success=False,
-                conclusion="exception",
-                submit_code=None,
-                verifier_reasoning=None,
-                error=str(e),
-            )
-
-        success = isinstance(result, RewireSessionResultSuccess)
-        submit = None
-        trials_serialized: list | None = None
-        if hasattr(result, "trials") and result.trials is not None:
-            submit = _extract_submit(result.trials)
-            try:
-                trials_serialized = _serialize_trials(result.trials)
-            except Exception:
-                logger.exception("failed to serialize investigation trials")
-        progress["done"] += 1
-        if success:
-            progress["ok"] += 1
-        mark = "OK  " if success else "FAIL"
-        conclusion = getattr(result, "conclusion", "unknown")
-        print(
-            f"[inv {mark}] {progress['done']}/{progress['total']} "
-            f"(ok={progress['ok']}) task={dispatch.task_id} conclusion={conclusion}",
-            flush=True,
-        )
-        return Investigation(
-            dispatch=dispatch,
-            success=success,
-            conclusion=conclusion,
-            submit_code=submit,
-            verifier_reasoning=getattr(result, "reasoning", None),
-            trials=trials_serialized,
-            reward=getattr(result, "reward", None),
-        )
-
-
-async def _run_augment(
-    inv: Investigation,
-    *,
-    library_spec: LibrarySpec,
-    library_summary: str,
-    augmenter_model,
-    sem: asyncio.Semaphore,
-    progress: dict,
-) -> Variants | None:
-    async with sem:
-        try:
-            v = await propose_variants(
-                original_instruction=inv.dispatch.item,
-                original_answer=inv.submit_code or "",
-                library_name=library_spec.name,
-                libdir=library_spec.libdir,
-                library_summary=library_summary,
-                n_variants=VARIANTS_PER_ITEM,
-                solver_model=augmenter_model,
-                max_turns=AUGMENT_MAX_TURNS,
-            )
-            progress["done"] += 1
-            n = len(v.variants) if v is not None else 0
-            mark = "ok " if v is not None else "FAIL"
-            print(
-                f"[aug {mark}] {progress['done']}/{progress['total']} "
-                f"task={inv.dispatch.task_id} -> {n} variants",
-                flush=True,
-            )
-            return v
-        except Exception as e:
-            progress["done"] += 1
-            print(
-                f"[aug ERR] {progress['done']}/{progress['total']} "
-                f"task={inv.dispatch.task_id}: {e}",
-                flush=True,
-            )
-            logger.exception(f"augmenter crashed: task={inv.dispatch.task_id}")
-            return None
-
-
-async def _run_variant_verify(
-    dispatch: AugmentDispatch,
-    *,
-    library_spec: LibrarySpec,
-    library_summary: str,
-    solver_model,
-    verifier_model,
-    runtime_pool: RuntimePool,
-    sem: asyncio.Semaphore,
-    progress: dict,
-) -> AugmentResult:
-    async with sem:
-        # Hand the verified original (instruction, answer) to the solver as
-        # a SolvedSubtask hint so it knows which API to use without searching.
-        solved = [SolvedSubtask(
-            instruction=dispatch.investigation.dispatch.item,
-            submit_code=dispatch.investigation.submit_code or "",
-        )]
-        try:
-            result = await solve_verify(
-                solver_model=solver_model,
-                verifier_model=verifier_model,
-                task=Task(instruction=_build_variant_task(
-                    dispatch.variant_instruction, library_spec.name,
-                )),
-                libdir=library_spec.libdir,
-                library_name=library_spec.name,
-                runtime_pool=runtime_pool,
-                max_turns=VARIANT_VERIFY_MAX_TURNS,
-                solved_subtasks=solved,
-                reference_knowledge=library_summary,
-                # SolvedSubtask hint already carries the API; allowing source
-                # search here would let the solver drift to unrelated APIs.
-                enable_search_tools=False,
-            )
-        except Exception as e:
-            progress["done"] += 1
-            print(
-                f"[var ERR] {progress['done']}/{progress['total']} "
-                f"task={dispatch.investigation.dispatch.task_id}: {e}",
-                flush=True,
-            )
-            logger.exception(
-                f"variant verifier crashed: task={dispatch.investigation.dispatch.task_id}"
-            )
-            return AugmentResult(
-                dispatch=dispatch,
-                success=False,
-                conclusion="exception",
-                submit_code=None,
-                verifier_reasoning=None,
-                error=str(e),
-            )
-
-        success = isinstance(result, RewireSessionResultSuccess)
-        submit = None
-        trials_serialized: list | None = None
-        if hasattr(result, "trials") and result.trials is not None:
-            submit = _extract_submit(result.trials)
-            try:
-                trials_serialized = _serialize_trials(result.trials)
-            except Exception:
-                logger.exception("failed to serialize variant trials")
-        progress["done"] += 1
-        if success:
-            progress["ok"] += 1
-        mark = "OK  " if success else "FAIL"
-        conclusion = getattr(result, "conclusion", "unknown")
-        print(
-            f"[var {mark}] {progress['done']}/{progress['total']} "
-            f"(ok={progress['ok']}) task={dispatch.investigation.dispatch.task_id} "
-            f"conclusion={conclusion}",
-            flush=True,
-        )
-        return AugmentResult(
-            dispatch=dispatch,
-            success=success,
-            conclusion=conclusion,
-            submit_code=submit,
-            verifier_reasoning=getattr(result, "reasoning", None),
-            trials=trials_serialized,
-            reward=getattr(result, "reward", None),
-        )
-
-
-async def _run_reason(
-    r: AugmentResult,
-    *,
-    library_spec: LibrarySpec,
-    library_summary: str,
-    reasoner_model,
-    sem: asyncio.Semaphore,
-    progress: dict,
-) -> str | None:
-    """Generate the chain-of-thought between the variant question and its
-    verified answer. Caller persists the result if non-None."""
-    async with sem:
-        try:
-            reasoning = await fill_reasoning(
-                question=r.dispatch.variant_instruction,
-                answer=r.submit_code or "",
-                library_name=library_spec.name,
-                library_summary=library_summary,
-                model=reasoner_model,
-            )
-            progress["done"] += 1
-            mark = "ok " if reasoning else "FAIL"
-            words = len(reasoning.split()) if reasoning else 0
-            print(
-                f"[qra {mark}] {progress['done']}/{progress['total']} "
-                f"task={r.dispatch.investigation.dispatch.task_id} words={words}",
-                flush=True,
-            )
-            return reasoning
-        except Exception as e:
-            progress["done"] += 1
-            print(
-                f"[qra ERR] {progress['done']}/{progress['total']} "
-                f"task={r.dispatch.investigation.dispatch.task_id}: {e}",
-                flush=True,
-            )
-            logger.exception(
-                f"reasoner crashed: task={r.dispatch.investigation.dispatch.task_id}"
-            )
-            return None
-
-
-# --- Per-task pipeline ---
-
-
-async def _process_task(
-    task: Task,
-    *,
-    library_spec: LibrarySpec,
-    library_summary: str,
-    planner_model,
-    solver_model,
-    verifier_model,
-    augmenter_model,
-    reasoner_model,
-    runtime_pool: RuntimePool,
-    sems: dict,
-    progresses: dict,
-    prisma: Prisma,
-) -> None:
-    """Run plan → investigate fan-out → augment fan-out → variant-verify."""
-    plan = await _run_plan(
-        task,
-        library_spec=library_spec,
-        library_summary=library_summary,
-        planner_model=planner_model,
-        sem=sems["plan"],
-        progress=progresses["plan"],
-    )
+async def _process_task_from_plan(task: Task, ctx: StageContext) -> None:
+    """PLAN mode: plan → investigate fan-out → (aug → var → qra)."""
+    plan = await _run_plan(task, ctx)
     if plan is None or not plan.items:
         return
 
-    items = plan.items[:ITEMS_PER_TASK_LIMIT]
+    items = plan.items[: ctx.recipe.workload.items_per_task_limit]
+    cache = ctx.recipe.cache
 
     async def _investigate_then_augment(item: str) -> None:
         dispatch = InvestigationDispatch(
-            task_id=task.id, task_instruction=task.instruction, item=item,
+            task_id=task.id, task_instruction=task.instruction, item=item
         )
-        inv = await _run_investigate(
-            dispatch,
-            library_spec=library_spec,
-            library_summary=library_summary,
-            solver_model=solver_model,
-            verifier_model=verifier_model,
-            runtime_pool=runtime_pool,
-            sem=sems["inv"],
-            progress=progresses["inv"],
-        )
+        inv = await run_investigate(dispatch, ctx)
         try:
-            await _persist_investigation(prisma, inv)
+            await persist_investigation(ctx.prisma, inv, cache_id=cache.inv_cache_id)
         except Exception:
             logger.exception(f"persist investigation failed: task={task.id}")
 
         if not inv.success or not inv.submit_code:
             return  # nothing to augment from
-
-        variants = await _run_augment(
-            inv,
-            library_spec=library_spec,
-            library_summary=library_summary,
-            augmenter_model=augmenter_model,
-            sem=sems["aug"],
-            progress=progresses["aug"],
-        )
-        if variants is None or not variants.variants:
-            return
-
-        dispatches = [
-            AugmentDispatch(investigation=inv, variant_instruction=v)
-            for v in variants.variants[:VARIANTS_PER_ITEM]
-        ]
-
-        async def _verify_and_persist(d: AugmentDispatch) -> None:
-            r = await _run_variant_verify(
-                d,
-                library_spec=library_spec,
-                library_summary=library_summary,
-                solver_model=solver_model,
-                verifier_model=verifier_model,
-                runtime_pool=runtime_pool,
-                sem=sems["var"],
-                progress=progresses["var"],
-            )
-            try:
-                await _persist_variant(prisma, r)
-            except Exception:
-                logger.exception(f"persist variant failed: task={task.id}")
-
-            # Stage 5 — reasoning fill (only on verified variants).
-            if not r.success or not r.submit_code:
-                return
-            reasoning = await _run_reason(
-                r,
-                library_spec=library_spec,
-                library_summary=library_summary,
-                reasoner_model=reasoner_model,
-                sem=sems["qra"],
-                progress=progresses["qra"],
-            )
-            if reasoning is None:
-                return
-            try:
-                await _persist_qra(prisma, r, reasoning)
-            except Exception:
-                logger.exception(f"persist qra failed: task={task.id}")
-
-        await asyncio.gather(*[_verify_and_persist(d) for d in dispatches])
+        await augment_verify_reason(inv, ctx)
 
     await asyncio.gather(*[_investigate_then_augment(it) for it in items])
+
+
+async def _process_investigation(inv: Investigation, ctx: StageContext) -> None:
+    """AUGMENT mode: skip plan + investigate. Run aug → var → qra only."""
+    await augment_verify_reason(inv, ctx)
 
 
 # --- Main ---
@@ -673,114 +345,172 @@ async def _process_task(
 
 async def main() -> None:
     load_dotenv()
-    library_spec = LibrarySpec.hisab()
-
-    tasks = load_gh_archive(difficulty=None, csv_path=library_spec.benchmark_csv)[
-        NUM_TASKS
-    ]
-    logger.info(f"Loaded {len(tasks)} tasks from {library_spec.benchmark_csv}.")
+    cfg = CONFIG
+    spec = cfg.library_spec
+    workload = cfg.workload
+    stage_cfg = cfg.stage
+    cache_cfg = cfg.cache
 
     try:
-        library_summary = library_spec.read_summary()
+        library_summary = spec.read_summary()
     except FileNotFoundError as e:
         raise SystemExit(str(e))
 
-    # Upper bounds for progress counters (actual totals depend on plan/inv survival).
-    n_tasks = len(tasks)
-    inv_total = n_tasks * ITEMS_PER_TASK_LIMIT
-    aug_total = inv_total
-    var_total = inv_total * VARIANTS_PER_ITEM
-
     print("\n" + "=" * 80)
+    print(f"PIPELINE — start_stage={cfg.start_stage.value}")
     print(
-        f"PIPELINE — {n_tasks} tasks, up to {ITEMS_PER_TASK_LIMIT} items × "
-        f"{VARIANTS_PER_ITEM} variants per task."
+        f"  concurrency: plan={stage_cfg.planner_concurrency} "
+        f"inv={stage_cfg.investigator_concurrency} "
+        f"aug={stage_cfg.augmenter_concurrency} "
+        f"var={stage_cfg.variant_verifier_concurrency} "
+        f"qra={stage_cfg.reasoner_concurrency}"
     )
+    print(f"  runtime pool: cloudrun, max_size={cfg.runtime_pool_max_size}")
     print(
-        f"  concurrency: plan={PLANNER_CONCURRENCY} inv={INVESTIGATOR_CONCURRENCY} "
-        f"aug={AUGMENTER_CONCURRENCY} var={VARIANT_VERIFIER_CONCURRENCY} "
-        f"qra={REASONER_CONCURRENCY}"
+        f"  caches: inv='{cache_cfg.inv_cache_id}' "
+        f"aug='{cache_cfg.aug_cache_id}' qra='{cache_cfg.qra_cache_id}'"
     )
-    print(f"  runtime pool: cloudrun, max_size={RUNTIME_POOL_MAX_SIZE}")
     print("=" * 80)
 
-    prisma = Prisma()
-    await prisma.connect()
-    runtime_pool: RuntimePool | None = None
-    try:
-        # Reset both target caches so each run starts fresh.
-        for cid, desc in [
-            (STUDY2_CACHE_ID,
-             f"study2 (pipelined): {n_tasks} tasks × ≤{ITEMS_PER_TASK_LIMIT} items."),
-            (AUGMENT_CACHE_ID,
-             f"study2_aug (pipelined): variants from study2 × {VARIANTS_PER_ITEM}."),
-        ]:
-            if await prisma.sftcache.find_unique(where={"id": cid}) is not None:
-                await prisma.sftcache.delete(where={"id": cid})
-                logger.info(f"Cleared existing '{cid}' SFT cache.")
-            await prisma.sftcache.create(data={
-                "id": cid,
-                "library_name": library_spec.name,
-                "description": desc,
-            })
-
-        # One shared cloudrun pool covers both investigator + variant verifier.
-        runtime_pool = RuntimePool(
-            settings=library_spec.cloudrun_runtime(),
-            max_size=RUNTIME_POOL_MAX_SIZE,
-        )
-
-        planner_model = get_gemini()
-        solver_model = get_gemini()
-        verifier_model = get_gemini_lite()
-        augmenter_model = get_gemini()
-
-        sems = {
-            "plan": asyncio.Semaphore(PLANNER_CONCURRENCY),
-            "inv": asyncio.Semaphore(INVESTIGATOR_CONCURRENCY),
-            "aug": asyncio.Semaphore(AUGMENTER_CONCURRENCY),
-            "var": asyncio.Semaphore(VARIANT_VERIFIER_CONCURRENCY),
-        }
-        progresses = {
-            "plan": {"done": 0, "total": n_tasks},
-            "inv": {"done": 0, "ok": 0, "total": inv_total},
-            "aug": {"done": 0, "total": aug_total},
-            "var": {"done": 0, "ok": 0, "total": var_total},
-        }
-
-        await asyncio.gather(*[
-            _process_task(
-                t,
-                library_spec=library_spec,
-                library_summary=library_summary,
-                planner_model=planner_model,
-                solver_model=solver_model,
-                verifier_model=verifier_model,
-                augmenter_model=augmenter_model,
-                runtime_pool=runtime_pool,
-                sems=sems,
-                progresses=progresses,
-                prisma=prisma,
+    # Pin LiteLLM's global httpx client to a pool sized for our peak
+    # concurrent LLM load — without this, default httpx limits (~100
+    # connections) leak into CLOSE_WAIT under sustained high concurrency
+    # and the pipeline progressively stalls.
+    async with litellm_concurrent_limit(max_concurrent=cfg.litellm_pool_size):
+        prisma = Prisma()
+        await prisma.connect()
+        runtime_pool: RuntimePool | None = None
+        try:
+            # PLAN mode owns the inv cache; AUGMENT mode reads it.
+            if cfg.start_stage == StartStage.PLAN:
+                await ensure_cache(
+                    prisma,
+                    cache_id=cache_cfg.inv_cache_id,
+                    library_name=spec.name,
+                    description=(
+                        f"study2 (pipelined): plan→investigate output, "
+                        f"workload={workload}."
+                    ),
+                    reset=cache_cfg.reset_target_caches,
+                )
+            await ensure_cache(
+                prisma,
+                cache_id=cache_cfg.aug_cache_id,
+                library_name=spec.name,
+                description=(
+                    f"study2_aug (pipelined): variants × {workload.variants_per_item}, "
+                    f"start_stage={cfg.start_stage.value}, "
+                    f"source_inv='{cache_cfg.inv_cache_id}'."
+                ),
+                reset=cache_cfg.reset_target_caches,
             )
-            for t in tasks
-        ])
+            await ensure_cache(
+                prisma,
+                cache_id=cache_cfg.qra_cache_id,
+                library_name=spec.name,
+                description=(
+                    f"study2 QRA (pipelined): SFT-ready triples from verified variants, "
+                    f"start_stage={cfg.start_stage.value}."
+                ),
+                reset=cache_cfg.reset_target_caches,
+            )
 
-        print("\n" + "=" * 80)
-        print(
-            f"DONE — plans: {progresses['plan']['done']}/{n_tasks} | "
-            f"inv: {progresses['inv']['ok']}/{progresses['inv']['done']} | "
-            f"aug: {progresses['aug']['done']} | "
-            f"var: {progresses['var']['ok']}/{progresses['var']['done']}"
-        )
-        print(
-            f"→ View in graphvis: SFT Caches tab — '{STUDY2_CACHE_ID}' and "
-            f"'{AUGMENT_CACHE_ID}'"
-        )
+            runtime_pool = RuntimePool(
+                settings=spec.cloudrun_runtime(),
+                max_size=cfg.runtime_pool_max_size,
+            )
 
-    finally:
-        if runtime_pool is not None:
-            await runtime_pool.close_all()
-        await prisma.disconnect()
+            ctx = StageContext(
+                recipe=cfg,
+                library_summary=library_summary,
+                runtime_pool=runtime_pool,
+                prisma=prisma,
+                planner_model=get_gemini(),
+                solver_model=get_gemini(),
+                verifier_model=get_gemini_lite(),
+                augmenter_model=get_gemini(),
+                reasoner_model=get_gemini(),
+                sems={
+                    "plan": asyncio.Semaphore(stage_cfg.planner_concurrency),
+                    "inv": asyncio.Semaphore(stage_cfg.investigator_concurrency),
+                    "aug": asyncio.Semaphore(stage_cfg.augmenter_concurrency),
+                    "var": asyncio.Semaphore(stage_cfg.variant_verifier_concurrency),
+                    "qra": asyncio.Semaphore(stage_cfg.reasoner_concurrency),
+                },
+            )
+
+            if cfg.start_stage == StartStage.PLAN:
+                tasks = load_gh_archive(
+                    difficulty=spec.default_difficulty,
+                    csv_path=spec.benchmark_csv,
+                )[workload.num_tasks]
+                logger.info(f"Loaded {len(tasks)} tasks from {spec.benchmark_csv}.")
+
+                # Upper bounds (actual totals depend on plan/inv survival).
+                n_tasks = len(tasks)
+                inv_total = n_tasks * workload.items_per_task_limit
+                aug_total = inv_total
+                var_total = inv_total * workload.variants_per_item
+                qra_total = var_total
+                ctx.progresses = {
+                    "plan": {"done": 0, "total": n_tasks},
+                    "inv": {"done": 0, "ok": 0, "total": inv_total},
+                    "aug": {"done": 0, "total": aug_total},
+                    "var": {"done": 0, "ok": 0, "total": var_total},
+                    "qra": {"done": 0, "total": qra_total},
+                }
+
+                await asyncio.gather(*[_process_task_from_plan(t, ctx) for t in tasks])
+            else:  # AUGMENT
+                investigations = await load_investigations_from_cache(
+                    prisma,
+                    cache_cfg.inv_cache_id,
+                    verified_only=cache_cfg.verified_only_source,
+                )
+                logger.info(
+                    f"Loaded {len(investigations)} investigations from "
+                    f"cache_id='{cache_cfg.inv_cache_id}' "
+                    f"(verified_only={cache_cfg.verified_only_source})."
+                )
+                if not investigations:
+                    print("No investigations to augment. Exiting.")
+                    return
+
+                aug_total = len(investigations)
+                var_total = aug_total * workload.variants_per_item
+                qra_total = var_total
+                # plan/inv stages are skipped — keep the keys present (zero
+                # totals) so any stray progress writes are harmless.
+                ctx.progresses = {
+                    "plan": {"done": 0, "total": 0},
+                    "inv": {"done": 0, "ok": 0, "total": 0},
+                    "aug": {"done": 0, "total": aug_total},
+                    "var": {"done": 0, "ok": 0, "total": var_total},
+                    "qra": {"done": 0, "total": qra_total},
+                }
+
+                await asyncio.gather(
+                    *[_process_investigation(inv, ctx) for inv in investigations]
+                )
+
+            print("\n" + "=" * 80)
+            p = ctx.progresses
+            print(
+                f"DONE — plans: {p['plan']['done']}/{p['plan']['total']} | "
+                f"inv: {p['inv']['ok']}/{p['inv']['done']} | "
+                f"aug: {p['aug']['done']} | "
+                f"var: {p['var']['ok']}/{p['var']['done']} | "
+                f"qra: {p['qra']['done']}"
+            )
+            print(
+                f"→ View in graphvis: SFT Caches tab — '{cache_cfg.inv_cache_id}', "
+                f"'{cache_cfg.aug_cache_id}', '{cache_cfg.qra_cache_id}'"
+            )
+
+        finally:
+            if runtime_pool is not None:
+                await runtime_pool.close_all()
+            await prisma.disconnect()
 
 
 if __name__ == "__main__":

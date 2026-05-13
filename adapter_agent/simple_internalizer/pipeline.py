@@ -3,6 +3,7 @@ import logging
 import math
 import random
 import statistics
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Self
@@ -32,6 +33,7 @@ from adapter_agent.simple_internalizer.executor import InternalizeExecutor
 from adapter_agent.simple_internalizer.ray.ray_rl_worker_pool import RayRLWorkerPool
 from adapter_agent.simple_internalizer.rl_worker_pool import RLWorkerPool
 from adapter_agent.simple_internalizer.rollout_engine import RolloutEngine, build_solver_system_prompt
+from adapter_agent.simple_internalizer.rollout_persistence import persist_rl_groups
 from adapter_agent.simple_internalizer.training_runner import TrainingRunner
 from adapter_agent.simple_internalizer.types import PipelineConfig, SeedSuite, SftSuite
 from adapter_agent.util.config_util import flatten_config
@@ -102,6 +104,26 @@ class RLBatchState:
             metrics["rollout/response_length_mean"] = float(mean_len)
             metrics["rollout/response_length_variance"] = float(var_len)
             metrics["rollout/response_length_max"] = float(max(response_lengths))
+
+        # Per-suite breakdown — surfaces "new tasks vs replay" performance
+        # without a separate plumbing pass. Suites without a name (defensive)
+        # are bucketed under "_unknown".
+        by_suite: dict[str, list[RLGroup]] = defaultdict(list)
+        for g in self.window_groups:
+            by_suite[g.suite_name or "_unknown"].append(g)
+        for suite_name, groups in by_suite.items():
+            suite_rewards = [r for g in groups for r in g.rewards]
+            if not suite_rewards:
+                continue
+            any_correct = sum(1 for g in groups if max(g.rewards) > 0)
+            metrics[f"rollout/{suite_name}/mean_reward"] = (
+                sum(suite_rewards) / len(suite_rewards)
+            )
+            metrics[f"rollout/{suite_name}/any_correct_ratio"] = (
+                any_correct / len(groups)
+            )
+            metrics[f"rollout/{suite_name}/n_groups"] = float(len(groups))
+
         self.window_groups = []
         return metrics
 
@@ -207,7 +229,7 @@ class SimplePipeline:
         log_dir.mkdir(parents=True, exist_ok=True)
         ml_logger = ml_log.setup_logging(
             log_dir=str(log_dir),
-            wandb_project="internalization",
+            wandb_project=config.wandb_project,
             config=flatten_config(config),
         )
         ml_logger = ClockCycleFilteredLogger(ml_logger)
@@ -252,6 +274,8 @@ class SimplePipeline:
             eval_concurrency=config.eval.eval_concurrency,
             eval_rollout=config.eval.eval_rollout,
             max_output_tokens=config.rollout.max_output_tokens,
+            prisma_client=client,
+            simple_train_id=config.simple_train_id,
         )
         sampling_params = tinker.SamplingParams(
             max_tokens=config.rollout.max_output_tokens
@@ -280,6 +304,7 @@ class SimplePipeline:
                     worker_stagger_s=config.rollout.worker_stagger_s,
                     num_samples=config.rollout.num_samples,
                     sampling_params=sampling_params,
+                    suite_mix_weights=config.rl.suite_mix_weights,
                 )
             else:
                 rl_pool = RLWorkerPool(
@@ -291,6 +316,7 @@ class SimplePipeline:
                     num_samples=config.rollout.num_samples,
                     sampling_params=sampling_params,
                     rl_seed=config.rl.rl_seed,
+                    suite_mix_weights=config.rl.suite_mix_weights,
                 )
 
         # Weight sync 時に RL pool (Ray 版) へブロードキャストするフック
@@ -338,10 +364,6 @@ class SimplePipeline:
         try:
             if self.config.sft is None:
                 logger.info("Skipping initial SFT (config.sft is None).")
-            elif self.config.model_loading_settings.resume_trainer_path:
-                logger.info(
-                    f"Skipping initial SFT because resume_trainer_path is provided: {self.config.model_loading_settings.resume_trainer_path}"
-                )
             else:
                 sft_qras = await self._prepare_sft_qras()
                 sft_batch_iter = self._create_sft_batch_iterator(
@@ -406,8 +428,10 @@ class SimplePipeline:
                     batch_groups = await self._collect_valid_rl_batch(rl_step=rl_step)
 
                     trigger_eval = rl_step % self.config.eval.eval_interval == 0
-
-
+                    # Tag the next eval cycle's persisted rollouts with the
+                    # step that just completed, so they sit in the same
+                    # `rl_step` bucket as the train rollouts in graphvis.
+                    self.evaluate_worker.set_current_rl_step(rl_step)
 
                     logger.info(
                         f"Running RL (GRPO) update on valid batch of size {len(batch_groups)}..."
@@ -464,50 +488,14 @@ class SimplePipeline:
         return state.pop_batch()
 
     async def _persist_rollouts(self, rl_step: int, groups: list[RLGroup]) -> None:
-        """Bulk-write rollouts to the `simple_rl_rollouts` table for later audit.
-
-        One `create_many` call per iteration. Wrapped in try/except so a DB
-        failure logs a warning but never kills training. Skips groups that
-        lack audit metadata (e.g. Ray rollouts — TODO).
-        """
-        records = []
-        for gi, g in enumerate(groups):
-            if (
-                g.samples is None
-                or g.instruction is None
-                or g.suite_name is None
-                or g.task_id is None
-            ):
-                continue
-            for si, (sample, reward) in enumerate(zip(g.samples, g.rewards)):
-                records.append(
-                    {
-                        "simple_train_id": self.config.simple_train_id,
-                        "rl_step": rl_step,
-                        "suite_name": g.suite_name,
-                        "task_id": g.task_id,
-                        "group_idx": gi,
-                        "sample_idx": si,
-                        "num_samples": len(g.samples),
-                        "instruction": g.instruction,
-                        "answer": sample.answer,
-                        "reasoning": sample.reasoning,
-                        "parsed": sample.parsed,
-                        "success": sample.success,
-                        "reward": float(reward),
-                        "execution_output": sample.execution_output,
-                        "verification_output": sample.verification_output,
-                        "sampling_client_version": g.sampling_client_version,
-                    }
-                )
-        if not records:
-            return
-        try:
-            await self.prisma_client.simplerlrollout.create_many(data=records)
-        except Exception as e:
-            logger.warning(
-                f"Failed to persist {len(records)} RL rollouts at step {rl_step}: {e}"
-            )
+        """Bulk-write rollouts via the shared helper. Eval rollouts use the
+        same path so `simple_rl_rollouts` rows are uniform across train/eval."""
+        await persist_rl_groups(
+            self.prisma_client,
+            simple_train_id=self.config.simple_train_id,
+            rl_step=rl_step,
+            groups=groups,
+        )
 
     async def _run_grpo_update(
         self, valid_groups: list[RLGroup], trigger_eval: bool = True

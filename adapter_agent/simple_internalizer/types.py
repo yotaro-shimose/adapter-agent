@@ -163,6 +163,13 @@ class RLConfig:
     kl_discount_factor: float = 0.0
     skip_update: bool = False
     rl_seed: int = 42  # initial RL task ordering shuffle seed
+    # Per-seed-suite weights controlling the rollout-stream mix. Keys must
+    # match `SeedSuite.name`s in the run's seed pool. Weights are normalized
+    # internally; set ratios like {"new_tasks": 1.0, "replay": 1.0} for a
+    # 50/50 mix, or {"new_tasks": 3.0, "replay": 1.0} for 75/25.
+    # When None (default), all RL suites share a single shuffled queue —
+    # the legacy behaviour where the per-batch mix follows pool sizes.
+    suite_mix_weights: dict[str, float] | None = None
 
     def __post_init__(self) -> None:
         if (self.max_iterations is None) == (self.num_passes is None):
@@ -201,6 +208,9 @@ class PipelineConfig:
     cache_dir: Path
 
     generation_concurrency: int = 400
+
+    # Wandb project name. Used as `wandb_project=` in the ML logger setup.
+    wandb_project: str = "study2"
 
     # Stage configs (None disables that stage)
     sft: SFTConfig | None = None

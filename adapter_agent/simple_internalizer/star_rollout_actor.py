@@ -4,8 +4,8 @@
 `run()` を回し、結果 `(Task, RolloutBatch)` を出力 queue へ push する。
 
 `RayRLWorkerPool` 側の `RolloutActor` を参考にしているが、RL 特有コンポーネント
-(`RLWorkerPool`, `DistilledQRAManager`, Prisma 書き込み、RLGroup 変換、streaming な
-task 再投入) は落としてある。STaR は「task 群を 1 パス回して全部取る」モデルなので、
+(`RLWorkerPool`, Prisma 書き込み、RLGroup 変換、streaming な task 再投入) は
+落としてある。STaR は「task 群を 1 パス回して全部取る」モデルなので、
 actor 側は task を取って結果を返すだけ。
 """
 
@@ -86,7 +86,7 @@ class STaRRolloutActor:
         self._shared = SharedSamplingClient(sampling_client)
         _, renderer = get_tokenizer_renderer(sampling_client, self._model_name)
 
-        verifier = Verifier(model=self._verifier_model)
+        verifier = Verifier(model=self._verifier_model, library_name=self._library_name)
         self._runtime_pool = RuntimePool(
             self._runtime_settings, max_size=self._runtime_pool_size
         )

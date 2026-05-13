@@ -14,7 +14,7 @@ dependencies = [
     "trl>=0.26.2",
     "flash-attn",
     "vllm>=0.13.0",
-    "litellm==1.83.7",
+    "litellm>=1.85.0.dev2",
     "openai>=2.14.0",
     "chz>=0.4.0",
     "tinker-cookbook",

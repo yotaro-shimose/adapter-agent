@@ -55,6 +55,7 @@ class RayRLWorkerPool:
         worker_stagger_s: float,
         num_samples: int,
         sampling_params: tinker.SamplingParams,
+        suite_mix_weights: dict[str, float] | None = None,
     ) -> None:
         self._num_processes = num_processes
         self._workers_per_process = workers_per_process
@@ -70,6 +71,7 @@ class RayRLWorkerPool:
         self._worker_stagger_s = worker_stagger_s
         self._num_samples = num_samples
         self._sampling_params = sampling_params
+        self._suite_mix_weights = suite_mix_weights
 
         self._actors: list = []
         self._results_queue: RayQueue | None = None
@@ -106,6 +108,7 @@ class RayRLWorkerPool:
                 num_samples=self._num_samples,
                 sampling_params=self._sampling_params,
                 results_queue=self._results_queue,
+                suite_mix_weights=self._suite_mix_weights,
             )
             self._actors.append(actor)
 

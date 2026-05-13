@@ -60,10 +60,9 @@ VERIFIED_ONLY = True
 SOURCE_LIMIT: int | None = 5
 
 AUGMENTER_CONCURRENCY = 50
-AUGMENTER_MAX_TURNS = 16
 
 INVESTIGATION_CONCURRENCY = 25
-INVESTIGATION_MAX_TURNS = 12
+INVESTIGATION_MAX_TURNS = 8
 
 
 @dataclass
@@ -179,7 +178,6 @@ async def _augment_one(
     library_summary: str,
     augmenter_model,
     n_variants: int,
-    max_turns: int,
     sem: asyncio.Semaphore,
     progress: dict,
 ) -> tuple[SourceItem, Variants | None, str | None]:
@@ -194,11 +192,9 @@ async def _augment_one(
                 original_instruction=src.instruction,
                 original_answer=src.answer,
                 library_name=library_spec.name,
-                libdir=library_spec.libdir,
                 library_summary=library_summary,
                 n_variants=n_variants,
                 solver_model=augmenter_model,
-                max_turns=max_turns,
             )
             progress["done"] += 1
             n = len(v.variants) if v is not None else 0
@@ -441,7 +437,6 @@ async def main() -> None:
                 library_summary=library_summary,
                 augmenter_model=augmenter_model,
                 n_variants=VARIANTS_PER_ITEM,
-                max_turns=AUGMENTER_MAX_TURNS,
                 sem=aug_sem,
                 progress=aug_progress,
             )

@@ -48,6 +48,7 @@ class RolloutActor:
         num_samples: int,
         sampling_params: tinker.SamplingParams,
         results_queue: RayQueue,
+        suite_mix_weights: dict[str, float] | None = None,
     ) -> None:
         self._actor_index = actor_index
         self._runtime_settings = runtime_settings
@@ -61,6 +62,7 @@ class RolloutActor:
         self._num_samples = num_samples
         self._sampling_params = sampling_params
         self._results_queue = results_queue
+        self._suite_mix_weights = suite_mix_weights
 
         self._db: PostgresDB | None = None
         self._runtime_pool: RuntimePool | None = None
@@ -116,6 +118,7 @@ class RolloutActor:
             stagger_s=self._stagger_s,
             num_samples=self._num_samples,
             sampling_params=self._sampling_params,
+            suite_mix_weights=self._suite_mix_weights,
         )
         await self._pool.__aenter__()
         self._drain_task = asyncio.create_task(

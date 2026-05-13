@@ -113,6 +113,8 @@ async def load_sft_cache_suite(
     name: str,
     cache_id: str,
     verified_only: bool = True,
+    take_n: int | None = None,
+    take_seed: int = 42,
 ) -> SftSuite:
     """Read existing QRA rows from `sft_cache_items` by cache_id.
 
@@ -120,6 +122,11 @@ async def load_sft_cache_suite(
     pipeline writing to `pipeline_v1_qra`). Items must have non-empty
     answer + reasoning to be usable for SFT — rows missing either are
     skipped with a warning.
+
+    `take_n` deterministically subsamples the verified pool down to
+    that count (using `random.Random(take_seed)`) — used to make a
+    large replay pool fit cleanly into the per-batch mix alongside a
+    much smaller fine-tune pool. `None` keeps everything.
     """
     where: dict = {"cache_id": cache_id}
     if verified_only:
@@ -138,9 +145,98 @@ async def load_sft_cache_suite(
             f"SftCache suite '{name}' (cache_id={cache_id}): skipped {skipped} "
             f"row(s) missing answer or reasoning."
         )
+
+    pre_subsample = len(qras)
+    if take_n is not None and pre_subsample > take_n:
+        import random as _random
+        rng = _random.Random(take_seed)
+        qras = rng.sample(qras, take_n)
+        logger.info(
+            f"SftCache suite '{name}' (cache_id={cache_id}): subsampled "
+            f"{pre_subsample} → {len(qras)} QRAs (seed={take_seed})."
+        )
+    else:
+        logger.info(
+            f"SftCache suite '{name}' (cache_id={cache_id}): {len(qras)} QRAs "
+            f"(verified_only={verified_only})."
+        )
+    return SftSuite(name=name, qras=qras)
+
+
+async def load_rl_rollout_replay_suite(
+    ctx: SftLoaderContext,
+    *,
+    name: str,
+    simple_train_ids: list[str],
+    take_n: int,
+    take_seed: int = 42,
+) -> SftSuite:
+    """On-policy replay suite — pull successful (question, reasoning, answer)
+    rollouts from `simplerlrollout` for use as SFT replay anchor.
+
+    Rationale: SFT on out-of-band (e.g. Gemini-generated) QRAs drifts the
+    model toward the data source's distribution; using the model's OWN past
+    successful rollouts as replay keeps that anchor on-policy, so the
+    forgetting brake doesn't introduce its own distribution shift.
+
+    Sampling is two-stage to maximize *task* diversity and *step* recency:
+      1. For each `simple_train_id`, group success rollouts by `task_id`
+         and keep only the highest-`rl_step` success per task (one row).
+      2. Concatenate the resulting per-task-latest-success rows across all
+         provided train ids, then `random.Random(take_seed).sample` down
+         to `take_n`. Task ids never collide across TaskRL (gh_archive) and
+         KRL (pipeline_v2_qra) namespaces in practice.
+
+    Typical use: pass [task_rl_run_id, knowledge_rl_run_id] so a single
+    suite covers both the task-level and knowledge-level distributions
+    the model has been trained on.
+    """
+    import random as _random
+
+    per_run_pools: list[tuple[str, dict[str, tuple[int, str, str, str]]]] = []
+    for tid in simple_train_ids:
+        rows = await ctx.prisma.simplerlrollout.find_many(
+            where={"simple_train_id": tid, "success": True},
+            order={"rl_step": "desc"},
+        )
+        # task_id -> (rl_step, instruction, reasoning, answer) at latest step
+        latest: dict[str, tuple[int, str, str, str]] = {}
+        for r in rows:
+            if not r.answer or not r.reasoning:
+                continue
+            if r.task_id in latest:
+                # rows are ordered rl_step desc, so the first hit already
+                # wins; subsequent same-task rows are older.
+                continue
+            latest[r.task_id] = (r.rl_step, r.instruction, r.reasoning, r.answer)
+        per_run_pools.append((tid, latest))
+        logger.info(
+            f"RolloutReplay '{name}' / {tid}: {len(latest)} unique tasks "
+            f"with success (latest rl_step per task)."
+        )
+
+    flat: list[tuple[str, str, str]] = []
+    for _, latest in per_run_pools:
+        for _step, q, r_text, a in latest.values():
+            flat.append((q, r_text, a))
+
+    if not flat:
+        logger.warning(
+            f"RolloutReplay '{name}': no success rollouts found across "
+            f"{len(simple_train_ids)} run id(s)."
+        )
+        return SftSuite(name=name, qras=[])
+
+    rng = _random.Random(take_seed)
+    if len(flat) > take_n:
+        picked = rng.sample(flat, take_n)
+    else:
+        picked = flat
+    qras = [QRA(question=q, reasoning=r_text, answer=a) for q, r_text, a in picked]
     logger.info(
-        f"SftCache suite '{name}' (cache_id={cache_id}): {len(qras)} QRAs "
-        f"(verified_only={verified_only})."
+        f"RolloutReplay suite '{name}': pooled {len(flat)} task-latest "
+        f"successes from {len(simple_train_ids)} run(s) → sampled "
+        f"{len(qras)} (seed={take_seed})."
     )
     return SftSuite(name=name, qras=qras)
 

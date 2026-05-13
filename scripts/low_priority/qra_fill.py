@@ -79,13 +79,15 @@ async def _load_source_items(prisma: Prisma) -> list[QraInput]:
     for r in rows:
         if not r.answer:
             continue  # nothing to anchor reasoning on
-        items.append(QraInput(
-            item_id=r.id,
-            knowledge_id=r.knowledge_id,
-            knowledge_title=r.knowledge_title,
-            question=r.question,
-            answer=r.answer,
-        ))
+        items.append(
+            QraInput(
+                item_id=r.id,
+                knowledge_id=r.knowledge_id,
+                knowledge_title=r.knowledge_title,
+                question=r.question,
+                answer=r.answer,
+            )
+        )
     return items
 
 
@@ -129,20 +131,22 @@ async def _fill_one(
 
 async def _persist(prisma: Prisma, r: QraResult) -> None:
     s = r.src
-    await prisma.sftcacheitem.create(data={
-        "cache_id": TARGET_CACHE_ID,
-        # Source-link back to the original Q&A row.
-        "knowledge_id": f"{s.knowledge_id}#qra{s.item_id}",
-        "knowledge_title": s.knowledge_title,
-        "question": s.question,
-        "reasoning": r.reasoning or "",
-        "answer": s.answer,
-        # Inherit "verified" from the source — if the source was verified
-        # the QA pair is sound, and the reasoning is purely descriptive.
-        "verified": True,
-        "verifier_reasoning": "",
-        "conclusion": "reasoning_filled" if r.reasoning else "reasoning_failed",
-    })
+    await prisma.sftcacheitem.create(
+        data={
+            "cache_id": TARGET_CACHE_ID,
+            # Source-link back to the original Q&A row.
+            "knowledge_id": f"{s.knowledge_id}#qra{s.item_id}",
+            "knowledge_title": s.knowledge_title,
+            "question": s.question,
+            "reasoning": r.reasoning or "",
+            "answer": s.answer,
+            # Inherit "verified" from the source — if the source was verified
+            # the QA pair is sound, and the reasoning is purely descriptive.
+            "verified": True,
+            "verifier_reasoning": "",
+            "conclusion": "reasoning_filled" if r.reasoning else "reasoning_failed",
+        }
+    )
 
 
 async def main() -> None:
@@ -174,20 +178,19 @@ async def main() -> None:
         if await prisma.sftcache.find_unique(where={"id": TARGET_CACHE_ID}) is not None:
             await prisma.sftcache.delete(where={"id": TARGET_CACHE_ID})
             logger.info(f"Cleared existing '{TARGET_CACHE_ID}' SFT cache.")
-        await prisma.sftcache.create(data={
-            "id": TARGET_CACHE_ID,
-            "library_name": library_spec.name,
-            "description": (
-                f"qra_fill: chain-of-thought reasoning filled in for "
-                f"{len(sources)} verified QA pair(s) from {SOURCE_CACHE_ID}."
-            ),
-        })
+        await prisma.sftcache.create(
+            data={
+                "id": TARGET_CACHE_ID,
+                "library_name": library_spec.name,
+                "description": (
+                    f"qra_fill: chain-of-thought reasoning filled in for "
+                    f"{len(sources)} verified QA pair(s) from {SOURCE_CACHE_ID}."
+                ),
+            }
+        )
 
         print("\n" + "=" * 80)
-        print(
-            f"FILLING REASONING — {len(sources)} items "
-            f"(concurrency={CONCURRENCY})"
-        )
+        print(f"FILLING REASONING — {len(sources)} items (concurrency={CONCURRENCY})")
         print("=" * 80)
 
         model = get_gemini()

@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   useSftCaches,
   useSftCacheItems,
@@ -17,6 +17,17 @@ export const SftCacheExplorer: React.FC = () => {
   const [verifiedFilter, setVerifiedFilter] = useState<VerifiedFilter>('all');
   const [knowledgeFilter, setKnowledgeFilter] = useState<string>('');
 
+  // Full-text search across question / reasoning / answer / verifier_reasoning.
+  // Debounced so each keystroke doesn't fire a request — the server search is
+  // ILIKE on indexed-but-large text columns, so 200ms debounce keeps the UI
+  // snappy without hammering the DB.
+  const [searchInput, setSearchInput] = useState<string>('');
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  useEffect(() => {
+    const id = setTimeout(() => setSearchQuery(searchInput.trim()), 200);
+    return () => clearTimeout(id);
+  }, [searchInput]);
+
   // Single counter shared by the items + item-detail hooks. Bumping it
   // forces both downstream queries to re-fetch, so a sidebar Refresh
   // updates the main pane too instead of leaving stale data.
@@ -30,9 +41,10 @@ export const SftCacheExplorer: React.FC = () => {
     () => ({
       verified: verifiedFilter === 'verified' ? ('true' as const) : verifiedFilter === 'rejected' ? ('false' as const) : undefined,
       knowledge_id: knowledgeFilter || undefined,
+      q: searchQuery || undefined,
       limit: 1000,
     }),
-    [verifiedFilter, knowledgeFilter],
+    [verifiedFilter, knowledgeFilter, searchQuery],
   );
 
   const { items, loading: itemsLoading, error: itemsError } = useSftCacheItems(effectiveCacheId, filters, refreshToken);
@@ -77,7 +89,7 @@ export const SftCacheExplorer: React.FC = () => {
             return (
               <div
                 key={c.id}
-                onClick={() => { setSelectedCacheId(c.id); setSelectedItemId(null); setVerifiedFilter('all'); setKnowledgeFilter(''); }}
+                onClick={() => { setSelectedCacheId(c.id); setSelectedItemId(null); setVerifiedFilter('all'); setKnowledgeFilter(''); setSearchInput(''); }}
                 style={{
                   padding: '12px 20px',
                   cursor: 'pointer',
@@ -148,7 +160,14 @@ export const SftCacheExplorer: React.FC = () => {
                   placeholder="knowledge_id filter..."
                   value={knowledgeFilter}
                   onChange={e => setKnowledgeFilter(e.target.value)}
-                  style={{ ...selectStyle, flex: 2, minWidth: '180px' }}
+                  style={{ ...selectStyle, flex: 1, minWidth: '160px' }}
+                />
+                <input
+                  type="text"
+                  placeholder="search question / answer / reasoning..."
+                  value={searchInput}
+                  onChange={e => setSearchInput(e.target.value)}
+                  style={{ ...selectStyle, flex: 2, minWidth: '220px' }}
                 />
               </div>
 

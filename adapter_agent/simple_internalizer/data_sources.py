@@ -93,6 +93,31 @@ def load_gh_archive_suite(
     return SeedSuite(name=name, tasks=tasks, for_rl=for_rl, for_eval=for_eval)
 
 
+async def load_sft_cache_seed_suite(
+    prisma_client: Prisma,
+    *,
+    name: str,
+    cache_id: str,
+    for_rl: bool,
+    for_eval: bool,
+    verified_only: bool = True,
+) -> SeedSuite:
+    """Build a SeedSuite from rows in `sft_cache_items` for `cache_id`.
+
+    Mirrors `load_sft_cache_suite` (which returns an SftSuite) but produces
+    RL/eval seed tasks from the same rows — `Task.instruction = row.question`.
+    Used when an out-of-band pipeline (e.g. study2_pipeline AUGMENT mode)
+    has already produced verified question/answer pairs and we want to RL
+    on those questions.
+    """
+    where: dict = {"cache_id": cache_id}
+    if verified_only:
+        where["verified"] = True
+    rows = await prisma_client.sftcacheitem.find_many(where=where)
+    tasks = [Task(instruction=r.question) for r in rows if r.question]
+    return SeedSuite(name=name, tasks=tasks, for_rl=for_rl, for_eval=for_eval)
+
+
 async def generate_qras_cached(
     generator: GeneratorAgent,
     knowledge: Knowledge,

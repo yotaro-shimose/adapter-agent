@@ -33,6 +33,7 @@ export function useSftCaches() {
 export interface SftItemFilters {
   knowledge_id?: string;
   verified?: 'true' | 'false';
+  q?: string;
   limit?: number;
 }
 
@@ -56,6 +57,7 @@ export function useSftCacheItems(
     const params = new URLSearchParams();
     if (filters.knowledge_id) params.set('knowledge_id', filters.knowledge_id);
     if (filters.verified) params.set('verified', filters.verified);
+    if (filters.q) params.set('q', filters.q);
     if (filters.limit) params.set('limit', String(filters.limit));
     const q = params.toString();
     const url = `${API_BASE}/api/sft_caches/${encodeURIComponent(cacheId)}/items${q ? `?${q}` : ''}`;

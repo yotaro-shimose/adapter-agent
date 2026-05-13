@@ -75,7 +75,11 @@ export interface RolloutFilters {
   limit?: number;
 }
 
-export function useSimpleRunRollouts(simpleTrainId: string | null, filters: RolloutFilters) {
+export function useSimpleRunRollouts(
+  simpleTrainId: string | null,
+  filters: RolloutFilters,
+  refreshToken: number = 0,
+) {
   const [rollouts, setRollouts] = useState<SimpleRolloutListItem[]>([]);
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
@@ -115,7 +119,7 @@ export function useSimpleRunRollouts(simpleTrainId: string | null, filters: Roll
       });
     return () => controller.abort();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [simpleTrainId, fkey]);
+  }, [simpleTrainId, fkey, refreshToken]);
 
   return { rollouts, loading, error };
 }

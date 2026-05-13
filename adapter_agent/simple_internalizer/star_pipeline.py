@@ -58,7 +58,7 @@ class STaRPipeline:
     - 評価: `EvaluateWorker` を `eval_trigger` 経由で駆動
     - 成功サンプル蓄積: `SuccessfulQRABuffer` (FIFO, 上限付き)
 
-    GRPO/RLGroup/DistilledQRAManager は使わない (純 STaR)。
+    GRPO/RLGroup は使わない (純 STaR)。
     """
 
     config: STaRPipelineConfig
@@ -182,7 +182,8 @@ class STaRPipeline:
             max_size=config.rollout.runtime_pool_size,
         )
         eval_executor = InternalizeExecutor(
-            runtime_pool=eval_runtime_pool, verifier=Verifier(model=verifier_model)
+            runtime_pool=eval_runtime_pool,
+            verifier=Verifier(model=verifier_model, library_name=config.library_name),
         )
         system_prompt = build_solver_system_prompt(config.library_name)
         eval_rollout_engine = RolloutEngine(
@@ -200,6 +201,8 @@ class STaRPipeline:
             eval_concurrency=config.eval.eval_concurrency,
             eval_rollout=config.eval.eval_rollout,
             max_output_tokens=config.rollout.max_output_tokens,
+            prisma_client=prisma_client,
+            simple_train_id=config.simple_train_id,
         )
 
         sampling_params = tinker.SamplingParams(
@@ -351,6 +354,10 @@ class STaRPipeline:
                         #    (累積 buffer を fresh な model + fresh optimizer で学習)
                         await self._reset_training_client_to_base()
                         trigger_eval = step % self.config.eval.eval_interval == 0
+                        # Tag the eval cycle's persisted rollouts with the
+                        # STaR step so they share the rl_step bucket with
+                        # the pre/post-update train rollouts in graphvis.
+                        self.evaluate_worker.set_current_rl_step(step)
                         await self._run_star_sft_step(trigger_eval=trigger_eval)
 
                     # 4. checkpoint

@@ -112,3 +112,19 @@ def get_gemini_lite() -> LitellmModel:
     if not api_key:
         raise ValueError("Error: GEMINI_API_KEY not set.")
     return LitellmModel(model=model_name, api_key=api_key)
+
+
+def get_gemini_pro() -> LitellmModel:
+    model_name = "gemini/gemini-3-pro-preview"
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("Error: GEMINI_API_KEY not set.")
+    return LitellmModel(model=model_name, api_key=api_key)
+
+
+def get_claude_opus_47() -> LitellmModel:
+    model_name = "anthropic/claude-opus-4-7"
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise ValueError("Error: ANTHROPIC_API_KEY not set.")
+    return LitellmModel(model=model_name, api_key=api_key)
